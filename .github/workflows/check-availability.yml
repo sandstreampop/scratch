@@ -18,12 +18,17 @@ jobs:
           npm init -y >/dev/null 2>&1 || true
           npm i playwright@1.49.1
           npx playwright install --with-deps chromium
-      - name: Run availability check
+      - name: Run availability check (round 1)
         run: node scripts/check.js
+      - name: Run availability check (round 2)
+        if: always()
+        run: node scripts/check2.js
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: availability-results
-          path: out/**
+          path: |
+            out/**
+            out2/**
           if-no-files-found: warn
