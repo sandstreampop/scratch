@@ -1,0 +1,414 @@
+<title>Boende efter The Tallest Man on Earth – Tänndalen 11 juli 2026</title>
+<style>
+  :root{
+    --ground:#f5f2ea; --ink:#232b28; --muted:#5c6b64; --line:#e3dccb;
+    --card:#fffdf8; --forest:#1f3d34; --pine:#33604f; --amber:#c1712a;
+    --amber-soft:#f2e2cd; --sky:#5f8592; --good:#3f7d5a;
+    --shadow:0 1px 2px rgba(31,61,52,.06),0 8px 24px rgba(31,61,52,.07);
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,"Times New Roman",serif;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--ground:#0f1a16;--ink:#ece7db;--muted:#9cb0a6;--line:#26372e;
+      --card:#16241e;--forest:#d3e6d8;--pine:#8fc0a5;--amber:#e2a15c;
+      --amber-soft:#2b2115;--sky:#8bb0bc;--good:#7dc298;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 28px rgba(0,0,0,.35);}
+  }
+  :root[data-theme="light"]{--ground:#f5f2ea;--ink:#232b28;--muted:#5c6b64;--line:#e3dccb;
+    --card:#fffdf8;--forest:#1f3d34;--pine:#33604f;--amber:#c1712a;--amber-soft:#f2e2cd;--sky:#5f8592;--good:#3f7d5a;
+    --shadow:0 1px 2px rgba(31,61,52,.06),0 8px 24px rgba(31,61,52,.07);}
+  :root[data-theme="dark"]{--ground:#0f1a16;--ink:#ece7db;--muted:#9cb0a6;--line:#26372e;
+    --card:#16241e;--forest:#d3e6d8;--pine:#8fc0a5;--amber:#e2a15c;--amber-soft:#2b2115;--sky:#8bb0bc;--good:#7dc298;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 28px rgba(0,0,0,.35);}
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+    line-height:1.55;-webkit-font-smoothing:antialiased;font-size:16px}
+  .wrap{max-width:1020px;margin:0 auto;padding:0 20px}
+  a{color:inherit}
+  h1,h2,h3{font-family:var(--serif);font-weight:600;text-wrap:balance;margin:0}
+  .eyebrow{font-family:var(--sans);text-transform:uppercase;letter-spacing:.18em;
+    font-size:.72rem;font-weight:700;color:var(--amber)}
+
+  /* HERO */
+  .hero{position:relative;overflow:hidden;border-bottom:1px solid var(--line);
+    background:
+      radial-gradient(120% 90% at 80% -10%, color-mix(in srgb,var(--amber) 20%, transparent), transparent 60%),
+      linear-gradient(180deg, color-mix(in srgb,var(--forest) 8%, var(--ground)), var(--ground));}
+  .hero .wrap{padding:54px 20px 120px}
+  .hero h1{font-size:clamp(2.1rem,5.5vw,3.6rem);line-height:1.02;margin:.35em 0 .3em;letter-spacing:-.01em}
+  .hero p.lede{max-width:60ch;color:var(--muted);font-size:1.06rem;margin:0}
+  .ridge{position:absolute;left:0;right:0;bottom:-1px;height:110px;display:block}
+  .chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:22px}
+  .chip{display:inline-flex;align-items:center;gap:8px;background:var(--card);
+    border:1px solid var(--line);border-radius:999px;padding:8px 14px;font-size:.86rem;box-shadow:var(--shadow)}
+  .chip b{font-weight:650}
+  .chip .k{color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-size:.68rem;font-weight:700}
+
+  section{padding:40px 0}
+  .sec-head{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  .sec-head h2{font-size:clamp(1.4rem,3vw,1.9rem)}
+  .sec-head .count{font-family:var(--mono);font-size:.82rem;color:var(--amber);font-weight:600}
+  .sec-sub{color:var(--muted);max-width:70ch;margin:.2em 0 22px}
+
+  /* callout / methodology */
+  .note{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--amber);
+    border-radius:12px;padding:16px 18px;box-shadow:var(--shadow);font-size:.95rem}
+  .note b{color:var(--ink)}
+
+  /* zone label */
+  .zone{display:flex;align-items:center;gap:12px;margin:26px 0 14px}
+  .zone h3{font-size:1.08rem}
+  .zone .dist{font-family:var(--mono);font-size:.76rem;color:var(--sky);border:1px solid var(--line);
+    padding:3px 9px;border-radius:999px;white-space:nowrap}
+  .zone .rule{flex:1;height:1px;background:var(--line)}
+
+  /* cards */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(288px,1fr));gap:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;
+    box-shadow:var(--shadow);display:flex;flex-direction:column;gap:10px;position:relative}
+  .card .top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+  .card h4{font-family:var(--serif);font-size:1.16rem;font-weight:600;margin:0;line-height:1.15}
+  .card .type{color:var(--muted);font-size:.86rem}
+  .verified{align-self:flex-start;display:inline-flex;align-items:center;gap:6px;
+    background:color-mix(in srgb,var(--good) 15%, transparent);color:var(--good);
+    border:1px solid color-mix(in srgb,var(--good) 35%, transparent);
+    font-size:.7rem;font-weight:700;letter-spacing:.03em;text-transform:uppercase;padding:4px 9px;border-radius:999px}
+  .meta{display:flex;flex-wrap:wrap;gap:7px}
+  .tag{font-size:.76rem;color:var(--muted);background:color-mix(in srgb,var(--sky) 12%, transparent);
+    border:1px solid var(--line);padding:3px 9px;border-radius:8px}
+  .price{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:1.5rem;font-weight:700;color:var(--amber);line-height:1}
+  .price small{font-family:var(--sans);font-size:.72rem;color:var(--muted);font-weight:600;letter-spacing:.03em}
+  .foot{margin-top:auto;display:flex;align-items:flex-end;justify-content:space-between;gap:10px;padding-top:6px}
+  .btn{display:inline-flex;align-items:center;gap:7px;background:var(--forest);color:#fff;
+    text-decoration:none;font-weight:650;font-size:.85rem;padding:9px 15px;border-radius:10px;
+    border:1px solid color-mix(in srgb,var(--forest) 60%, #000 0%);transition:transform .08s ease, filter .15s ease;white-space:nowrap}
+  :root[data-theme="dark"] .btn, @media(prefers-color-scheme:dark){}
+  .btn:hover{filter:brightness(1.08);transform:translateY(-1px)}
+  .btn.alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  .btn.amber{background:var(--amber);border-color:var(--amber)}
+
+  /* phone cards */
+  .pcard .foot .btn{background:transparent;color:var(--ink);border:1px solid var(--amber)}
+  .phone{font-family:var(--mono);font-weight:600;color:var(--ink)}
+
+  /* table */
+  .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow)}
+  table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--card);min-width:520px}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line)}
+  th{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700}
+  tr:last-child td{border-bottom:none}
+  td .np{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--amber);font-weight:600}
+
+  /* logistics */
+  .logi{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
+  .logi .item{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;box-shadow:var(--shadow)}
+  .logi h4{font-family:var(--serif);font-size:1.05rem;margin:0 0 4px}
+  .logi p{margin:0;color:var(--muted);font-size:.9rem}
+
+  /* steps */
+  ol.plan{counter-reset:s;list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:10px}
+  ol.plan li{counter-increment:s;display:flex;gap:14px;align-items:flex-start;background:var(--card);
+    border:1px solid var(--line);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow)}
+  ol.plan li::before{content:counter(s);flex:none;width:28px;height:28px;border-radius:50%;
+    background:var(--amber);color:#fff;font-family:var(--mono);font-weight:700;display:grid;place-items:center;font-size:.9rem}
+
+  footer{border-top:1px solid var(--line);padding:26px 0 60px;color:var(--muted);font-size:.85rem}
+  footer a{color:var(--pine)}
+  .src{display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:8px}
+  @media (max-width:560px){ .hero .wrap{padding:40px 20px 96px} }
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<header class="hero">
+  <svg class="ridge" viewBox="0 0 1440 110" preserveAspectRatio="none" aria-hidden="true">
+    <path d="M0,110 L0,64 L120,30 L240,58 L360,20 L480,52 L600,14 L720,46 L840,8 L960,44 L1080,22 L1200,52 L1320,28 L1440,60 L1440,110 Z"
+      fill="var(--forest)" opacity=".14"></path>
+    <path d="M0,110 L0,86 L160,58 L320,84 L480,50 L640,80 L800,44 L960,78 L1120,54 L1280,82 L1440,62 L1440,110 Z"
+      fill="var(--forest)" opacity=".22"></path>
+  </svg>
+  <div class="wrap">
+    <div class="eyebrow">Musikkväll på kalfjäll · Hamrafjället, Tänndalen</div>
+    <h1>Var ska familjen sova efter&nbsp;konserten?</h1>
+    <p class="lede">The Tallest Man on Earth spelar på fjälltoppen lördag 11 juli 2026. Här är boenden som är
+      <b>verifierat lediga</b> för just den natten — för 2 vuxna, en 5-åring och en 2-åring.</p>
+    <div class="chips">
+      <span class="chip"><span class="k">Natt</span><b>11 → 12 juli 2026</b></span>
+      <span class="chip"><span class="k">Sällskap</span><b>2 vuxna + 5 år + 2 år</b></span>
+      <span class="chip"><span class="k">Konsert</span><b>ca 19:00–20:30 (insläpp 16:30)</b></span>
+      <span class="chip"><span class="k">Scen</span><b>Skans Hamrafjäll, ~1 000 m ö.h.</b></span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section>
+    <div class="note">
+      <b>Så är listan verifierad.</b> Varje boende märkt <span style="color:var(--good);font-weight:700">✓ Verifierat ledigt</span>
+      kontrollerades <b>live</b> mot bokningssystemens riktiga tillgänglighet för <b>exakt natten 11→12 juli 2026</b> med
+      sökningen 2 vuxna + 2 barn (5 &amp; 2 år). Kontrollen kördes i en riktig webbläsare på en server 2026-07-07;
+      priserna är totalpris för natten i SEK som visades då. Boenden märkta <b>☎️ Ring för att boka</b> ligger allra närmast scenen
+      men säljs inte via Booking.com — tillgänglighet bekräftas per telefon. Priser och tillgänglighet ändras löpande: <b>boka snarast</b>.
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>Verifierat lediga boenden</h2><span class="count">20 bekräftade för natten</span></div>
+    <p class="sec-sub">Sorterade efter avstånd till Hamrafjället/Tänndalen. Klicka på knappen — datum och antal gäster är redan ifyllda,
+      så du ser priset och kan boka direkt.</p>
+
+    <div class="zone"><h3>Tänndalen — närmast scenen</h3><span class="dist">0–3 km</span><span class="rule"></span></div>
+    <div class="grid">
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Nobel Cabins – Tänndalen</h4><div class="type">Helt semesterhus · Booking.com · eget kök &amp; bergsutsikt</div></div></div>
+        <div class="meta"><span class="tag">✦ för 2 vuxna + 2 barn</span><span class="tag">2 sovrum</span><span class="tag">44 m²</span><span class="tag">1,2 km</span></div>
+        <div class="foot"><div class="price">2 249<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.booking.com/hotel/se/nobel-cabins.sv.html?checkin=2026-07-11&checkout=2026-07-12&group_adults=2&group_children=2&age=5&age=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Arkitektritat fjällhus i Tänndalen</h4><div class="type">Helt hus · Airbnb</div></div></div>
+        <div class="meta"><span class="tag">3 sovrum</span><span class="tag">5 sängar</span><span class="tag">i Tänndalen</span></div>
+        <div class="foot"><div class="price">6 118<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.airbnb.se/rooms/1594380901080467752?check_in=2026-07-11&check_out=2026-07-12&adults=2&children=2">Boka →</a></div>
+      </article>
+    </div>
+
+    <div class="zone"><h3>Fjällnäs — väster om Tänndalen</h3><span class="dist">~3–10 km</span><span class="rule"></span></div>
+    <div class="grid">
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Fjällnäs Camping &amp; Lodges</h4><div class="type">Hel lägenhet · Booking.com · närmaste camping till liften</div></div></div>
+        <div class="meta"><span class="tag">1 sovrum</span><span class="tag">45 m²</span><span class="tag">≈3 km från Ski Lodge</span></div>
+        <div class="foot"><div class="price">1 310<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.booking.com/hotel/se/fjallnas-camping-amp-lodges.sv.html?checkin=2026-07-11&checkout=2026-07-12&group_adults=2&group_children=2&age=5&age=2">Boka →</a></div>
+      </article>
+    </div>
+
+    <div class="zone"><h3>Funäsdalen &amp; närområde</h3><span class="dist">~7–13 km</span><span class="rule"></span></div>
+    <div class="grid">
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Lillskarvens vandrarhem</h4><div class="type">Vandrarhem · Booking.com · billigast</div></div></div>
+        <div class="meta"><span class="tag">Funäsdalen</span><span class="tag">6,8 km</span></div>
+        <div class="foot"><div class="price">1 259<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.booking.com/hotel/se/lillskarvens-vandrarhem-funasdalen.sv.html?checkin=2026-07-11&checkout=2026-07-12&group_adults=2&group_children=2&age=5&age=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Funäsdalens Stugby</h4><div class="type">Helt semesterhus · Booking.com · dubbelsäng + våningssäng + bäddsoffa, terrass</div></div></div>
+        <div class="meta"><span class="tag">✦ för 2 vuxna + 2 barn</span><span class="tag">2 sovrum</span><span class="tag">50 m²</span><span class="tag">~8 km</span></div>
+        <div class="foot"><div class="price">1 429<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.booking.com/hotel/se/funasdalens-stugby.sv.html?checkin=2026-07-11&checkout=2026-07-12&group_adults=2&group_children=2&age=5&age=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Ömsedal – Funäsdalen Kåvan</h4><div class="type">Lägenhet · Booking.com</div></div></div>
+        <div class="meta"><span class="tag">3 sovrum</span><span class="tag">2 badrum</span><span class="tag">~11 km</span></div>
+        <div class="foot"><div class="price">1 606<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.booking.com/hotel/se/omsedal-kavan.sv.html?checkin=2026-07-11&checkout=2026-07-12&group_adults=2&group_children=2&age=5&age=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Skoogs Logi Lägenheter</h4><div class="type">Lägenhet · Booking.com · centralt i Funäsdalen</div></div></div>
+        <div class="meta"><span class="tag">3 sovrum</span><span class="tag">90 m²</span><span class="tag">~11 km</span></div>
+        <div class="foot"><div class="price">1 692<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.booking.com/hotel/se/skoogs-krog-och-logi-lagenheter.sv.html?checkin=2026-07-11&checkout=2026-07-12&group_adults=2&group_children=2&age=5&age=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Parkstigens Lägenheter</h4><div class="type">Stor lägenhet · Booking.com</div></div></div>
+        <div class="meta"><span class="tag">5 sovrum</span><span class="tag">120 m²</span><span class="tag">~11 km</span></div>
+        <div class="foot"><div class="price">1 829<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.booking.com/hotel/se/parkstigen.sv.html?checkin=2026-07-11&checkout=2026-07-12&group_adults=2&group_children=2&age=5&age=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Modern stuga precis vid liften</h4><div class="type">Stuga · Airbnb · Funäsdalen</div></div></div>
+        <div class="meta"><span class="tag">3 sovrum</span><span class="tag">5 sängar</span></div>
+        <div class="foot"><div class="price">2 448<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.airbnb.se/rooms/1380585536921426774?check_in=2026-07-11&check_out=2026-07-12&adults=2&children=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Ny fjällstuga med kamin &amp; bastu</h4><div class="type">Minihus · Airbnb · Funäsdalen</div></div></div>
+        <div class="meta"><span class="tag">Bastu</span><span class="tag">kamin</span></div>
+        <div class="foot"><div class="price">2 370<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.airbnb.se/rooms/976745019018873881?check_in=2026-07-11&check_out=2026-07-12&adults=2&children=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Prästgården i Funäsdalen</h4><div class="type">Stor lägenhet · Booking.com</div></div></div>
+        <div class="meta"><span class="tag">200 m²</span><span class="tag">~11 km</span></div>
+        <div class="foot"><div class="price">2 362<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.booking.com/hotel/se/pra-stgay-rden-i-funa-sdalen.sv.html?checkin=2026-07-11&checkout=2026-07-12&group_adults=2&group_children=2&age=5&age=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Hotell Funäsdalen</h4><div class="type">Familjerum: 2 enkelsängar + våningssäng, babysäng kan ordnas · frukost ingår</div></div></div>
+        <div class="meta"><span class="tag">✦ för 2 vuxna + 2 barn</span><span class="tag">centralt</span><span class="tag">~11 km</span></div>
+        <div class="foot"><div class="price">2 595<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.booking.com/hotel/se/hotell-funa-sdalen.sv.html?checkin=2026-07-11&checkout=2026-07-12&group_adults=2&group_children=2&age=5&age=2">Boka →</a></div>
+      </article>
+    </div>
+
+    <div class="zone"><h3>Bruksvallarna, Ramundberget &amp; Mittådalen</h3><span class="dist">~15–25 km</span><span class="rule"></span></div>
+    <div class="grid">
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Appartement Svansjökläppen</h4><div class="type">Lägenhet (4 pers) · Airbnb · Gästfavorit</div></div></div>
+        <div class="meta"><span class="tag">5 sängar</span><span class="tag">Härjedalen</span></div>
+        <div class="foot"><div class="price">1 425<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.airbnb.se/rooms/47544275?check_in=2026-07-11&check_out=2026-07-12&adults=2&children=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Mountain Lodge "Storviglen"</h4><div class="type">Lägenhet (6 pers) · Airbnb · Superhost</div></div></div>
+        <div class="meta"><span class="tag">2 sovrum</span><span class="tag">5 sängar</span></div>
+        <div class="foot"><div class="price">1 500<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.airbnb.se/rooms/47556229?check_in=2026-07-11&check_out=2026-07-12&adults=2&children=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Rockvallen, lugnt område</h4><div class="type">Stuga · Airbnb · Bruksvallarna · Gästfavorit</div></div></div>
+        <div class="meta"><span class="tag">2 sovrum</span><span class="tag">3 sängar</span></div>
+        <div class="foot"><div class="price">1 765<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.airbnb.se/rooms/43778479?check_in=2026-07-11&check_out=2026-07-12&adults=2&children=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Lillskarven i Bruksvallarna</h4><div class="type">Stor stuga · Airbnb</div></div></div>
+        <div class="meta"><span class="tag">3 sovrum</span><span class="tag">9 sängar</span></div>
+        <div class="foot"><div class="price">1 765<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.airbnb.se/rooms/768759558972749602?check_in=2026-07-11&check_out=2026-07-12&adults=2&children=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Fjällriket Baggården</h4><div class="type">Fjällby · Booking.com · Messlingen</div></div></div>
+        <div class="meta"><span class="tag">~21 km</span></div>
+        <div class="foot"><div class="price">1 838<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.booking.com/hotel/se/messlingen-fjallby-funasdalen.sv.html?checkin=2026-07-11&checkout=2026-07-12&group_adults=2&group_children=2&age=5&age=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Bo med utsikt i Bruksvallarna</h4><div class="type">Stuga · Airbnb</div></div></div>
+        <div class="meta"><span class="tag">3 sovrum</span><span class="tag">7 sängar</span></div>
+        <div class="foot"><div class="price">2 471<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.airbnb.se/rooms/1064449516010259524?check_in=2026-07-11&check_out=2026-07-12&adults=2&children=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Ramundbergets Fjällgård</h4><div class="type">Fjällhotell · Booking.com</div></div></div>
+        <div class="meta"><span class="tag">~18 km</span><span class="tag">restaurang</span></div>
+        <div class="foot"><div class="price">2 821<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.booking.com/hotel/se/ramundbergets-fjallgard.sv.html?checkin=2026-07-11&checkout=2026-07-12&group_adults=2&group_children=2&age=5&age=2">Boka →</a></div>
+      </article>
+      <article class="card">
+        <span class="verified">✓ Verifierat ledigt</span>
+        <div class="top"><div><h4>Torvkåta i Mittådalen</h4><div class="type">Unik jordkåta · Airbnb · för äventyret</div></div></div>
+        <div class="meta"><span class="tag">6 sängar</span><span class="tag">fri avbokning</span></div>
+        <div class="foot"><div class="price">2 942<small> kr/natt</small></div>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.airbnb.se/rooms/1206452084483289857?check_in=2026-07-11&check_out=2026-07-12&adults=2&children=2">Boka →</a></div>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>Närmast liften — ring för att boka</h2><span class="count">☎️ egna sajter</span></div>
+    <p class="sec-sub">Dessa ligger vid eller närmast själva scenen och passar barnfamilj utmärkt, men säljs inte via Booking.com.
+      Ring så bekräftar de tillgänglighet för natten direkt.</p>
+    <div class="grid">
+      <article class="card pcard">
+        <div class="top"><div><h4>Ski Lodge Tänndalen</h4><div class="type">65 lägenheter (4–6 bäddar) vid liftfoten · arrangörens eget boende</div></div></div>
+        <div class="meta"><span class="tag">ski-in/out</span><span class="tag">vid scenen</span></div>
+        <div class="foot"><span class="phone">0684-155 00</span>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.tanndalen.com/boende/boka">Boka →</a></div>
+      </article>
+      <article class="card pcard">
+        <div class="top"><div><h4>Tänndalens Fjällhotell</h4><div class="type">Historiskt hotell · rum med eget sovrum + pentry · 3-rätters</div></div></div>
+        <div class="meta"><span class="tag">Tänndalen</span><span class="tag">frukost</span></div>
+        <div class="foot"><span class="phone">0684-155 00</span>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.tanndalen.com/boende/boka">Boka →</a></div>
+      </article>
+      <article class="card pcard">
+        <div class="top"><div><h4>STF Skarvruets Högfjällshotell</h4><div class="type">Familjerum med badrum &amp; pentry · frukost · 65 bäddar</div></div></div>
+        <div class="meta"><span class="tag">~8 km</span><span class="tag">mellan Tänndalen &amp; Funäsdalen</span></div>
+        <div class="foot"><span class="phone">0684-221 11</span>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.skarvruet.com/">Sajt →</a></div>
+      </article>
+      <article class="card pcard">
+        <div class="top"><div><h4>Tänndalsvallens Fjällstugor &amp; Camping</h4><div class="type">Stugor, lägenheter &amp; camping</div></div></div>
+        <div class="meta"><span class="tag">Tänndalen</span><span class="tag">camping</span></div>
+        <div class="foot"><span class="phone">0684-221 94</span>
+          <a class="btn" target="_blank" rel="noopener" href="https://tanndalsvallen.nu/boende/">Sajt →</a></div>
+      </article>
+      <article class="card pcard">
+        <div class="top"><div><h4>Hotell Fjällnäs (Est. 1882)</h4><div class="type">Sveriges äldsta fjällhotell · 2 familjerum (upp till 4) · spa</div></div></div>
+        <div class="meta"><span class="tag">~10 km</span><span class="tag">spa</span></div>
+        <div class="foot"><span class="phone">fjallnas.se</span>
+          <a class="btn" target="_blank" rel="noopener" href="https://www.fjallnas.se/">Sajt →</a></div>
+      </article>
+      <article class="card pcard">
+        <div class="top"><div><h4>Regional centralbokning</h4><div class="type">Stugvärden / Destination Funäsfjällen · ~50 privata stugor i systemet</div></div></div>
+        <div class="meta"><span class="tag">filtrera 11–12 juli</span></div>
+        <div class="foot"><span class="phone">0684-155 80</span>
+          <a class="btn" target="_blank" rel="noopener" href="https://stugvarden.online.citybreak.com/sv/stugor">Sök →</a></div>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>Reservplan — lediga intilliggande natt</h2></div>
+    <p class="sec-sub">Dessa stugor i Tänndalen/Bruksvallarna var <b>inte</b> lediga exakt 11→12 juli, men lediga natten före eller efter —
+      bra om ni kan justera datum eller stanna två nätter.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Boende</th><th>Område</th><th>Ledig natt</th><th>Pris</th><th></th></tr></thead>
+        <tbody>
+          <tr><td>Buskvallen (2 sovrum, 6 sängar)</td><td>Tänndalen</td><td>10–11 juli</td><td class="np">859 kr</td><td><a href="https://www.airbnb.se/rooms/1181750714915910377" target="_blank" rel="noopener">Airbnb →</a></td></tr>
+          <tr><td>Liten stuga med 2 våningssängar</td><td>Tänndalen</td><td>10–11 juli</td><td class="np">1 024 kr</td><td><a href="https://www.airbnb.se/rooms/1422382517500923534" target="_blank" rel="noopener">Airbnb →</a></td></tr>
+          <tr><td>Elise minne (2 sovrum)</td><td>Tänndalen</td><td>12–13 juli</td><td class="np">989 kr</td><td><a href="https://www.airbnb.se/rooms/1502271709452506031" target="_blank" rel="noopener">Airbnb →</a></td></tr>
+          <tr><td>Lägenhet i nybyggt fjällhus</td><td>Tänndalen</td><td>12–13 juli</td><td class="np">1 883 kr</td><td><a href="https://www.airbnb.se/rooms/1594986804474104190" target="_blank" rel="noopener">Airbnb →</a></td></tr>
+          <tr><td>Nybyggt fjällhus ski in/out</td><td>Hamra</td><td>12–13 juli</td><td class="np">2 500 kr</td><td><a href="https://www.airbnb.se/rooms/958506874429428882" target="_blank" rel="noopener">Airbnb →</a></td></tr>
+          <tr><td>Lillstugan</td><td>Bruksvallarna</td><td>12–13 juli</td><td class="np">777 kr</td><td><a href="https://www.airbnb.se/rooms/1194762343492172406" target="_blank" rel="noopener">Airbnb →</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>Kvällen — så tar ni er upp &amp; ner</h2></div>
+    <div class="logi">
+      <div class="item"><h4>Upp till scenen</h4><p>Sittlift (några minuter) eller ca 20 min vandring. Efter konserten åker man ner samma väg.</p></div>
+      <div class="item"><h4>Parkering</h4><p>Stora <b>gratis</b> parkeringar direkt vid liften. Husbil/husvagn ej i Hamra eller vid Ski Lodge — ställplats i Buskvallen.</p></div>
+      <div class="item"><h4>Tält &amp; camping</h4><p>Tält tillåts utanför konsertområdet; utrustning bärs upp före insläpp 16:30. Närmaste camping: Fjällnäs (~3 km).</p></div>
+      <div class="item"><h4>Med småbarn</h4><p>Hörselskydd till både 2- och 5-åringen. På ~1 000 m kan kvällen bli sval — varma lager och regnkläder.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>Bokningsplan</h2></div>
+    <ol class="plan">
+      <li><b>Boka i dag.</b> 11 juli är högsommar + konsertkväll — det som ligger närmast tar slut först.</li>
+      <li><b>Kortast väg med 2-åringen?</b> Börja med Nobel Cabins, eller ring Ski Lodge / Tänndalens Fjällhotell på 0684-155 00.</li>
+      <li><b>Billigast eget hus?</b> Lillskarvens vandrarhem (1 259 kr) eller Fjällnäs Camping-lägenhet (1 310 kr).</li>
+      <li><b>Hotell med frukost?</b> Hotell Funäsdalen, Ramundbergets Fjällgård eller ring Skarvruet.</li>
+      <li><b>Klicka på en Boka-knapp</b> — datum (11→12 juli) och gäster (2 vuxna + 2 barn) är förifyllda; boka i sista steget.</li>
+    </ol>
+  </section>
+
+</main>
+
+<footer class="wrap">
+  <div><b>Verifierat</b> med live-kontroll mot Booking.com och Airbnb.se för natten 11→12 juli 2026 (2 vuxna + barn 5 &amp; 2), utförd 2026-07-07. Priser är totalpris/natt i SEK och kan ändras — bekräfta alltid i bokningssteget.</div>
+  <div class="src">
+    <a href="https://www.tanndalen.com/utforska/evenemang/musikkvaell-paa-kalfjaell" target="_blank" rel="noopener">Musikkväll på kalfjäll</a>
+    <a href="https://funasfjallen.se/event/the-tallest-man-on-earth/" target="_blank" rel="noopener">Funäsfjällen · konsert</a>
+    <a href="https://www.nortic.se/ticket/event/76312" target="_blank" rel="noopener">Biljetter (Nortic)</a>
+    <a href="https://funasfjallen.se/boende-i-fjallen/" target="_blank" rel="noopener">Funäsfjällen · boende</a>
+    <a href="https://www.tanndalen.com/boende" target="_blank" rel="noopener">Tänndalen · boende</a>
+  </div>
+</footer>
