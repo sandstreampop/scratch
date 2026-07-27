@@ -144,6 +144,9 @@ class Game {
     this.atmosphere.configureShadows(this.quality.get('shadowMapSize') || 1024);
     this.atmosphere.sun.shadow.radius = this.quality.get('shadowRadius');
     if (this.scene.fog) this.scene.fog.density *= this.quality.get('fogDensityScale');
+    // Ask the GPU whether the environment map actually lights anything before
+    // a single surface is built on top of the assumption that it does.
+    this.envReport = this.atmosphere.verifyEnvironment(this.renderer);
     window.__MARK?.('atmosphere');
   }
 
@@ -631,6 +634,10 @@ function showDiagnostics(game) {
     ['half_float_linear', String(game.renderer.extensions.has('OES_texture_half_float_linear'))],
     ['max texture', String(gl.getParameter(gl.MAX_TEXTURE_SIZE))],
     ['env map', game.scene.environment ? 'present' : 'MISSING'],
+    ['env response', game.envReport
+      ? `${game.envReport.measured.toFixed(4)} / ${game.envReport.expected.toFixed(4)}`
+        + (game.envReport.healed ? ' HEALED' : '')
+      : 'unmeasured'],
     ['draw calls', String(game.renderer.info.render.calls)],
     ['triangles', String(game.renderer.info.render.triangles)],
     ['gl error', String(gl.getError())],

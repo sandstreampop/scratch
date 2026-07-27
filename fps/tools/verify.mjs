@@ -246,6 +246,20 @@ try {
   check('image-based lighting is live', envLuma > 0.02,
     `environment-lit probe at ${envLuma}`);
 
+  // The device-side guard behind that: it measures the environment's actual
+  // irradiance against what the sky was authored to emit, and puts the
+  // shortfall back through analytic lights when the GPU comes up short. Either
+  // outcome is acceptable — a dark scene is not. Asserting the verdict here
+  // keeps the guard from quietly becoming a no-op.
+  const env = await page.evaluate(() => window.__GAME.envReport);
+  check('environment guard reports a lit scene',
+    !!env && (env.healed || env.measured >= env.expected * 0.45),
+    env
+      ? `irradiance ${env.measured.toFixed(4)} of ${env.expected.toFixed(4)} expected`
+        + (env.pointSampled ? ', recovered by point sampling' : '')
+        + (env.healed ? ', healed with analytic fill' : '')
+      : 'no measurement taken');
+
   const before = await page.evaluate(() => {
     const g = window.__GAME;
     return { x: g.player.position.x, z: g.player.position.z, yaw: g.player.yaw, ammo: g.weapon.ammo };

@@ -322,7 +322,7 @@ export class Atmosphere {
    * contribution stays out of it, since the directional light already carries
    * it and including it here would double-count.
    */
-  buildEnvironmentTexture(width = 256) {
+  buildEnvironmentTexture(width = 256, filter = THREE.LinearFilter) {
     const height = width / 2;
     const data = new Float32Array(width * height * 4);
 
@@ -342,6 +342,9 @@ export class Atmosphere {
     // look like a render; a real sky is orange on one side and blue on the
     // other, and shadowed geometry picks that up.
     const sunAz = Math.atan2(sun.z, sun.x);
+
+    let sumWeight = 0;
+    let sumLuma = 0;
 
     for (let y = 0; y < height; y++) {
       // three's equirectUv: v = asin(dir.y)/PI + 0.5, so row 0 looks straight down.
@@ -392,8 +395,17 @@ export class Atmosphere {
         data[i + 1] = g * this.settings.skyLuminance;
         data[i + 2] = b * this.settings.skyLuminance;
         data[i + 3] = 1;
+
+        // Solid-angle-weighted mean radiance, accumulated while the linear
+        // values are still here. This is what a white diffuse surface under
+        // this environment should come back as, and verifyEnvironment() checks
+        // the GPU against it. Texel solid angle on a latitude-linear map goes
+        // with cos(elevation).
+        sumWeight += cy;
+        sumLuma += cy * (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]);
       }
     }
+    this.envMeanRadiance = sumLuma / Math.max(sumWeight, 1e-6);
 
     // 8-bit, sRGB-encoded — the only texture format every target filters.
     //
@@ -431,8 +443,8 @@ export class Atmosphere {
     const tex = new THREE.DataTexture(bytes, width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
     tex.mapping = THREE.EquirectangularReflectionMapping;
     tex.colorSpace = THREE.SRGBColorSpace;
-    tex.minFilter = THREE.LinearFilter;
-    tex.magFilter = THREE.LinearFilter;
+    tex.minFilter = filter;
+    tex.magFilter = filter;
     tex.generateMipmaps = false;
     tex.needsUpdate = true;
     this.envPeak = peak;
@@ -450,14 +462,28 @@ export class Atmosphere {
    * any renderer.
    */
   environmentLuma(renderer) {
+    return this.probeLuma(renderer, (scene) => {
+      scene.environment = this.scene.environment;
+      scene.environmentIntensity = this.scene.environmentIntensity;
+    });
+  }
+
+  /**
+   * Mean luma of a white sphere under one configuration of a bare scene.
+   *
+   * Only the ratio of two of these is meaningful — the sphere covers a fixed
+   * fraction of the frame, and dividing one probe by another cancels that
+   * coverage exactly, which is what makes the result comparable across
+   * renderers instead of a number that has to be retuned per rasteriser.
+   */
+  probeLuma(renderer, configure) {
     const scene = new THREE.Scene();
-    scene.environment = this.scene.environment;
-    scene.environmentIntensity = this.scene.environmentIntensity;
     const probe = new THREE.Mesh(
       new THREE.SphereGeometry(1, 16, 12),
       new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1, metalness: 0 }),
     );
     scene.add(probe);
+    configure(scene);
     const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 10);
     camera.position.set(0, 0, 2.6);
 
@@ -489,12 +515,76 @@ export class Atmosphere {
     return luma;
   }
 
+  /**
+   * Confirms on the running device that image-based lighting survived, and
+   * puts the missing light back with analytic lights if it did not.
+   *
+   * The iOS black scene came from a texture format the device would not filter,
+   * and the fix was to stop using one. But the class of bug is wider than the
+   * instance: PMREM convolves whatever it is handed, an unfilterable or
+   * unrenderable intermediate samples as black, and every PBR surface in the
+   * game goes black while the sky — which has no envMap — keeps drawing. No
+   * feature probe covers every way that can happen on hardware nobody here can
+   * hold, so this measures the outcome instead of predicting the cause.
+   *
+   * The two probes differ only in their light source, so their ratio is the
+   * environment's irradiance in the same units as an ambient light of
+   * intensity 1, on any renderer. buildEnvironmentTexture() already knows what
+   * that should be, so a disagreement is measurable without a reference device.
+   *
+   * Recovery is a ladder, because the two rungs are not equivalent. Point
+   * sampling first: an unfilterable texture is incomplete and samples black,
+   * but no format is ever incomplete for NEAREST, and PMREM's own convolution
+   * washes out most of what point sampling costs on a source this smooth. That
+   * keeps real image-based lighting — diffuse and specular, directional. Only
+   * if that also fails do analytic lights make up the shortfall, which is a
+   * genuine downgrade: hemisphere fill has no specular and no structure, and
+   * the tone curve compresses it hard enough that it cannot reach parity. It
+   * is there so the worst case is a flat-looking scene rather than a black one.
+   */
+  verifyEnvironment(renderer) {
+    const reference = this.probeLuma(renderer, (scene) => {
+      scene.add(new THREE.AmbientLight(0xffffff, 1));
+    });
+    // A failed readback says nothing about the environment; leave it alone
+    // rather than compensate for a measurement that did not happen.
+    if (!(reference > 0.01)) return null;
+
+    // getIBLIrradiance multiplies by PI; getAmbientLightIrradiance does not.
+    // Both probes are the same sphere under the same BRDF, so that factor is
+    // the only systematic difference between them, and with it in place the
+    // GPU agrees with the CPU-side integral to within about a percent.
+    const expected = Math.PI * this.envMeanRadiance * this.settings.environmentIntensity;
+    const measure = () => this.environmentLuma(renderer) / reference;
+
+    const report = { measured: measure(), expected, healed: false, pointSampled: false };
+    if (!(expected > 1e-4)) return report;
+
+    // Generous: PMREM's convolution, the byte round-trip and the probe's own
+    // quantisation all cost a little, and over-triggering would double-light
+    // a device that was fine. This fires on collapse, not on drift.
+    const ok = (v) => v >= expected * 0.45;
+    if (ok(report.measured)) return report;
+
+    this.refreshEnvironment(THREE.NearestFilter);
+    report.measured = measure();
+    report.pointSampled = true;
+    if (ok(report.measured)) return report;
+
+    const deficit = Math.max(0, expected - Math.max(0, report.measured));
+    this.hemi.intensity = this.settings.hemiIntensity + deficit * 2.2;
+    this.bounce.intensity = this.settings.fillIntensity + deficit * 1.3;
+    report.healed = true;
+    this.iblFallback = true;
+    return report;
+  }
+
   /** Re-convolves the analytic sky into scene.environment. */
-  refreshEnvironment() {
+  refreshEnvironment(filter = THREE.LinearFilter) {
     if (this.envTarget) this.envTarget.dispose();
     this.envSource?.dispose();
 
-    this.envSource = this.buildEnvironmentTexture();
+    this.envSource = this.buildEnvironmentTexture(256, filter);
     this.envTarget = this.pmrem.fromEquirectangular(this.envSource);
     this.scene.environment = this.envTarget.texture;
     // envPeak restores the range the byte encoding normalised away.
