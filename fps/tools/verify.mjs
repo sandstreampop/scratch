@@ -62,11 +62,15 @@ else {
   port = server.address().port;
 }
 
-// The deployed page needs the same two declarations the local harness makes:
-// CI browsers are software rasterisers regardless of where the page is served.
+// Deliberately does NOT force 8-bit buffers. Every check used to, which is
+// precisely how a device-only black screen shipped: the one configuration real
+// users get was the one configuration never exercised. The renderer now
+// detects and falls back on its own, so the harness runs the default path and
+// that fallback is under test. Only the tier stays pinned, which is a genuine
+// property of a GPU-less runner rather than a rendering decision.
 const baseUrl = liveUrl
-  ? `${liveUrl}${liveUrl.includes('?') ? '&' : '?'}buffers=byte&quality=low`
-  : `http://127.0.0.1:${port}/index.html?buffers=byte&quality=low`;
+  ? `${liveUrl}${liveUrl.includes('?') ? '&' : '?'}quality=low`
+  : `http://127.0.0.1:${port}/index.html?quality=low`;
 
 // iPhone 13 in landscape — the orientation the game asks for.
 const IPHONE = {

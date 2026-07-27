@@ -12,7 +12,7 @@
 
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
-import { material, maps } from './textures.js';
+import { maps } from './textures.js';
 
 const TAU = Math.PI * 2;
 // Rig-space pull applied to the sun-tracked key: over the camera's left
@@ -104,21 +104,22 @@ function reticleTexture() {
   // A 2-MOA emitter is a hard-edged point with a tight bloom around it, not a
   // gaussian smear. The smear is what a soft dot looks like out of the eyebox,
   // and it is the single tell that separates a modelled optic from a decal.
-  const glow = g.createRadialGradient(cx, cy, 0, cx, cy, s * 0.15);
-  glow.addColorStop(0.00, 'rgba(255, 62, 38, 0.60)');
-  glow.addColorStop(0.22, 'rgba(255, 48, 28, 0.18)');
-  glow.addColorStop(1.00, 'rgba(255, 40, 24, 0.00)');
+  const glow = g.createRadialGradient(cx, cy, 0, cx, cy, s * 0.11);
+  glow.addColorStop(0.00, 'rgba(255, 40, 20, 0.42)');
+  glow.addColorStop(0.28, 'rgba(255, 34, 16, 0.12)');
+  glow.addColorStop(1.00, 'rgba(255, 30, 14, 0.00)');
   g.fillStyle = glow;
   g.fillRect(0, 0, s, s);
 
-  const core = g.createRadialGradient(cx, cy, 0, cx, cy, s * 0.030);
-  core.addColorStop(0.00, 'rgba(255, 246, 242, 1.0)');
-  core.addColorStop(0.42, 'rgba(255, 128, 78, 1.0)');
-  core.addColorStop(0.74, 'rgba(255, 46, 26, 0.92)');
-  core.addColorStop(1.00, 'rgba(255, 40, 24, 0.0)');
+  const core = g.createRadialGradient(cx, cy, 0, cx, cy, s * 0.028);
+  core.addColorStop(0.00, 'rgba(255, 214, 196, 1.0)');
+  core.addColorStop(0.52, 'rgba(255, 132, 74, 1.0)');
+  core.addColorStop(0.78, 'rgba(255, 44, 20, 1.0)');
+  core.addColorStop(0.94, 'rgba(255, 36, 16, 0.55)');
+  core.addColorStop(1.00, 'rgba(255, 30, 14, 0.0)');
   g.fillStyle = core;
   g.beginPath();
-  g.arc(cx, cy, s * 0.032, 0, TAU);
+  g.arc(cx, cy, s * 0.030, 0, TAU);
   g.fill();
 
   const t = new THREE.CanvasTexture(c);
@@ -139,10 +140,10 @@ function lensTexture() {
   const g = c.getContext('2d');
   const cx = s / 2, cy = s / 2;
   const grd = g.createRadialGradient(cx, cy, 0, cx, cy, s * 0.5);
-  grd.addColorStop(0.00, '#2c2c2c');
-  grd.addColorStop(0.48, '#3a3a3a');
-  grd.addColorStop(0.74, '#6e6e6e');
-  grd.addColorStop(0.92, '#d2d2d2');
+  grd.addColorStop(0.00, '#1c1c1c');
+  grd.addColorStop(0.62, '#242424');
+  grd.addColorStop(0.82, '#4e4e4e');
+  grd.addColorStop(0.93, '#a8a8a8');
   grd.addColorStop(1.00, '#ffffff');
   g.fillStyle = grd;
   g.fillRect(0, 0, s, s);
@@ -505,7 +506,7 @@ function buildCarbine() {
   // and fully clear and the aperture is just a hole with the same world behind
   // it, which is exactly how a painted-on optic looks.
   const lensMat = new THREE.MeshPhysicalMaterial({
-    color: 0x1d3b52,
+    color: 0x25465e,
     alphaMap: lensTexture(),
     roughness: 0.05,
     metalness: 0.0,
@@ -574,7 +575,7 @@ export class Weapon {
     // The shadow side of a black rifle has nothing but sky to work with, so
     // this carries most of the value there. Pushed past ~1.3 the small
     // anodised parts start mirroring the dawn and read as bare aluminium.
-    this.scene.environmentIntensity = 0.62;
+    this.scene.environmentIntensity = 0.80;
 
     // Viewmodel FOV is deliberately decoupled from the world camera. The world
     // runs very wide for peripheral awareness; putting a 0.84 m object through
@@ -700,7 +701,7 @@ export class Weapon {
     // sun 8 degrees above the horizon backlights the carbine from most player
     // headings, and an honest key would silhouette the hero prop on half the
     // compass. Direction tracks the sun; placement is pulled toward the lens.
-    this.key = new THREE.DirectionalLight(0xffdcbb, 2.85);
+    this.key = new THREE.DirectionalLight(0xffdcbb, 4.20);
     this.key.position.set(0.6, 1.0, 0.35);
     this.key.castShadow = true;
     this.key.shadow.mapSize.set(1024, 1024);
@@ -718,28 +719,28 @@ export class Weapon {
     // Cool sky on the shadow side. Kept low and to the side: raised overhead it
     // lights every top face at once and the receiver reads as light grey
     // plastic instead of phosphate.
-    this.fill = new THREE.DirectionalLight(0x9fbde0, 1.75);
+    this.fill = new THREE.DirectionalLight(0x9fbde0, 2.90);
     this.fill.position.set(0.85, 0.75, 0.90);
     this.scene.add(this.fill);
 
     // Rim rides past the sun and high, so the top rail and the optic tube keep
     // a hot edge that no amount of key can give a flat-topped receiver.
-    this.rim = new THREE.DirectionalLight(0xffc9a2, 0.72);
+    this.rim = new THREE.DirectionalLight(0xffc9a2, 0.45);
     this.rim.position.set(-0.25, 0.95, -1.0);
     this.scene.add(this.rim);
 
     // Sand bounce. At this hour the ground is the brightest surface in frame
     // and the undersides of the magazine, handguard and support glove see
     // essentially nothing else; without it they sit on the grade's black floor.
-    this.bounce = new THREE.DirectionalLight(0xffc890, 0.46);
+    this.bounce = new THREE.DirectionalLight(0xffc890, 0.66);
     this.bounce.position.set(0.15, -1.0, 0.30);
     this.scene.add(this.bounce);
 
     // Sky-over-sand ambient plus a flat floor. A black rifle sits around 0.06
     // albedo; without this much indirect the shadow side lands under the tone
     // curve's toe and the whole lower half of the weapon crushes to zero.
-    this.scene.add(new THREE.HemisphereLight(0x9cc0e6, 0xb08a58, 0.28));
-    this.scene.add(new THREE.AmbientLight(0xdfe4ee, 0.13));
+    this.scene.add(new THREE.HemisphereLight(0x9cc0e6, 0xb08a58, 0.44));
+    this.scene.add(new THREE.AmbientLight(0xdfe4ee, 0.23));
   }
 
   /** Aligns the viewmodel rig with the world sun as the player turns. */

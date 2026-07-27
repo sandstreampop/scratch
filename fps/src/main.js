@@ -105,6 +105,20 @@ class Game {
     this.renderer.info.autoReset = true;
     this.container.appendChild(this.renderer.domElement);
 
+    // iOS discards the WebGL context under memory pressure. Without a handler
+    // the canvas simply stops updating and looks like a hang.
+    this.renderer.domElement.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      this.contextLost = true;
+      console.error('renderer: WebGL context lost');
+      showFatal('GRAPHICS CONTEXT LOST', 'The browser reclaimed the WebGL context, '
+        + 'usually from memory pressure. Reload to restart.');
+    });
+    this.renderer.domElement.addEventListener('webglcontextrestored', () => {
+      this.contextLost = false;
+      console.warn('renderer: WebGL context restored');
+    });
+
     setAnisotropy(Math.min(this.quality.get('anisotropy'),
       this.renderer.capabilities.getMaxAnisotropy()));
     // Must precede any material construction; textures are cached on first use.
@@ -158,6 +172,9 @@ class Game {
   setupPost() {
     this.post = new PostStack(this.renderer, this.scene, this.camera, PRESET.exposure);
     this.viewmodelPass = this.post.setViewmodel(this.weapon.scene, this.weapon.camera);
+    // One real frame through the chain before anything is presented, so a
+    // device that cannot composite falls back instead of showing black.
+    this.post.validateFrame();
     this.applyQuality(this.quality.settings);
     this.quality.onChange((s) => this.applyQuality(s));
     window.__MARK?.('post');
@@ -570,10 +587,62 @@ async function runShotMode(game, preset) {
     await new Promise((r) => setTimeout(r, 0));
   }
 
+  if (params.get('diag') === '1') showDiagnostics(game);
+
   window.__SHOT_READY = true;
 }
 
 /* ------------------------------------------------------------- entry ----- */
+
+/** Shown instead of a black screen when the renderer cannot continue. */
+function showFatal(title, detail) {
+  let el = document.getElementById('fatal');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'fatal';
+    el.style.cssText = 'position:fixed;inset:0;z-index:60;display:flex;flex-direction:column;'
+      + 'align-items:center;justify-content:center;background:#07090b;color:#f0f4f8;'
+      + 'font:600 13px/1.7 -apple-system,system-ui,sans-serif;letter-spacing:2px;'
+      + 'text-align:center;padding:24px';
+    document.body.appendChild(el);
+  }
+  el.innerHTML = `<div style="color:#ffb454;letter-spacing:4px">${title}</div>`
+    + `<div style="margin-top:12px;max-width:34em;color:rgba(240,244,248,0.6);`
+    + `letter-spacing:1px;font-weight:400">${detail}</div>`;
+}
+
+/**
+ * On-screen renderer report. The console is not reachable on a phone, so when
+ * something only reproduces on a device this is the only way to see what that
+ * device actually provided.
+ */
+function showDiagnostics(game) {
+  const gl = game.renderer.getContext();
+  const info = gl.getExtension('WEBGL_debug_renderer_info');
+  const rows = [
+    ['WebGL', game.renderer.capabilities.isWebGL2 ? '2' : '1'],
+    ['renderer', info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : 'masked'],
+    ['tier', game.quality.tierName],
+    ['pixel ratio', String(game.renderer.getPixelRatio())],
+    ['buffers', game.post.bufferType === THREE.HalfFloatType ? 'half-float' : '8-bit'],
+    ['post', game.post.postDisabled ? 'DISABLED (fallback)' : 'active'],
+    ['color_buffer_float', String(game.renderer.extensions.has('EXT_color_buffer_float'))],
+    ['float_linear', String(game.renderer.extensions.has('OES_texture_float_linear'))],
+    ['half_float_linear', String(game.renderer.extensions.has('OES_texture_half_float_linear'))],
+    ['max texture', String(gl.getParameter(gl.MAX_TEXTURE_SIZE))],
+    ['env map', game.scene.environment ? 'present' : 'MISSING'],
+    ['draw calls', String(game.renderer.info.render.calls)],
+    ['triangles', String(game.renderer.info.render.triangles)],
+    ['gl error', String(gl.getError())],
+  ];
+  const el = document.createElement('div');
+  el.style.cssText = 'position:fixed;left:8px;top:8px;z-index:50;background:rgba(4,6,8,0.86);'
+    + 'color:#cfe;font:11px/1.5 ui-monospace,Menlo,monospace;padding:10px 12px;'
+    + 'border:1px solid rgba(255,255,255,0.2);border-radius:4px;pointer-events:none;'
+    + 'max-width:70vw';
+  el.innerHTML = rows.map(([k, v]) => `${k}: <b>${v}</b>`).join('<br>');
+  document.body.appendChild(el);
+}
 
 function setProgress(label, fraction) {
   const fill = document.getElementById('loading-fill');

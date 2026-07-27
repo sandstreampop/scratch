@@ -395,13 +395,47 @@ export class Atmosphere {
       }
     }
 
-    const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
+    // 8-bit, sRGB-encoded — the only texture format every target filters.
+    //
+    // Linear filtering of wider formats is extension-gated and the gaps do not
+    // agree: iOS Safari has OES_texture_half_float_linear but not
+    // OES_texture_float_linear, while SwiftShader has exactly the reverse. An
+    // unfilterable texture is incomplete, samples as black, and PMREM then
+    // convolves that black into scene.environment — which renders every PBR
+    // surface in the game black while the sky, having no envMap, carries on
+    // drawing and makes it look like a lighting bug.
+    //
+    // Nothing here needs float precision anyway: this is a smooth gradient
+    // with one soft aureole. Normalising by the peak and returning that peak
+    // as a multiplier keeps the full dynamic range, in a format with no
+    // capability question attached.
+    let peak = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      peak = Math.max(peak, data[i], data[i + 1], data[i + 2]);
+    }
+    peak = Math.max(peak, 1e-6);
+
+    const bytes = new Uint8Array(data.length);
+    for (let i = 0; i < data.length; i += 4) {
+      for (let k = 0; k < 3; k++) {
+        const linear = data[i + k] / peak;
+        // sRGB transfer, so the 256 steps land where the eye needs them.
+        const encoded = linear <= 0.0031308
+          ? linear * 12.92
+          : 1.055 * Math.pow(linear, 1 / 2.4) - 0.055;
+        bytes[i + k] = Math.round(Math.min(1, Math.max(0, encoded)) * 255);
+      }
+      bytes[i + 3] = 255;
+    }
+
+    const tex = new THREE.DataTexture(bytes, width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
     tex.mapping = THREE.EquirectangularReflectionMapping;
-    tex.colorSpace = THREE.NoColorSpace;      // already linear
+    tex.colorSpace = THREE.SRGBColorSpace;
     tex.minFilter = THREE.LinearFilter;
     tex.magFilter = THREE.LinearFilter;
     tex.generateMipmaps = false;
     tex.needsUpdate = true;
+    this.envPeak = peak;
     return tex;
   }
 
@@ -413,7 +447,8 @@ export class Atmosphere {
     this.envSource = this.buildEnvironmentTexture();
     this.envTarget = this.pmrem.fromEquirectangular(this.envSource);
     this.scene.environment = this.envTarget.texture;
-    this.scene.environmentIntensity = this.settings.environmentIntensity;
+    // envPeak restores the range the byte encoding normalised away.
+    this.scene.environmentIntensity = this.settings.environmentIntensity * (this.envPeak ?? 1);
   }
 
   /**

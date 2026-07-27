@@ -463,6 +463,16 @@ const FXAAShader = {
   `,
 };
 
+/** Scalar mirrors of the grade shader's transfer, for validation on the host. */
+function acesToneMap(x) {
+  const a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+  return Math.min(1, Math.max(0, (x * (a * x + b)) / (x * (c * x + d) + e)));
+}
+
+function srgbTransfer(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
 /* ---------------------------------------------------------------- public -- */
 
 export class PostStack {
@@ -485,9 +495,15 @@ export class PostStack {
     // guess, the headless harnesses declare it: ?buffers=byte. Nothing a
     // player runs takes that path.
     const forceByte = new URLSearchParams(location.search).get('buffers') === 'byte';
-    const bufferType = (!forceByte && renderer.capabilities.isWebGL2)
+    // Rendering into RGBA16F is an extension, not a WebGL2 guarantee. Ask
+    // rather than assume: being wrong here costs the entire image.
+    const canRenderHalfFloat = renderer.extensions.has('EXT_color_buffer_float')
+      || renderer.extensions.has('EXT_color_buffer_half_float');
+    const bufferType = (!forceByte && renderer.capabilities.isWebGL2 && canRenderHalfFloat)
       ? THREE.HalfFloatType : THREE.UnsignedByteType;
     this.bufferType = bufferType;
+    this.postDisabled = false;
+    this._validated = false;
     this.composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(w, h, {
       type: bufferType,
       samples: 0,
@@ -554,6 +570,145 @@ export class PostStack {
   }
 
   /**
+   * Renders one frame through the real chain and falls back if it comes out
+   * black.
+   *
+   * Feature probes have repeatedly failed to predict this: a device can report
+   * every extension, clear and read a target correctly, draw a single quad
+   * into one, and still produce nothing from the full multi-pass composite.
+   * The only question that has ever given the right answer is whether the
+   * composed frame has light in it, so ask that, once, at startup.
+   *
+   * Two stages: drop to 8-bit buffers, then drop post-processing entirely. A
+   * frame that is merely ungraded is worth far more than a black one, and
+   * there is no third failure mode — a plain forward render into the default
+   * framebuffer is the path the sky already proves works.
+   */
+  validateFrame() {
+    if (this._validated) return true;
+    this._validated = true;
+
+    const previous = this.composer.renderToScreen;
+    this.composer.renderToScreen = false;
+    let threw = null;
+    try {
+      this.composer.render(1 / 60);
+    } catch (e) {
+      threw = e;
+    }
+    this.composer.renderToScreen = previous;
+
+    if (threw) return this.degrade(`composer threw: ${String(threw).slice(0, 120)}`);
+
+    // Either buffer may hold the result, depending on the final pass's swap.
+    const composed = Math.max(
+      this.meanLuma(this.composer.readBuffer, this.bufferType),
+      this.meanLuma(this.composer.writeBuffer, this.bufferType),
+    );
+    const reference = this.referenceLuma();
+
+    // Nothing to diagnose if the scene itself has no light in it.
+    if (reference < 0.005) return true;
+
+    // The two are not in the same space: the reference is scene-referred
+    // linear, the composite is display-referred sRGB, and a correct frame is
+    // several times brighter than its linear source. Put the reference
+    // through the same curve before comparing, or the test reads a working
+    // frame as broken and a broken one as fine.
+    const expected = srgbTransfer(acesToneMap(reference * this.grade.uniforms.uExposure.value));
+    if (composed >= expected * 0.35) return true;
+
+    return this.degrade(
+      `composed ${composed.toFixed(3)} against an expected ${expected.toFixed(3)}`,
+    );
+  }
+
+  /**
+   * Mean luminance of a target's centre, normalised to 0..1.
+   *
+   * Sampling the centre rather than the whole frame keeps this cheap and
+   * avoids the vignette, which darkens exactly the region that would otherwise
+   * bias the average toward "broken".
+   */
+  meanLuma(target, type) {
+    if (!target) return -1;
+    const w = Math.min(32, target.width), h = Math.min(32, target.height);
+    const x = Math.max(0, (target.width - w) >> 1), y = Math.max(0, (target.height - h) >> 1);
+    const half = type === THREE.HalfFloatType;
+    const buffer = half ? new Uint16Array(w * h * 4) : new Uint8Array(w * h * 4);
+    try {
+      this.renderer.readRenderTargetPixels(target, x, y, w, h, buffer);
+    } catch (e) {
+      return -1;
+    }
+    let sum = 0;
+    for (let i = 0; i < buffer.length; i += 4) {
+      const r = half ? THREE.DataUtils.fromHalfFloat(buffer[i]) : buffer[i] / 255;
+      const g = half ? THREE.DataUtils.fromHalfFloat(buffer[i + 1]) : buffer[i + 1] / 255;
+      const b = half ? THREE.DataUtils.fromHalfFloat(buffer[i + 2]) : buffer[i + 2] / 255;
+      sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+    return sum / (buffer.length / 4);
+  }
+
+  /**
+   * Forward-renders the scene into an 8-bit target as a reference.
+   *
+   * The comparison matters: an absolute threshold cannot tell a broken
+   * composite from a scene that is legitimately dark. A plain forward render
+   * always works — it is the path the sky already proves — so it establishes
+   * what this frame *should* look like.
+   */
+  referenceLuma() {
+    const target = new THREE.WebGLRenderTarget(64, 64, {
+      type: THREE.UnsignedByteType, colorSpace: THREE.LinearSRGBColorSpace,
+    });
+    const previous = this.renderer.getRenderTarget();
+    this.renderer.setRenderTarget(target);
+    this.renderer.clear();
+    this.renderer.render(this.scene, this.camera);
+    const luma = this.meanLuma(target, THREE.UnsignedByteType);
+    this.renderer.setRenderTarget(previous);
+    target.dispose();
+    return luma;
+  }
+
+  degrade(reason) {
+    if (this.bufferType === THREE.HalfFloatType) {
+      console.warn(`post: ${reason}; retrying on 8-bit buffers`);
+      this.rebuildBuffers(THREE.UnsignedByteType);
+      this._validated = false;
+      return this.validateFrame();
+    }
+    console.warn(`post: ${reason}; disabling post-processing`);
+    this.postDisabled = true;
+    return false;
+  }
+
+  /** Swaps the composer's buffer format, preserving the pass chain. */
+  rebuildBuffers(type) {
+    const size = this.renderer.getSize(new THREE.Vector2());
+    const dpr = this.renderer.getPixelRatio();
+    const passes = [...this.composer.passes];
+
+    this.bufferType = type;
+    this.composer.renderTarget1.dispose();
+    this.composer.renderTarget2.dispose();
+
+    const target = new THREE.WebGLRenderTarget(
+      Math.max(1, Math.floor(size.x * dpr)), Math.max(1, Math.floor(size.y * dpr)),
+      { type, colorSpace: THREE.LinearSRGBColorSpace },
+    );
+    this.composer.renderTarget1 = target;
+    this.composer.renderTarget2 = target.clone();
+    this.composer.writeBuffer = this.composer.renderTarget1;
+    this.composer.readBuffer = this.composer.renderTarget2;
+    this.composer.passes = passes;
+    this.composer.setPixelRatio(dpr);
+    this.composer.setSize(size.x, size.y);
+  }
+
+  /**
    * Inserts the first-person weapon into the chain: after world-space AO and
    * shafts (which must not touch it) but before bloom and the grade (which
    * must, or the weapon looks pasted on).
@@ -600,6 +755,21 @@ export class PostStack {
     this.grade.uniforms.uTime.value = elapsed;
     // The quality tier owns `smaa.enabled`; FXAA takes over whenever it drops.
     this.fxaa.enabled = !this.smaa.enabled;
+
+    if (this.postDisabled) {
+      // Last resort: forward render, then the viewmodel over a cleared depth
+      // buffer. Ungraded, but visible.
+      this.renderer.setRenderTarget(null);
+      this.renderer.clear();
+      this.renderer.render(this.scene, this.camera);
+      if (this.viewmodel) {
+        this.renderer.autoClear = false;
+        this.renderer.clearDepth();
+        this.renderer.render(this.viewmodel.scene, this.viewmodel.camera);
+        this.renderer.autoClear = true;
+      }
+      return;
+    }
     this.composer.render(dt);
   }
 

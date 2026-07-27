@@ -9,9 +9,15 @@ import * as THREE from 'three';
 const TAU = Math.PI * 2;
 const _v = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
+const _v3 = new THREE.Vector3();
+const _v4 = new THREE.Vector3();
+const _v5 = new THREE.Vector3();
 const _q = new THREE.Quaternion();
+const _q2 = new THREE.Quaternion();
 const _m = new THREE.Matrix4();
+const _basis = new THREE.Matrix4();
 const _s = new THREE.Vector3();
+const _AXIS_Z = new THREE.Vector3(0, 0, 1);
 
 /* ------------------------------------------------------------- textures -- */
 
@@ -140,6 +146,10 @@ function initTextures() {
 /**
  * Pooled sprite particles. One draw call per system.
  * `mode` selects the blend: 'additive' for sparks/embers, 'normal' for smoke.
+ *
+ * Sizes are world-space diameters in metres, projected through the lens in the
+ * vertex shader. Authoring them in pixels instead is how a muzzle puff spawned
+ * 0.8 m from the eye ends up asking for a 20,000 px sprite.
  */
 class PointPool {
   constructor(scene, count, texture, mode, sizeAttenuation = true) {
@@ -162,6 +172,7 @@ class PointPool {
       uniforms: {
         uMap: { value: texture },
         uPixelRatio: { value: 1 },
+        uViewHeight: { value: 900 },
         uAttenuate: { value: sizeAttenuation ? 1 : 0 },
       },
       vertexShader: /* glsl */`
@@ -170,13 +181,18 @@ class PointPool {
         varying vec3 vColor;
         varying float vAlpha;
         uniform float uPixelRatio;
+        uniform float uViewHeight;
         uniform float uAttenuate;
         void main() {
           vColor = color;
           vAlpha = aAlpha;
           vec4 mv = modelViewMatrix * vec4(position, 1.0);
-          float atten = mix(1.0, 300.0 / max(-mv.z, 0.001), uAttenuate);
-          gl_PointSize = aSize * atten * uPixelRatio;
+          // projectionMatrix[1][1] is 1/tan(fovY/2), so this is the exact
+          // pixel height a one-metre sprite covers at this depth.
+          float perMetre = projectionMatrix[1][1] * uViewHeight * 0.5 / max(-mv.z, 0.05);
+          float px = aSize * mix(1.0, perMetre, uAttenuate);
+          // Nothing spawned at arm's length may ever tile the viewport.
+          gl_PointSize = min(px, 220.0) * uPixelRatio;
           gl_Position = projectionMatrix * mv;
         }
       `,
@@ -219,6 +235,7 @@ class PointPool {
     this.grav = new Float32Array(count);
     this.spin = new Float32Array(count);
     this.fade = new Float32Array(count);       // exponent on the alpha ramp
+    this.peak = new Float32Array(count);       // ceiling on that ramp
     this.col0 = new Float32Array(count * 3);
     this.col1 = new Float32Array(count * 3);
     this.bounce = new Uint8Array(count);
@@ -239,6 +256,7 @@ class PointPool {
     this.drag[i] = o.drag ?? 1.4;
     this.grav[i] = o.gravity ?? 0;
     this.fade[i] = o.fade ?? 1;
+    this.peak[i] = o.opacity ?? 1;
     this.bounce[i] = o.bounce ? 1 : 0;
     const c0 = o.color0, c1 = o.color1 ?? o.color0;
     this.col0[i3] = c0.r; this.col0[i3 + 1] = c0.g; this.col0[i3 + 2] = c0.b;
@@ -274,7 +292,7 @@ class PointPool {
       }
 
       size[i] = this.size0[i] + (this.size1[i] - this.size0[i]) * t;
-      alpha[i] = Math.pow(1 - t, this.fade[i]) * Math.min(1, t * 14);
+      alpha[i] = Math.pow(1 - t, this.fade[i]) * Math.min(1, t * 14) * this.peak[i];
       col[i3] = col0[i3] + (col1[i3] - col0[i3]) * t;
       col[i3 + 1] = col0[i3 + 1] + (col1[i3 + 1] - col0[i3 + 1]) * t;
       col[i3 + 2] = col0[i3 + 2] + (col1[i3 + 2] - col0[i3 + 2]) * t;
@@ -325,8 +343,8 @@ class DecalPool {
   place(point, normal, size, roll = Math.random() * TAU) {
     const i = this.cursor;
     this.cursor = (this.cursor + 1) % this.count;
-    _q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal);
-    _q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), roll));
+    _q.setFromUnitVectors(_AXIS_Z, normal);
+    _q.multiply(_q2.setFromAxisAngle(_AXIS_Z, roll));
     _v.copy(point).addScaledVector(normal, 0.012);
     _s.set(size, size, size);
     _m.compose(_v, _q, _s);
@@ -337,14 +355,17 @@ class DecalPool {
 
 /* --------------------------------------------------------------- tracers -- */
 
+const TRACER_LENGTH = 9.0;
+
 class TracerPool {
   constructor(scene, count) {
-    // A unit quad stretched along -Z; the shader keeps it facing the camera
-    // by billboarding around its own axis.
+    // A unit quad stretched along +Y; the shader keeps it facing the camera
+    // by billboarding around its own axis. Local y runs 0 at the tail to 1 at
+    // the head and local x spans the width, which is all the gradients need.
     const geo = new THREE.PlaneGeometry(1, 1);
     geo.translate(0, 0.5, 0);
     const mat = new THREE.MeshBasicMaterial({
-      color: 0xffd9a2,
+      color: 0xff8c3a,
       transparent: true,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
@@ -359,13 +380,22 @@ class TracerPool {
 
     this.opacity = new THREE.InstancedBufferAttribute(new Float32Array(count), 1);
     geo.setAttribute('aOpacity', this.opacity);
+    // The quad is the envelope, not the round. Without a falloff across it the
+    // streak is a hard-edged plank of clipped white; with one it reads as a
+    // millimetre-wide hot core inside its own glow, fading down the tail.
     mat.onBeforeCompile = (shader) => {
-      shader.vertexShader = 'attribute float aOpacity;\nvarying float vO;\n'
-        + shader.vertexShader.replace('void main() {', 'void main() {\n  vO = aOpacity;');
-      shader.fragmentShader = 'varying float vO;\n'
+      shader.vertexShader = 'attribute float aOpacity;\nvarying float vO;\nvarying vec2 vStreak;\n'
+        + shader.vertexShader.replace(
+          'void main() {',
+          'void main() {\n  vO = aOpacity;\n  vStreak = position.xy;',
+        );
+      shader.fragmentShader = 'varying float vO;\nvarying vec2 vStreak;\n'
         + shader.fragmentShader.replace(
           '#include <opaque_fragment>',
-          'gl_FragColor = vec4( outgoingLight, diffuseColor.a * vO );',
+          `float core = exp( -vStreak.x * vStreak.x * 30.0 );
+           float along = pow( clamp( vStreak.y, 0.0, 1.0 ), 3.0 );
+           gl_FragColor = vec4( outgoingLight * mix( 1.0, 2.4, along ),
+             diffuseColor.a * vO * core * ( 0.05 + 0.95 * along ) );`,
         );
     };
 
@@ -384,7 +414,7 @@ class TracerPool {
     }
   }
 
-  fire(origin, direction, distance, speed = 480, width = 0.022) {
+  fire(origin, direction, distance, speed = 480, width = 0.024) {
     const i = this.cursor;
     this.cursor = (this.cursor + 1) % this.count;
     const i3 = i * 3;
@@ -402,38 +432,42 @@ class TracerPool {
     const camPos = camera.position;
     for (let i = 0; i < this.count; i++) {
       if (!this.active[i]) continue;
-      any = true;
       const i3 = i * 3;
       this.dist[i] += this.speed[i] * dt;
-      if (this.dist[i] > this.maxDist[i] + 6) {
+
+      // The head stops at the impact point while the tail keeps running, so
+      // the streak drains into the surface instead of vanishing mid-air.
+      const head = Math.min(this.dist[i], this.maxDist[i]);
+      const tail = Math.max(0, this.dist[i] - TRACER_LENGTH);
+      const len = head - tail;
+      if (len <= 0.01) {
         this.active[i] = 0;
         this.opacity.array[i] = 0;
         _m.makeScale(0, 0, 0);
         this.mesh.setMatrixAt(i, _m);
+        any = true;
         continue;
       }
-      // Streak trails behind the projectile head.
-      const head = Math.min(this.dist[i], this.maxDist[i]);
-      const len = Math.min(5.5, head);
-      const tail = head - len;
+      any = true;
+
       _v.set(this.from[i3] + this.dir[i3] * tail,
         this.from[i3 + 1] + this.dir[i3 + 1] * tail,
         this.from[i3 + 2] + this.dir[i3 + 2] * tail);
       _v2.set(this.dir[i3], this.dir[i3 + 1], this.dir[i3 + 2]);
 
       // Billboard: quad's local Y runs along the tracer, local Z faces camera.
-      const toCam = new THREE.Vector3().subVectors(camPos, _v).normalize();
-      const side = new THREE.Vector3().crossVectors(_v2, toCam).normalize();
-      const facing = new THREE.Vector3().crossVectors(side, _v2).normalize();
-      const basis = new THREE.Matrix4().makeBasis(side, _v2, facing);
-      _q.setFromRotationMatrix(basis);
+      _v3.subVectors(camPos, _v).normalize();
+      _v4.crossVectors(_v2, _v3).normalize();
+      _v5.crossVectors(_v4, _v2).normalize();
+      _basis.makeBasis(_v4, _v2, _v5);
+      _q.setFromRotationMatrix(_basis);
       _s.set(this.width[i], len, 1);
       _m.compose(_v, _q, _s);
       this.mesh.setMatrixAt(i, _m);
 
-      // Fade over the flight so the streak does not pop out at the end.
-      this.opacity.array[i] = Math.min(1, (this.maxDist[i] - head) / 3 + 0.15)
-        * Math.min(1, this.dist[i] / 2.2);
+      // Ramp in over the first couple of metres so the streak does not pop out
+      // of the barrel already at full length.
+      this.opacity.array[i] = Math.min(1, this.dist[i] / 2.2);
     }
     if (any) {
       this.mesh.instanceMatrix.needsUpdate = true;
@@ -534,6 +568,47 @@ class CasingPool {
   }
 }
 
+/* ---------------------------------------------------------------- flashes -- */
+
+/** Short-lived point lights on a ring buffer. Everything that goes bang has to
+ *  put its light on the world or the bang reads as a decal floating in front
+ *  of an unlit scene. */
+class FlashPool {
+  constructor(scene, count, color, distance) {
+    this.slots = [];
+    for (let i = 0; i < count; i++) {
+      const light = new THREE.PointLight(color, 0, distance, 2);
+      light.castShadow = false;
+      light.visible = false;
+      scene.add(light);
+      this.slots.push({ light, life: 0, max: 1, peak: 0 });
+    }
+    this.cursor = 0;
+  }
+
+  pulse(position, color, intensity, life) {
+    const slot = this.slots[this.cursor];
+    this.cursor = (this.cursor + 1) % this.slots.length;
+    slot.light.position.copy(position);
+    slot.light.color.set(color);
+    slot.light.intensity = intensity;
+    slot.light.visible = true;
+    slot.life = life;
+    slot.max = life;
+    slot.peak = intensity;
+  }
+
+  update(dt) {
+    for (const slot of this.slots) {
+      if (slot.life <= 0) continue;
+      slot.life -= dt;
+      if (slot.life <= 0) { slot.light.visible = false; slot.light.intensity = 0; continue; }
+      const k = slot.life / slot.max;
+      slot.light.intensity = slot.peak * k * k;
+    }
+  }
+}
+
 /* ------------------------------------------------------------------ VFX -- */
 
 export class VFX {
@@ -557,17 +632,24 @@ export class VFX {
 
     this.buildAmbientDust();
 
-    this._impactLights = [];
-    for (let i = 0; i < 4; i++) {
-      const l = new THREE.PointLight(0xffb060, 0, 4.5, 2);
-      l.visible = false;
-      scene.add(l);
-      this._impactLights.push({ light: l, life: 0 });
-    }
-    this._lightCursor = 0;
+    this._impactFlash = new FlashPool(scene, 4, 0xffb060, 4.5);
+    this._muzzleFlash = new FlashPool(scene, 3, 0xffb474, 14);
 
     this.onCasingLand = null;
     this.casings.onLand = (x, y, z, v) => this.onCasingLand?.(x, y, z, v);
+
+    this._syncViewport();
+    window.addEventListener('resize', () => this._syncViewport());
+    window.visualViewport?.addEventListener('resize', () => this._syncViewport());
+  }
+
+  /** Sprite sizes are metres, so the shader needs the viewport height to turn
+   *  them into pixels. */
+  _syncViewport() {
+    const h = Math.max(1, Math.round(window.visualViewport?.height ?? window.innerHeight));
+    for (const pool of [this.sparks, this.debris, this.smoke, this.blood]) {
+      pool.points.material.uniforms.uViewHeight.value = h;
+    }
   }
 
   /** Slow-drifting motes that catch the sun — the single cheapest way to
@@ -647,15 +729,7 @@ export class VFX {
   /* ------------------------------------------------------------ spawners -- */
 
   flashLight(position, color, intensity, life) {
-    const slot = this._impactLights[this._lightCursor];
-    this._lightCursor = (this._lightCursor + 1) % this._impactLights.length;
-    slot.light.position.copy(position);
-    slot.light.color.set(color);
-    slot.light.intensity = intensity;
-    slot.light.visible = true;
-    slot.life = life;
-    slot.max = life;
-    slot.peak = intensity;
+    this._impactFlash.pulse(position, color, intensity, life);
   }
 
   /** Surface hit: spall, dust, sparks on hard materials, and a hole decal. */
@@ -676,8 +750,9 @@ export class VFX {
         vy: normal.y * (0.9 + Math.random()) + Math.random() * 0.7 + 0.3,
         vz: normal.z * (0.9 + Math.random()) + (Math.random() - 0.5) * spread,
         life: 0.75 + Math.random() * 0.85,
-        size0: 6 + Math.random() * 5,
-        size1: 34 + Math.random() * 26,
+        size0: 0.09 + Math.random() * 0.07,
+        size1: 0.50 + Math.random() * 0.38,
+        opacity: 0.75,
         drag: 2.6,
         gravity: -0.7,
         fade: 1.7,
@@ -702,8 +777,8 @@ export class VFX {
         x: point.x, y: point.y, z: point.z,
         vx: dir.x * sp, vy: dir.y * sp + 1.2, vz: dir.z * sp,
         life: 0.7 + Math.random() * 1.1,
-        size0: 1.6 + Math.random() * 2.4,
-        size1: 1.0 + Math.random() * 1.2,
+        size0: 0.022 + Math.random() * 0.034,
+        size1: 0.014 + Math.random() * 0.017,
         drag: 0.45,
         gravity: 15,
         fade: 0.7,
@@ -730,8 +805,8 @@ export class VFX {
           x: point.x, y: point.y, z: point.z,
           vx: dir.x * sp, vy: dir.y * sp, vz: dir.z * sp,
           life: 0.16 + Math.random() * 0.42,
-          size0: 3.2 + Math.random() * 3.4,
-          size1: 0.4,
+          size0: 0.05 + Math.random() * 0.055,
+          size1: 0.008,
           drag: 1.1,
           gravity: 13,
           fade: 1.5,
@@ -756,8 +831,8 @@ export class VFX {
         x: point.x, y: point.y, z: point.z,
         vx: d.x * sp, vy: d.y * sp + 0.8, vz: d.z * sp,
         life: 0.35 + Math.random() * 0.6,
-        size0: 3 + Math.random() * 6,
-        size1: 1.5 + Math.random() * 3,
+        size0: 0.035 + Math.random() * 0.07,
+        size1: 0.018 + Math.random() * 0.035,
         drag: 1.5,
         gravity: 12,
         fade: 1.2,
@@ -773,8 +848,9 @@ export class VFX {
         vy: (Math.random() - 0.2) * 0.7,
         vz: direction.z * 1.3 + (Math.random() - 0.5) * 0.8,
         life: 0.32 + Math.random() * 0.30,
-        size0: 5,
-        size1: 22,
+        size0: 0.07,
+        size1: 0.34,
+        opacity: 0.7,
         drag: 3.6,
         gravity: 1.5,
         fade: 2.2,
@@ -784,24 +860,36 @@ export class VFX {
     }
   }
 
-  /** Muzzle smoke that lingers in front of the shooter. */
+  /** Muzzle smoke: a wisp that lifts off the barrel and clears in half a
+   *  second, plus the warm kick the flash throws onto everything nearby. */
   muzzleSmoke(position, direction) {
-    for (let i = 0; i < 3; i++) {
+    // The barrel is roughly a metre from the eye, so anything spawned on the
+    // muzzle itself is effectively against the near plane. Start the wisps
+    // downrange and give them enough speed to keep receding.
+    for (let i = 0; i < 6; i++) {
+      const along = 0.35 + Math.random() * 0.55;
       this.smoke.spawn({
-        x: position.x, y: position.y, z: position.z,
-        vx: direction.x * (1.6 + Math.random()) + (Math.random() - 0.5) * 0.5,
-        vy: direction.y * 1.4 + 0.35 + Math.random() * 0.4,
-        vz: direction.z * (1.6 + Math.random()) + (Math.random() - 0.5) * 0.5,
-        life: 0.5 + Math.random() * 0.8,
-        size0: 4 + Math.random() * 4,
-        size1: 26 + Math.random() * 22,
-        drag: 3.0,
-        gravity: -1.2,
-        fade: 2.0,
-        color0: new THREE.Color(0.55, 0.52, 0.48),
-        color1: new THREE.Color(0.40, 0.38, 0.36),
+        x: position.x + direction.x * along + (Math.random() - 0.5) * 0.10,
+        y: position.y + direction.y * along + (Math.random() - 0.5) * 0.10,
+        z: position.z + direction.z * along + (Math.random() - 0.5) * 0.10,
+        vx: direction.x * (3.2 + Math.random() * 1.8) + (Math.random() - 0.5) * 0.7,
+        vy: direction.y * 2.6 + 0.5 + Math.random() * 0.55,
+        vz: direction.z * (3.2 + Math.random() * 1.8) + (Math.random() - 0.5) * 0.7,
+        life: 0.26 + Math.random() * 0.30,
+        size0: 0.05 + Math.random() * 0.04,
+        size1: 0.22 + Math.random() * 0.16,
+        opacity: 0.22,
+        drag: 2.2,
+        gravity: -1.6,
+        fade: 2.4,
+        color0: new THREE.Color(0.60, 0.57, 0.53),
+        color1: new THREE.Color(0.44, 0.42, 0.40),
       });
     }
+    // Without this the gun and the ground stay in shadow while a bright decal
+    // floats beside them; the bounce is what sells the frame as a gunshot.
+    _v.copy(position).addScaledVector(direction, 0.20);
+    this._muzzleFlash.pulse(_v, 0xffb474, 90, 0.075);
   }
 
   /** Dust kicked up by a footfall. */
@@ -817,8 +905,9 @@ export class VFX {
         vy: 0.25 + Math.random() * 0.35,
         vz: Math.sin(a) * 0.5 * strength,
         life: 0.6 + Math.random() * 0.6,
-        size0: 6,
-        size1: 26 + Math.random() * 14,
+        size0: 0.10,
+        size1: 0.42 + Math.random() * 0.24,
+        opacity: 0.7,
         drag: 3.2,
         gravity: -0.4,
         fade: 2.4,
@@ -841,13 +930,8 @@ export class VFX {
     u.uCam.value.copy(this.camera.position);
     if (sunDirection) u.uSun.value.copy(sunDirection);
 
-    for (const slot of this._impactLights) {
-      if (slot.life <= 0) continue;
-      slot.life -= dt;
-      if (slot.life <= 0) { slot.light.visible = false; slot.light.intensity = 0; continue; }
-      const k = slot.life / slot.max;
-      slot.light.intensity = slot.peak * k * k;
-    }
+    this._impactFlash.update(dt);
+    this._muzzleFlash.update(dt);
   }
 
   setPixelRatio(r) {
@@ -856,5 +940,6 @@ export class VFX {
     this.smoke.points.material.uniforms.uPixelRatio.value = r;
     this.blood.points.material.uniforms.uPixelRatio.value = r;
     this.dustMaterial.uniforms.uPixelRatio.value = r;
+    this._syncViewport();
   }
 }
