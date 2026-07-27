@@ -46,7 +46,7 @@ export const PRESET = {
   // Key and fill have to differ in colour temperature, not just in level, or
   // the cast shadows come back as a darker copy of the sunlit sand and the
   // frame reads as one warm ramp at no particular hour.
-  hemiIntensity: 0.20,
+  hemiIntensity: 0.34,
   hazeColor: 0x8fa3ba,     // aerial perspective, away from the sun
   hazeSunColor: 0xffcb9c,  // ... and looking into it
   // Haze is sky radiance seen end-on, so it has to sit on the same scale as
@@ -61,8 +61,8 @@ export const PRESET = {
   fogDensity: 0.0030,
   fogHeight: 40,           // metres; e-folding height of the dust layer
   fillColor: 0xa6c2e6,     // cool sky fill on the shadow side
-  fillIntensity: 0.22,
-  skyLuminance: 0.17,      // scales the analytic IBL
+  fillIntensity: 0.40,
+  skyLuminance: 0.26,      // scales the analytic IBL
   environmentIntensity: 1.0,
 };
 

@@ -919,6 +919,11 @@ export class Level {
 
   /* --------------------------------------------------------- props: kit -- */
 
+  /**
+   * `color` multiplies the painted albedo rather than replacing it, and that
+   * albedo is already dark olive drab — so container tints have to be light to
+   * land anywhere near a believable value once the product is taken.
+   */
   container(x, z, ry, color) {
     const g = new THREE.Group();
     g.position.set(x, this.groundHeight(x, z), z);
@@ -2059,10 +2064,10 @@ export class Level {
 
     // Containers: one broadside in the middle distance to carry the eye across
     // the courtyard, one stacked pair north-west, one by the south wall.
-    this.container(-4.8, -10.5, 0.28, 0x5c6b58);
-    this.container(-13.2, 15.4, 0.12, 0x7a4f3a);
-    this.container(13.6, 7.2, 1.46, 0x4a5a66);
-    this.container(5, -17.5, 0.10, 0x556067);
+    this.container(-4.8, -10.5, 0.28, 0xb8ccae);
+    this.container(-13.2, 15.4, 0.12, 0xd8a184);
+    this.container(13.6, 7.2, 1.46, 0xa6c0d2);
+    this.container(5, -17.5, 0.10, 0xb0bcc4);
 
     // Sandbag line across the courtyard and a firing position by the gate.
     this.sandbags(-8.4, -2.6, 6.0, 0.62, 3);
