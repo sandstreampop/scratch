@@ -70,9 +70,13 @@ else {
 // detects and falls back on its own, so the harness runs the default path and
 // that fallback is under test. Only the tier stays pinned, which is a genuine
 // property of a GPU-less runner rather than a rendering decision.
+// --quality=auto leaves the tier to detectTier(), which is the only way to
+// test the choice a real device gets rather than one the harness imposed.
+const tier = (args.find((a) => a.startsWith('--quality=')) || '--quality=low').split('=')[1];
+const query = tier === 'auto' ? '' : `quality=${tier}`;
 const baseUrl = liveUrl
-  ? `${liveUrl}${liveUrl.includes('?') ? '&' : '?'}quality=low`
-  : `http://127.0.0.1:${port}/index.html?quality=low`;
+  ? `${liveUrl}${query ? `${liveUrl.includes('?') ? '&' : '?'}${query}` : ''}`
+  : `http://127.0.0.1:${port}/index.html${query ? `?${query}` : ''}`;
 
 // iPhone 13 in landscape — the orientation the game asks for.
 const IPHONE = {
@@ -133,6 +137,14 @@ if (emulate === 'ios') {
         return (supported.call(this) || []).filter((n) => !withheld.has(n));
       };
     }
+
+    // WebKit clamps this, and the runner does not. Reporting the runner's
+    // core count let tier detection be tested against a number no iPhone
+    // returns, which is how every current handset ended up pinned to the
+    // lowest tier without the harness noticing.
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
+    // Absent on Safari; present on the runner.
+    delete Navigator.prototype.deviceMemory;
   });
 }
 
@@ -352,8 +364,16 @@ try {
 
   await page.screenshot({ path: path.join(SHOTS, `${label}-2-playing.png`), timeout: 120000 });
 
-  const tier = await page.evaluate(() => window.__GAME?.quality?.tierName ?? 'unknown');
-  console.log(`      quality tier: ${tier}`);
+  const chosen = await page.evaluate(() => window.__GAME?.quality?.tierName ?? 'unknown');
+  console.log(`      quality tier: ${chosen}`);
+
+  // Only meaningful when nothing pinned the tier. The lowest tier is the one
+  // setting the governor can never undo, so landing there by detection on a
+  // phone profile is a permanent downgrade and worth failing over.
+  if (tier === 'auto' && !desktop) {
+    check('detected tier is not pinned to the floor', chosen !== 'low',
+      `detectTier chose ${chosen} at ${await page.evaluate(() => navigator.hardwareConcurrency)} cores`);
+  }
 
   const fatal = errors.filter((e) => !/favicon|404/i.test(e));
   check('no runtime errors', fatal.length === 0, fatal.slice(0, 2).join(' | '));

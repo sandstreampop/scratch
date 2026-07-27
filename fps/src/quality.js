@@ -107,9 +107,16 @@ export function detectTier() {
     : 0;
 
   if (platform.mobile) {
-    // A modern iPhone handles medium comfortably; anything older, or any
-    // low-core Android, starts at low and can be promoted later.
-    if (platform.ios) return cores >= 6 ? 'medium' : 'low';
+    // Not `cores >= 6`. WebKit clamps hardwareConcurrency, so current iPhones
+    // routinely report 4 and every one of them was pinned to the lowest tier —
+    // 256px textures, no sun shafts, no antialiasing — with no way back up,
+    // because the governor below only ever moves down. Guessing high is the
+    // cheap mistake here: a device that cannot hold medium drops out of it
+    // within a few seconds of measured frame time, and the only part of the
+    // tier fixed at boot is texture resolution, at 512px rather than 256px.
+    // Guessing low is the expensive one, because it is permanent.
+    if (platform.ios) return cores > 0 && cores <= 2 ? 'low' : 'medium';
+    // Android's core and memory reporting is honest enough to use directly.
     if (cores >= 8 && memory >= 6) return 'medium';
     return 'low';
   }
