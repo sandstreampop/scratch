@@ -12,10 +12,12 @@ import { Sky } from 'three/addons/objects/Sky.js';
 export const PRESET = {
   elevation: 8.6,          // degrees above horizon
   azimuth: 104,            // degrees, clockwise from north
-  // Turbidity scales Mie directly, and Mie at this sun elevation is what
-  // smears the disc into a pale wash across a third of the dome. Keeping the
-  // dust load low and the Rayleigh column high is what holds a cool zenith
-  // above a warm horizon inside one frame, which is the whole read of dawn.
+  // A high Rayleigh column is what holds a cool zenith above a warm horizon
+  // inside one frame, and that contrast is the whole read of dawn. Mie is
+  // nearly irrelevant at this dust load — its extinction is two orders below
+  // Rayleigh's — so the pale wash around the sun is forward-scattered Rayleigh
+  // through a horizon-length air mass and cannot be tuned away with turbidity.
+  // What separates the disc from it is headroom, not scattering.
   turbidity: 1.4,
   rayleigh: 5.5,
   mieCoefficient: 0.0026,
@@ -60,7 +62,7 @@ export const PRESET = {
   fogHeight: 40,           // metres; e-folding height of the dust layer
   fillColor: 0xa6c2e6,     // cool sky fill on the shadow side
   fillIntensity: 0.22,
-  skyLuminance: 0.13,      // scales the analytic IBL
+  skyLuminance: 0.17,      // scales the analytic IBL
   environmentIntensity: 1.0,
 };
 

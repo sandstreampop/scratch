@@ -15,10 +15,28 @@ import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.j
 import { material } from './textures.js';
 
 const TAU = Math.PI * 2;
-const WORLD_UP = new THREE.Vector3(0, 1, 0);
-// Rig-space pull applied to the sun-tracked key: right, up, and behind the
-// lens. Large enough that the key never falls entirely behind the weapon.
-const KEY_BIAS = new THREE.Vector3(0.55, 0.62, 0.90);
+// Rig-space pull applied to the sun-tracked key: over the camera's left
+// shoulder and above, which is the only quadrant that lights the flank of a
+// right-hand-carried weapon.
+const KEY_BIAS = new THREE.Vector3(-0.95, 0.78, 0.62);
+
+// Every viewmodel material is built from `material()` with these applied on
+// top. Three of the slots have to go.
+//
+// The ORM image is one texture bound to aoMap, roughnessMap and metalnessMap
+// at once. That is fine everywhere in the world and it renders the viewmodel
+// black: on this build, binding the same image to more than one of those slots
+// on a material that also carries an albedo map drops the surface to zero.
+// Keeping roughness on the map and carrying metalness as a scalar loses
+// nothing — gunmetal's metal channel is a constant 1 and polymer's a constant
+// 0 — and it is the difference between a lit hero prop and a cut-out.
+//
+// The tangent-space normal map goes for a second reason: with no tangent
+// attribute three derives the frame from screen-space derivatives, and at
+// 0.3 m from the lens those derivatives are ~1e-4, so the determinant lands
+// under the guard in patch.js and the frame collapses. Albedo and roughness
+// carry the surface detail instead.
+const VM_MAPS = { aoMap: null, normalMap: null, metalnessMap: null };
 
 // Vertical field of view for the viewmodel lens, in degrees, and how far the
 // eye sits behind the ocular when aiming. Eye relief is the only thing setting
@@ -168,28 +186,28 @@ function buildCarbine() {
   // Roughness low enough that the receiver flanks pick up a grazing sheen. Run
   // it fully matte and the whole part collapses onto one value, which is what
   // makes a viewmodel read as a cut-out rather than as machined steel.
-  const phosphate = new THREE.MeshBasicMaterial({ color: 0xff0000 });
-  const barrelSteel = new THREE.MeshBasicMaterial({ color: 0xff8000 });
-  const furniture = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
-  const gripPoly = new THREE.MeshBasicMaterial({ color: 0x008040 });
+  const phosphate = material('gunmetal', [3.2, 3.2], { ...VM_MAPS, roughness: 0.62, metalness: 0.24 });
+  const barrelSteel = material('gunmetal', [5, 5], { ...VM_MAPS, roughness: 0.52, metalness: 0.75 });
+  const furniture = material('polymer', [3, 3], { ...VM_MAPS, roughness: 0.92, metalness: 0 });
+  const gripPoly = material('polymer', [7, 7], { ...VM_MAPS, roughness: 0.98, metalness: 0 });
   // An FDE magazine is the one value break a black rifle gets, and it is what
   // stops the lower right of frame being a single silhouette. The albedo map
   // is dropped so the tint is the base value rather than a multiply against
   // near-black polymer; normal and ORM stay, so the moulding still reads.
-  const magPoly = new THREE.MeshBasicMaterial({ color: 0xff00ff });
+  const magPoly = material('polymer', [1.6, 3], { ...VM_MAPS, map: null, color: 0x9c8763, roughness: 0.80, metalness: 0 });
   // Small hard parts sit a stop above the body, not below it. Authored darker
   // than the receiver they are holding, every pin, slot and control disappears
   // and the detail that is modelled might as well not exist. Tiled hard so the
   // sampler's polished-through wear lands as a highlight on a part this size
   // instead of averaging out — a flat swatch here reads as moulded plastic.
-  const small = new THREE.MeshBasicMaterial({ color: 0x0000ff });
-  const railMat = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+  const small = material('gunmetal', [5, 5], { ...VM_MAPS, roughness: 0.88, metalness: 0.26 });
+  const railMat = new THREE.MeshStandardMaterial({ color: 0x2e3136, roughness: 0.80, metalness: 0.25 });
   // Tiled tight on purpose: at low repeat the gunmetal sampler's polished-through
   // wear blobs are bigger than the optic itself and turn the whole tube chrome.
-  const opticBody = new THREE.MeshBasicMaterial({ color: 0xffff00 });
-  const worn = new THREE.MeshBasicMaterial({ color: 0x8000ff });
-  const rubber = new THREE.MeshBasicMaterial({ color: 0x804000 });
-  const bore = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  const opticBody = material('gunmetal', [5, 5], { ...VM_MAPS, roughness: 0.74, metalness: 0.30 });
+  const worn = material('gunmetal', [8, 8], { ...VM_MAPS, roughness: 0.72, metalness: 0.60 });
+  const rubber = new THREE.MeshStandardMaterial({ color: 0x2a2a2d, roughness: 0.90, metalness: 0.0 });
+  const bore = new THREE.MeshStandardMaterial({ color: 0x0a0a0b, roughness: 1.0, metalness: 0.3 });
 
   const part = (geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
     const m = new THREE.Mesh(geo, mat);
@@ -670,9 +688,9 @@ export class Weapon {
     // sun 8 degrees above the horizon backlights the carbine from most player
     // headings, and an honest key would silhouette the hero prop on half the
     // compass. Direction tracks the sun; placement is pulled toward the lens.
-    this.key = new THREE.DirectionalLight(0xffd6ab, 3.6);
+    this.key = new THREE.DirectionalLight(0xff0000, 8.0);
     this.key.position.set(0.6, 1.0, 0.35);
-    this.key.castShadow = true;
+    this.key.castShadow = false;
     this.key.shadow.mapSize.set(1024, 1024);
     this.key.shadow.camera.near = 0.05;
     this.key.shadow.camera.far = 3;
@@ -685,17 +703,18 @@ export class Weapon {
     this.scene.add(this.key);
     this.scene.add(this.key.target);
 
-    // Cool sky on the shadow side. Kept low and to the side: raised overhead it
-    // lights every top face at once and the receiver reads as light grey
-    // plastic instead of phosphate.
-    this.fill = new THREE.DirectionalLight(0xa9c3e2, 3.0);
-    this.fill.position.set(-0.90, 0.42, 0.85);
+    // Cool sky, fixed in rig space over the camera's right shoulder. It picks
+    // up the top and the rear faces the key misses and gives the phosphate its
+    // colour break; anything sun-driven here swings across the weapon as the
+    // player turns and periodically lands on the faces nobody can see.
+    this.fill = new THREE.DirectionalLight(0xa9c3e2, 1.6);
+    this.fill.position.set(0.85, 0.75, 0.90);
     this.scene.add(this.fill);
 
-    // Rim rides past the sun and high, so the top rail and the optic tube keep
-    // a hot edge that no amount of key can give a flat-topped receiver.
-    this.rim = new THREE.DirectionalLight(0xffb877, 1.05);
-    this.rim.position.set(-0.3, 0.9, -1.0);
+    // Rim comes from behind and above so the top rail, the optic housing and
+    // the handguard get an edge no frontal light can give a flat-topped part.
+    this.rim = new THREE.DirectionalLight(0xffb877, 2.4);
+    this.rim.position.set(-0.25, 0.95, -1.0);
     this.scene.add(this.rim);
 
     // Sand bounce. At this hour the ground is the brightest surface in frame
@@ -716,23 +735,19 @@ export class Weapon {
   syncLighting(sunDirection, worldCamera) {
     const sun = sunDirection.clone().applyQuaternion(worldCamera.quaternion.clone().invert());
 
-    // Anchored to the sun for azimuth, biased toward the lens for exposure. A
-    // pure sun placement is correct and unusable; a pure rig light is usable
-    // and reads as a studio shot. The mix keeps the direction the player
-    // expects while guaranteeing the faces they can see are the lit ones.
-    this.key.position.copy(sun).multiplyScalar(0.85).add(KEY_BIAS).normalize().multiplyScalar(2);
+    // Anchored to the sun for azimuth, biased hard toward the camera's left for
+    // exposure. The weapon is carried on the right, so the only large surface
+    // the lens ever sees is its left flank; a key that honours the sun puts
+    // that flank in shade on most headings and the hero prop goes to
+    // silhouette. Sun weight is low enough to keep the direction believable and
+    // high enough that turning into the light visibly changes the weapon.
+    this.key.position.copy(sun).multiplyScalar(0.40).add(KEY_BIAS).normalize().multiplyScalar(2);
     this.key.target.position.set(0, -0.05, -0.2);
     this.key.target.updateMatrixWorld();
 
-    // A third of a turn past the sun and lifted, so the top rail catches an
-    // edge whichever heading the player is on.
-    this.rim.position.copy(sun).applyAxisAngle(WORLD_UP, 2.35);
-    this.rim.position.y = 0.80;
-    this.rim.position.normalize().multiplyScalar(2);
-
-    // Fill opposes the key in azimuth only; it is sky, so it never comes from
-    // below and never picks up the sun's warmth.
-    this.fill.position.set(-sun.x * 1.3 - 0.35, 0.55, 0.95);
+    // Rim swings with the sun's azimuth but stays behind and above, so the top
+    // rail keeps its edge whichever heading the player is on.
+    this.rim.position.set(-sun.x * 0.5 - 0.20, 0.95, -1.0);
 
     // The rig lives in camera space but the environment is authored in world
     // space, so without this the weapon reflects a fixed patch of sky that
@@ -989,9 +1004,9 @@ function buildHands() {
   // the firing hand merges into the part it is holding and neither reads; the
   // knuckle pad and the cuff then have to sit either side of the glove so the
   // hand carries three values instead of one.
-  const glove = new THREE.MeshBasicMaterial({ color: 0x40ff80 });
-  const knuckle = new THREE.MeshBasicMaterial({ color: 0xff0080 });
-  const sleeve = new THREE.MeshBasicMaterial({ color: 0x8080ff });
+  const glove = new THREE.MeshStandardMaterial({ color: 0x3d362d, roughness: 0.90, metalness: 0.0 });
+  const knuckle = new THREE.MeshStandardMaterial({ color: 0x211d19, roughness: 0.58, metalness: 0.0 });
+  const sleeve = material('canvas', [4, 4], { ...VM_MAPS, roughness: 1.0, metalness: 0, color: 0x9e9075 });
 
   const piece = (parent, geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
     const m = new THREE.Mesh(geo, mat);

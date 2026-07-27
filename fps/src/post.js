@@ -289,7 +289,7 @@ const GradeShader = {
     uTime: { value: 0 },
     uResolution: { value: new THREE.Vector2(1, 1) },
     uExposure: { value: 1.0 },
-    uAberration: { value: 0.0007 },
+    uAberration: { value: 0.00045 },
     uVignette: { value: 0.30 },
     // Also dithers the 8-bit composite buffers, which quantise the shadows
     // hard enough to band without it.
@@ -534,7 +534,7 @@ export class PostStack {
     // work lamp in the outpost — which is how bloom ends up reading as fog with
     // a second sun in it. Above 0.6 only the solar core and a muzzle flash
     // qualify, which is the one thing in a dawn frame that should glare.
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.55, 0.62, 0.72);
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.50, 0.60, 0.85);
     this.composer.addPass(this.bloom);
 
     this.grade = new ShaderPass(GradeShader);
