@@ -15,13 +15,20 @@ import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.j
 import { material } from './textures.js';
 
 const TAU = Math.PI * 2;
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
+// Rig-space pull applied to the sun-tracked key: right, up, and behind the
+// lens. Large enough that the key never falls entirely behind the weapon.
+const KEY_BIAS = new THREE.Vector3(0.55, 0.62, 0.90);
 
 // Vertical field of view for the viewmodel lens, in degrees, and how far the
 // eye sits behind the ocular when aiming. Eye relief is the only thing setting
 // how much of the frame the sight tube fills, so it is a tuning knob, not a
 // consequence of the pose.
-const FOV_HIP = 48;
-const FOV_ADS = 40;
+// Kept within ~20 degrees of the world lens. Open the gap much further and the
+// carbine stops being a held object and becomes a wall down the right of frame;
+// close it entirely and a 0.84 m prop 30 cm from the eye starts to fisheye.
+const FOV_HIP = 60;
+const FOV_ADS = 50;
 const ADS_EYE_RELIEF = 0.105;
 const OCULAR_OFFSET = 0.0285;   // rear glass, forward of the optic's centre
 
@@ -63,26 +70,52 @@ function reticleTexture() {
   g.clearRect(0, 0, s, s);
   const cx = s / 2, cy = s / 2;
 
-  // Soft bloom halo behind the dot — this is what sells an illuminated optic.
-  const glow = g.createRadialGradient(cx, cy, 0, cx, cy, s * 0.30);
-  glow.addColorStop(0.00, 'rgba(255, 60, 40, 0.85)');
-  glow.addColorStop(0.16, 'rgba(255, 46, 28, 0.30)');
-  glow.addColorStop(0.45, 'rgba(255, 40, 24, 0.06)');
+  // A 2-MOA emitter is a hard-edged point with a tight bloom around it, not a
+  // gaussian smear. The smear is what a soft dot looks like out of the eyebox,
+  // and it is the single tell that separates a modelled optic from a decal.
+  const glow = g.createRadialGradient(cx, cy, 0, cx, cy, s * 0.15);
+  glow.addColorStop(0.00, 'rgba(255, 62, 38, 0.60)');
+  glow.addColorStop(0.22, 'rgba(255, 48, 28, 0.18)');
   glow.addColorStop(1.00, 'rgba(255, 40, 24, 0.00)');
   g.fillStyle = glow;
   g.fillRect(0, 0, s, s);
 
-  const core = g.createRadialGradient(cx, cy, 0, cx, cy, s * 0.052);
-  core.addColorStop(0.0, 'rgba(255, 236, 230, 1.0)');
-  core.addColorStop(0.30, 'rgba(255, 96, 60, 1.0)');
-  core.addColorStop(1.0, 'rgba(255, 40, 24, 0.0)');
+  const core = g.createRadialGradient(cx, cy, 0, cx, cy, s * 0.030);
+  core.addColorStop(0.00, 'rgba(255, 246, 242, 1.0)');
+  core.addColorStop(0.42, 'rgba(255, 128, 78, 1.0)');
+  core.addColorStop(0.74, 'rgba(255, 46, 26, 0.92)');
+  core.addColorStop(1.00, 'rgba(255, 40, 24, 0.0)');
   g.fillStyle = core;
   g.beginPath();
-  g.arc(cx, cy, s * 0.055, 0, TAU);
+  g.arc(cx, cy, s * 0.032, 0, TAU);
   g.fill();
 
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
+  t.needsUpdate = true;
+  return t;
+}
+
+/**
+ * Alpha ramp for the objective glass: near-clear on axis, opaque against the
+ * tube wall. That falloff is the eye-relief shadow, and without it the sight
+ * picture is the same image as the world beside it and the lens disappears.
+ */
+function lensTexture() {
+  const s = 128;
+  const c = document.createElement('canvas');
+  c.width = c.height = s;
+  const g = c.getContext('2d');
+  const cx = s / 2, cy = s / 2;
+  const grd = g.createRadialGradient(cx, cy, 0, cx, cy, s * 0.5);
+  grd.addColorStop(0.00, '#2c2c2c');
+  grd.addColorStop(0.48, '#3a3a3a');
+  grd.addColorStop(0.74, '#6e6e6e');
+  grd.addColorStop(0.92, '#d2d2d2');
+  grd.addColorStop(1.00, '#ffffff');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, s, s);
+  const t = new THREE.CanvasTexture(c);
   t.needsUpdate = true;
   return t;
 }
@@ -103,15 +136,21 @@ const RAIL_DECK = 0.0262;        // slot floor above the bore
 const RAIL_PITCH = 0.0100;       // recoil-groove spacing
 const SIGHT_HEIGHT = 0.068;      // optical axis over bore
 
-/** One picatinny recoil lug, chamfered like the real extrusion. */
+/**
+ * One picatinny recoil lug. The real extrusion has a 0.2 mm chamfer, but on a
+ * part 0.34 m from the lens that flank lands well inside a single pixel and
+ * every tooth turns into a specular firefly — the deck reads as a dotted comb
+ * rather than as a rail. Widening it to 4 mm gives the highlight something to
+ * roll across and costs nothing at this size.
+ */
 function railToothGeometry() {
   const s = new THREE.Shape();
   s.moveTo(-0.0106, 0);
   s.lineTo(0.0106, 0);
-  s.lineTo(0.0106, 0.0014);
-  s.lineTo(0.0086, 0.0034);
-  s.lineTo(-0.0086, 0.0034);
-  s.lineTo(-0.0106, 0.0014);
+  s.lineTo(0.0106, 0.0008);
+  s.lineTo(0.0066, 0.0034);
+  s.lineTo(-0.0066, 0.0034);
+  s.lineTo(-0.0106, 0.0008);
   s.closePath();
   const g = new THREE.ExtrudeGeometry(s, { depth: 0.0050, bevelEnabled: false, curveSegments: 1 });
   g.translate(0, 0, -0.0025);
@@ -126,23 +165,37 @@ function buildCarbine() {
   // worn-through high points ever specular. Modelled at full metalness it has no
   // diffuse term at all and the receiver becomes a hole in a backlit frame;
   // backing metalness off gives the flanks something for the fill to catch.
-  const phosphate = material('gunmetal', [3.2, 3.2], { roughness: 0.88, metalness: 0.30 });
-  const barrelSteel = material('gunmetal', [5, 5], { roughness: 0.58, metalness: 0.75 });
-  const furniture = material('polymer', [3, 3], { roughness: 1.0 });
-  const gripPoly = material('polymer', [7, 7], { roughness: 1.05 });
+  // Roughness low enough that the receiver flanks pick up a grazing sheen. Run
+  // it fully matte and the whole part collapses onto one value, which is what
+  // makes a viewmodel read as a cut-out rather than as machined steel.
+  const phosphate = material('gunmetal', [3.2, 3.2], { roughness: 0.62, metalness: 0.24 });
+  const barrelSteel = material('gunmetal', [5, 5], { roughness: 0.52, metalness: 0.75 });
+  const furniture = material('polymer', [3, 3], { roughness: 0.92 });
+  const gripPoly = material('polymer', [7, 7], { roughness: 0.98 });
   // An FDE magazine is the one value break a black rifle gets, and it is what
-  // stops the lower right of frame being a single silhouette.
-  const magPoly = material('polymer', [2.4, 4], { map: null, color: 0x6f5f48, roughness: 0.88 });
-  // Small hard parts are the trap: at low roughness a near-black metal still
-  // mirrors a dawn sky straight back at the lens and reads as bare aluminium.
-  const small = new THREE.MeshStandardMaterial({ color: 0x1a1c1f, roughness: 0.86, metalness: 0.15 });
-  const railMat = new THREE.MeshStandardMaterial({ color: 0x232529, roughness: 0.54, metalness: 0.45 });
+  // stops the lower right of frame being a single silhouette. The albedo map
+  // is dropped so the tint is the base value rather than a multiply against
+  // near-black polymer; normal and ORM stay, so the moulding still reads.
+  const magPoly = material('polymer', [1.6, 3], { map: null, color: 0x9c8763, roughness: 0.80 });
+  // Small hard parts sit a stop above the body, not below it. Authored darker
+  // than the receiver they are holding, every pin, slot and control disappears
+  // and the detail that is modelled might as well not exist. Tiled hard so the
+  // sampler's polished-through wear lands as a highlight on a part this size
+  // instead of averaging out — a flat swatch here reads as moulded plastic.
+  const small = material('gunmetal', [5, 5], { roughness: 1.0, metalness: 0.26 });
+  const railMat = new THREE.MeshStandardMaterial({ color: 0x2e3136, roughness: 0.80, metalness: 0.25 });
   // Tiled tight on purpose: at low repeat the gunmetal sampler's polished-through
   // wear blobs are bigger than the optic itself and turn the whole tube chrome.
-  const opticBody = material('gunmetal', [5, 5], { roughness: 0.92, metalness: 0.28 });
-  const worn = new THREE.MeshStandardMaterial({ color: 0x4a4c51, roughness: 0.45, metalness: 0.80 });
-  const rubber = new THREE.MeshStandardMaterial({ color: 0x1b1b1d, roughness: 0.94, metalness: 0.0 });
-  const bore = new THREE.MeshStandardMaterial({ color: 0x030303, roughness: 1.0, metalness: 0.3 });
+  const opticBody = material('gunmetal', [5, 5], { roughness: 0.74, metalness: 0.30 });
+  const worn = material('gunmetal', [8, 8], { roughness: 0.72, metalness: 0.60 });
+  const rubber = new THREE.MeshStandardMaterial({ color: 0x2a2a2d, roughness: 0.90, metalness: 0.0 });
+  const bore = new THREE.MeshStandardMaterial({ color: 0x0a0a0b, roughness: 1.0, metalness: 0.3 });
+
+  const T_ctrl = phosphate;
+  const T_nomap = material('gunmetal', [3.2, 3.2], { roughness: 0.62, metalness: 0.24, map: null, color: 0x5b5b5e });
+  const T_noao = material('gunmetal', [3.2, 3.2], { roughness: 0.62, metalness: 0.24, aoMap: null });
+  const T_nonrm = material('gunmetal', [3.2, 3.2], { roughness: 0.62, metalness: 0.24, normalMap: null });
+  const T_plain = new THREE.MeshStandardMaterial({ color: 0x5b5b5e, roughness: 0.43, metalness: 0.24 });
 
   const part = (geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
     const m = new THREE.Mesh(geo, mat);
@@ -179,7 +232,7 @@ function buildCarbine() {
   };
 
   // ---- upper receiver ------------------------------------------------------
-  part(rbox(0.038, 0.040, 0.202, 0.005), phosphate, 0, 0.001, -0.101);
+  part(rbox(0.038, 0.040, 0.202, 0.005), T_ctrl, 0, 0.001, -0.101);
   part(rbox(0.031, 0.031, 0.016, 0.004), phosphate, 0, 0.003, 0.005);       // rear takedown lug
   part(rbox(0.0224, 0.0062, 0.212, 0.001), phosphate, 0, RAIL_DECK - 0.0031, -0.100);
   railRun(railMat, -0.204, 0.004, RAIL_DECK);
@@ -204,8 +257,8 @@ function buildCarbine() {
   }
 
   // ---- lower receiver ------------------------------------------------------
-  part(rbox(0.0272, 0.038, 0.128, 0.004), phosphate, 0, -0.031, -0.062);
-  part(rbox(0.0370, 0.058, 0.052, 0.004), phosphate, 0, -0.048, -0.086);
+  part(rbox(0.0272, 0.038, 0.128, 0.004), T_nomap, 0, -0.031, -0.062);
+  part(rbox(0.0370, 0.058, 0.052, 0.004), T_noao, 0, -0.048, -0.086);
   part(rbox(0.0432, 0.0085, 0.0575, 0.002), phosphate, 0, -0.0790, -0.086);   // flare
   part(rbox(0.0446, 0.0018, 0.0590, 0.0006), worn, 0, -0.0836, -0.086);       // worn lip
   // The left flank of an AR is a big blank casting, so it needs the parting
@@ -317,12 +370,12 @@ function buildCarbine() {
     part(rbox(0.0035, 0.0035, 0.0105, 0.0008), small,
       Math.sin(a) * 0.0168, -0.0015 + Math.cos(a) * 0.0168, 0.0080);
   }
-  tubeAlongZ(0.0146, 0.0146, 0.2300, 18, phosphate, 0, -0.0015, 0.1280);
+  tubeAlongZ(0.0146, 0.0146, 0.2300, 18, T_nonrm, 0, -0.0015, 0.1280);
   for (let i = 0; i < 6; i++) {                                    // adjustment detents
     part(cyl(0.0026, 0.0026, 0.0035, 8), bore, 0, -0.0155, 0.0700 + i * 0.0250);
   }
   // Collapsible stock: body, cheek rise, toe, pad.
-  part(rbox(0.0480, 0.0520, 0.1250, 0.006), furniture, 0, -0.0020, 0.1900);
+  part(rbox(0.0480, 0.0520, 0.1250, 0.006), T_plain, 0, -0.0020, 0.1900);
   part(rbox(0.0400, 0.0140, 0.1020, 0.005), furniture, 0, 0.0270, 0.1840);
   part(rbox(0.0300, 0.0300, 0.0620, 0.006), furniture, 0, -0.0360, 0.2320, -0.22);
   part(rbox(0.0455, 0.0980, 0.0150, 0.004), furniture, 0, -0.0060, 0.2720);
@@ -366,7 +419,13 @@ function buildCarbine() {
     add(rbox(0.0150, 0.0110, 0.0070, 0.002), small, 0, -0.0210, z);
   }
   add(rbox(0.0052, 0.0150, 0.0230, 0.002), worn, -0.0170, -0.0362, 0.0025); // throw lever
-  add(cyl(0.0030, 0.0030, 0.0310, 8), worn, 0.0000, -0.0362, -0.0150, 0, 0, Math.PI / 2);
+  // Cross-bolt through the clamp with a knurled thumb nut on the far side. It
+  // is the one piece of hardware that tells you the optic is bolted to a rail
+  // rather than grown out of it.
+  add(cyl(0.0030, 0.0030, 0.0340, 10), worn, 0.0000, -0.0362, -0.0150, 0, 0, Math.PI / 2);
+  add(cyl(0.0072, 0.0072, 0.0048, 12), worn, 0.0166, -0.0362, -0.0150, 0, 0, Math.PI / 2);
+  add(cyl(0.0030, 0.0030, 0.0340, 10), worn, 0.0000, -0.0362, 0.0180, 0, 0, Math.PI / 2);
+  add(cyl(0.0072, 0.0072, 0.0048, 12), worn, 0.0166, -0.0362, 0.0180, 0, 0, Math.PI / 2);
 
   // The tube and both bells are open cylinders drawn from the inside too:
   // capping them plugs the sight with a solid disc, which is the single fastest
@@ -377,23 +436,54 @@ function buildCarbine() {
   const boreWall = new THREE.MeshStandardMaterial({
     color: 0x08090a, roughness: 0.96, metalness: 0.0, side: THREE.DoubleSide,
   });
-  const ocyl = (rt, rb, len, seg) => new THREE.CylinderGeometry(rt, rb, len, seg, 1, true);
-  add(ocyl(0.0150, 0.0150, 0.0570, 40), anodised, 0, 0, 0, Math.PI / 2);
-  add(ocyl(0.0140, 0.0140, 0.0840, 40), boreWall, 0, 0, 0, Math.PI / 2);
-  add(ocyl(0.0164, 0.0150, 0.0120, 40), anodised, 0, 0, -0.0290, Math.PI / 2);
-  add(ocyl(0.0150, 0.0168, 0.0130, 40), anodised, 0, 0, 0.0295, Math.PI / 2);
-  add(cyl(0.0066, 0.0070, 0.0110, 16), small, 0, 0.0172, -0.0120);          // elevation turret
-  add(cyl(0.0066, 0.0070, 0.0110, 16), small, 0.0172, 0, -0.0120, 0, 0, Math.PI / 2);
-  add(cyl(0.0088, 0.0088, 0.0060, 18), small, -0.0172, 0, 0.0060, 0, 0, Math.PI / 2);  // battery cap
-  add(cyl(0.0070, 0.0070, 0.0040, 18), worn, -0.0208, 0, 0.0060, 0, 0, Math.PI / 2);
-  add(cyl(0.0056, 0.0060, 0.0070, 14), small, -0.0152, 0, 0.0230, 0, 0, Math.PI / 2);  // brightness dial
+  // Segment count is set by the tube's on-screen size when aiming, where it
+  // fills a third of frame height: at 40 the flats along the upper arc are
+  // visible against the sky and the whole optic reads as a low-poly prop.
+  const ocyl = (rt, rb, len, seg = 56) => new THREE.CylinderGeometry(rt, rb, len, seg, 1, true);
+  add(ocyl(0.0150, 0.0150, 0.0570), anodised, 0, 0, 0, Math.PI / 2);
+  add(ocyl(0.0140, 0.0140, 0.0840), boreWall, 0, 0, 0, Math.PI / 2);
+  add(ocyl(0.0164, 0.0150, 0.0120), anodised, 0, 0, -0.0290, Math.PI / 2);
+  add(ocyl(0.0150, 0.0168, 0.0130), anodised, 0, 0, 0.0295, Math.PI / 2);
+  // Turrets: a stepped base, a capped stem and knurling. A plain post in body
+  // colour is worse than nothing — it reads as a casting flaw on the tube.
+  for (const up of [true, false]) {
+    const trz = up ? 0 : Math.PI / 2;
+    const tx = up ? 0 : 0.0172, ty = up ? 0.0172 : 0;
+    add(cyl(0.0082, 0.0090, 0.0042, 18), small, tx * 0.72, ty * 0.72, -0.0120, 0, 0, trz);
+    add(cyl(0.0064, 0.0068, 0.0130, 18), small, tx, ty, -0.0120, 0, 0, trz);
+    add(cyl(0.0072, 0.0072, 0.0038, 18), worn, tx * 1.34, ty * 1.34, -0.0120, 0, 0, trz);
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * TAU, rk = 0.0068;
+      add(rbox(0.0012, 0.0012, 0.0036, 0.0004), bore,
+        up ? Math.sin(a) * rk : tx * 1.34,
+        up ? ty * 1.34 : Math.sin(a) * rk,
+        -0.0120 + Math.cos(a) * rk);
+    }
+  }
+  add(cyl(0.0092, 0.0092, 0.0062, 22), small, -0.0172, 0, 0.0060, 0, 0, Math.PI / 2);  // battery cap
+  add(cyl(0.0074, 0.0074, 0.0046, 22), worn, -0.0212, 0, 0.0060, 0, 0, Math.PI / 2);
+  add(rbox(0.0020, 0.0090, 0.0090, 0.0006), bore, -0.0236, 0, 0.0060);                 // coin slot
+  add(cyl(0.0058, 0.0062, 0.0074, 16), small, -0.0152, 0, 0.0230, 0, 0, Math.PI / 2);  // brightness dial
+  add(cyl(0.0064, 0.0064, 0.0026, 16), worn, -0.0196, 0, 0.0230, 0, 0, Math.PI / 2);
+  for (let i = 0; i < 10; i++) {                                             // detent ridges
+    const a = (i / 10) * TAU;
+    add(rbox(0.0026, 0.0011, 0.0011, 0.0004), bore,
+      -0.0196, Math.sin(a) * 0.0060, 0.0230 + Math.cos(a) * 0.0060);
+  }
 
   // Glass. Real transmission is no use here: the viewmodel scene is empty, so
   // three would refract a black backdrop. Plain alpha over the already-composited
   // world plus a clearcoat sheen is what actually reads as a coated lens.
+  //
+  // The tint and the alpha ramp are doing the real work. A multi-coat objective
+  // takes a couple of stops out of the sight picture and pushes it cool, and
+  // the image goes to nothing against the tube wall; leave the glass neutral
+  // and fully clear and the aperture is just a hole with the same world behind
+  // it, which is exactly how a painted-on optic looks.
   const lensMat = new THREE.MeshPhysicalMaterial({
-    color: 0x0c1a20,
-    roughness: 0.04,
+    color: 0x1d3b52,
+    alphaMap: lensTexture(),
+    roughness: 0.05,
     metalness: 0.0,
     clearcoat: 1.0,
     clearcoatRoughness: 0.02,
@@ -401,14 +491,15 @@ function buildCarbine() {
     iridescenceIOR: 1.85,
     iridescenceThicknessRange: [220, 520],
     transparent: true,
-    opacity: 0.26,
+    opacity: 1,
     depthWrite: false,
     side: THREE.DoubleSide,
   });
-  const front = add(new THREE.CircleGeometry(0.0134, 40), lensMat, 0, 0, -0.0300);
+  const front = add(new THREE.CircleGeometry(0.0140, 56), lensMat, 0, 0, -0.0300);
   front.castShadow = false;
-  const rear = add(new THREE.CircleGeometry(0.0136, 40), lensMat.clone(), 0, 0, 0.0300);
+  const rear = add(new THREE.CircleGeometry(0.0142, 56), lensMat.clone(), 0, 0, 0.0300);
   rear.castShadow = false;
+  rear.material.color.set(0x16303f);
   rear.material.iridescenceThicknessRange = [320, 700];
 
   // Reticle: additive, depth-tested off so it always floats in the tube, and
@@ -456,9 +547,10 @@ export class Weapon {
 
     this.scene = new THREE.Scene();
     this.scene.environment = environment;
-    // Held back below the world's: at full strength a dawn sky reflects off
-    // every small anodised part and the carbine reads as bare aluminium.
-    this.scene.environmentIntensity = 0.85;
+    // The shadow side of a black rifle has nothing but sky to work with, so
+    // this carries most of the value there. Pushed past ~1.3 the small
+    // anodised parts start mirroring the dawn and read as bare aluminium.
+    this.scene.environmentIntensity = 1.2;
 
     // Viewmodel FOV is deliberately decoupled from the world camera. The world
     // runs very wide for peripheral awareness; putting a 0.84 m object through
@@ -486,12 +578,13 @@ export class Weapon {
     this.setupLighting();
 
     // --- pose ---------------------------------------------------------------
-    // Hip: muzzle at 58% across and 55% up, receiver running out through the
-    // bottom-right corner, nothing crossing the vertical centreline. The muzzle
-    // rides above the stock purely from perspective convergence, so the numbers
-    // that matter are the offsets, not the on-screen result of any one part.
-    this.hipPosition = new THREE.Vector3(0.126, -0.041, -0.300);
-    this.hipRotation = new THREE.Euler(0.151, 0.062, 0.060);
+    // Hip: tucked down and to the right, the way a carbine is actually carried
+    // at the low ready. The optic has to sit clearly below the horizon — a red
+    // dot floating above the skyline in an unaimed pose is an ADS frame that
+    // forgot to centre, and it costs the whole left-of-centre composition. The
+    // muzzle-down cant is what drops the barrel out of the sightline.
+    this.hipPosition = new THREE.Vector3(0.150, -0.098, -0.345);
+    this.hipRotation = new THREE.Euler(0.215, 0.062, 0.060);
     // Aiming cancels the sight's offset from the bore so the optical axis is
     // the camera axis; ADS_EYE_RELIEF then sets how much eyebox the tube fills.
     const s = this.sightAnchor.position;
@@ -524,9 +617,18 @@ export class Weapon {
     this._shotCount = 0;
 
     // --- muzzle flash --------------------------------------------------------
-    this.flashLight = new THREE.PointLight(0xffcc88, 0, 9, 2);
+    // Two lights, not one. A single source at the muzzle falls off across the
+    // barrel and leaves the receiver, the optic and both gloves — the parts the
+    // frame is actually about — as dark on the firing frame as at idle. The
+    // second sits back over the handguard where the blast wraps.
+    this.flashLight = new THREE.PointLight(0xffd2a0, 0, 7, 1.7);
     this.flashLight.castShadow = false;
     this.muzzleAnchor.add(this.flashLight);
+
+    this.flashBounce = new THREE.PointLight(0xffbe86, 0, 3.2, 1.4);
+    this.flashBounce.castShadow = false;
+    this.flashBounce.position.set(0, 0.02, -0.30);
+    this.model.add(this.flashBounce);
 
     this.flashSprites = new THREE.Group();
     this.muzzleAnchor.add(this.flashSprites);
@@ -541,22 +643,25 @@ export class Weapon {
     });
     this.flashMaterials = [];
     for (let i = 0; i < 3; i++) {
-      const m = new THREE.Mesh(new THREE.PlaneGeometry(0.115, 0.115), flashMat.clone());
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(0.135, 0.135), flashMat.clone());
       m.rotation.z = (i / 3) * Math.PI;
-      m.renderOrder = 30;
+      m.renderOrder = 38;
       this.flashSprites.add(m);
       this.flashMaterials.push(m.material);
     }
-    // Forward-facing cone so the flash has volume when seen off-axis.
+    // Forward-facing cone so the flash has volume when seen off-axis. Long
+    // enough to read as gas leaving a barrel rather than as a spark on the
+    // crown; a birdcage throws a plume roughly a hand-span past the muzzle.
     this.flashCone = new THREE.Mesh(
-      new THREE.ConeGeometry(0.026, 0.10, 12, 1, true),
+      new THREE.ConeGeometry(0.030, 0.17, 14, 1, true),
       new THREE.MeshBasicMaterial({
         color: 0xffd9a0, transparent: true, opacity: 0,
         blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false, side: THREE.DoubleSide,
       }),
     );
     this.flashCone.rotation.x = Math.PI / 2;
-    this.flashCone.position.z = -0.05;
+    this.flashCone.position.z = -0.085;
+    this.flashCone.renderOrder = 36;
     this.muzzleAnchor.add(this.flashCone);
     this._flash = 0;
 
@@ -565,9 +670,13 @@ export class Weapon {
   }
 
   setupLighting() {
-    // Matches the world key so the weapon reads as being in the same place,
-    // with a tight fill that keeps the left side of the receiver off black.
-    this.key = new THREE.DirectionalLight(0xffd0a0, 3.0);
+    // The viewmodel has its own scene and its own lens, so nothing the world
+    // rig does reaches it and every value on the weapon is set here. It is a
+    // three-point setup anchored to the sun rather than a copy of it: a dawn
+    // sun 8 degrees above the horizon backlights the carbine from most player
+    // headings, and an honest key would silhouette the hero prop on half the
+    // compass. Direction tracks the sun; placement is pulled toward the lens.
+    this.key = new THREE.DirectionalLight(0xffd6ab, 3.6);
     this.key.position.set(0.6, 1.0, 0.35);
     this.key.castShadow = true;
     this.key.shadow.mapSize.set(1024, 1024);
@@ -582,35 +691,56 @@ export class Weapon {
     this.scene.add(this.key);
     this.scene.add(this.key.target);
 
-    // Fixed in view space rather than chased to the sun. Turning to face a
-    // dawn sun would otherwise flatten the weapon into a black cut-out, and no
-    // shooter ships that; a constant three-quarter fill is the standard cheat.
-    // Kept low and to the side. Raised overhead it lights every top face at
-    // once and the receiver reads as light grey plastic instead of phosphate.
-    this.fill = new THREE.DirectionalLight(0xb6c8dc, 2.3);
+    // Cool sky on the shadow side. Kept low and to the side: raised overhead it
+    // lights every top face at once and the receiver reads as light grey
+    // plastic instead of phosphate.
+    this.fill = new THREE.DirectionalLight(0xa9c3e2, 10.0);
     this.fill.position.set(-0.90, 0.42, 0.85);
     this.scene.add(this.fill);
 
-    this.rim = new THREE.DirectionalLight(0xffb066, 1.5);
-    this.rim.position.set(-0.3, 0.4, -1.0);
+    // Rim rides past the sun and high, so the top rail and the optic tube keep
+    // a hot edge that no amount of key can give a flat-topped receiver.
+    this.rim = new THREE.DirectionalLight(0xffb877, 1.05);
+    this.rim.position.set(-0.3, 0.9, -1.0);
     this.scene.add(this.rim);
 
-    // Sky-over-sand bounce plus a flat floor. A black rifle sits around 0.06
+    // Sand bounce. At this hour the ground is the brightest surface in frame
+    // and the undersides of the magazine, handguard and support glove see
+    // essentially nothing else; without it they sit on the grade's black floor.
+    this.bounce = new THREE.DirectionalLight(0xffc890, 0.5);
+    this.bounce.position.set(0.15, -1.0, 0.30);
+    this.scene.add(this.bounce);
+
+    // Sky-over-sand ambient plus a flat floor. A black rifle sits around 0.06
     // albedo; without this much indirect the shadow side lands under the tone
     // curve's toe and the whole lower half of the weapon crushes to zero.
-    this.scene.add(new THREE.HemisphereLight(0x9cc0e6, 0x8a6842, 2.1));
-    this.scene.add(new THREE.AmbientLight(0xdfe4ee, 0.8));
+    this.scene.add(new THREE.HemisphereLight(0x9cc0e6, 0xb08a58, 0.55));
+    this.scene.add(new THREE.AmbientLight(0xdfe4ee, 0.15));
+    this.key.visible=false;this.fill.visible=false;this.rim.visible=false;this.bounce.visible=false;
+    this.scene.add(new THREE.AmbientLight(0xffffff, 3.0));
   }
 
-  /** Aligns the viewmodel key light with the world sun as the player turns. */
+  /** Aligns the viewmodel rig with the world sun as the player turns. */
   syncLighting(sunDirection, worldCamera) {
-    const local = sunDirection.clone().applyQuaternion(worldCamera.quaternion.clone().invert());
-    this.key.position.copy(local).multiplyScalar(2).add(new THREE.Vector3(0, 0.2, 0));
+    const sun = sunDirection.clone().applyQuaternion(worldCamera.quaternion.clone().invert());
+
+    // Anchored to the sun for azimuth, biased toward the lens for exposure. A
+    // pure sun placement is correct and unusable; a pure rig light is usable
+    // and reads as a studio shot. The mix keeps the direction the player
+    // expects while guaranteeing the faces they can see are the lit ones.
+    this.key.position.copy(sun).multiplyScalar(0.85).add(KEY_BIAS).normalize().multiplyScalar(2);
     this.key.target.position.set(0, -0.05, -0.2);
     this.key.target.updateMatrixWorld();
-    // Bounce sits opposite the sun so a backlit weapon still gets a warm edge
-    // down the side facing the camera.
-    this.rim.position.copy(local).multiplyScalar(-2).add(new THREE.Vector3(0, 0.9, 0));
+
+    // A third of a turn past the sun and lifted, so the top rail catches an
+    // edge whichever heading the player is on.
+    this.rim.position.copy(sun).applyAxisAngle(WORLD_UP, 2.35);
+    this.rim.position.y = 0.80;
+    this.rim.position.normalize().multiplyScalar(2);
+
+    // Fill opposes the key in azimuth only; it is sky, so it never comes from
+    // below and never picks up the sun's warmth.
+    this.fill.position.set(-sun.x * 1.3 - 0.35, 0.55, 0.95);
   }
 
   /* --------------------------------------------------------------- fire -- */
@@ -814,13 +944,18 @@ export class Weapon {
     }
 
     // --- muzzle flash decay -------------------------------------------------------
-    this._flash = Math.max(0, this._flash - dt * 26);
+    this._flash = Math.max(0, this._flash - dt * 19);
     const f = this._flash;
-    this.flashLight.intensity = f * f * 14;
-    this.flashCone.material.opacity = f * 0.60;
+    // Held near peak for most of the (very short) life rather than decaying
+    // linearly: a discharge is over in about two frames, so a linear ramp means
+    // every captured frame catches it half-dead and the shot reads as posed.
+    const fp = Math.pow(f, 0.45);
+    this.flashLight.intensity = fp * 26;
+    this.flashBounce.intensity = fp * 11;
+    this.flashCone.material.opacity = Math.min(1, fp * 1.15);
     this.flashCone.scale.setScalar(0.7 + (1 - f) * 0.7);
     for (let i = 0; i < this.flashMaterials.length; i++) {
-      this.flashMaterials[i].opacity = f * (0.62 - i * 0.13);
+      this.flashMaterials[i].opacity = Math.min(1, fp * (1.15 - i * 0.22));
       this.flashSprites.children[i].scale.setScalar(0.50 + (1 - f) * 0.85 + i * 0.16);
       this.flashSprites.children[i].rotation.z += dt * (i % 2 ? 9 : -9);
     }
@@ -852,9 +987,13 @@ export class Weapon {
 
 function buildHands() {
   const g = new THREE.Group();
-  const glove = new THREE.MeshStandardMaterial({ color: 0x171310, roughness: 0.93, metalness: 0.0 });
-  const knuckle = new THREE.MeshStandardMaterial({ color: 0x0e0d0c, roughness: 0.66, metalness: 0.0 });
-  const sleeve = material('canvas', [3, 3], { roughness: 1.0, color: 0x34302a });
+  // A tactical glove is a dark neutral, not black. Authored at receiver value
+  // the firing hand merges into the part it is holding and neither reads; the
+  // knuckle pad and the cuff then have to sit either side of the glove so the
+  // hand carries three values instead of one.
+  const glove = new THREE.MeshStandardMaterial({ color: 0x3d362d, roughness: 0.90, metalness: 0.0 });
+  const knuckle = new THREE.MeshStandardMaterial({ color: 0x211d19, roughness: 0.58, metalness: 0.0 });
+  const sleeve = material('canvas', [4, 4], { roughness: 1.0, color: 0x9e9075 });
 
   const piece = (parent, geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
     const m = new THREE.Mesh(geo, mat);
@@ -866,47 +1005,95 @@ function buildHands() {
   };
   const rbox = (w, h, d, r) => new RoundedBoxGeometry(w, h, d, 2, r);
 
+  /**
+   * Three phalanges laid along -Z with a gap at each joint, curling about the
+   * local X axis. The gaps are the whole point: a finger drawn as one box is a
+   * sausage, and four sausages side by side are a mitten. What the eye reads at
+   * this distance is background showing between fingers and a shadow at each
+   * knuckle, not the shape of any one digit.
+   */
+  const finger = (parent, x, y, z, len, w, curl, tilt = 0) => {
+    const root = new THREE.Group();
+    root.position.set(x, y, z);
+    root.rotation.set(curl * 0.9, tilt, 0);
+    parent.add(root);
+    let node = root;
+    for (let s = 0; s < 3; s++) {
+      const l = len * [0.40, 0.34, 0.26][s];
+      const t = w * (1 - s * 0.10);
+      piece(node, rbox(t, t * 0.96, l, t * 0.44), glove, 0, 0, -l * 0.5);
+      // Pad over the joint, set proud and darker so it catches its own shadow.
+      if (s < 2) piece(node, rbox(t * 0.96, t * 0.34, t * 0.62, t * 0.15), knuckle, 0, t * 0.40, -l * 0.62);
+      const next = new THREE.Group();
+      next.position.z = -l - w * 0.13;
+      next.rotation.x = curl * (s === 0 ? 0.85 : 0.70);
+      node.add(next);
+      node = next;
+    }
+    return root;
+  };
+
   // Firing hand: palm on the backstrap, fingers wrapped across the frontstrap,
-  // index laid along the receiver above the trigger.
+  // index laid along the receiver above the trigger. The grip is raked, so the
+  // whole hand is raked with it.
   const right = new THREE.Group();
   right.position.set(0.002, -0.098, 0.016);
   right.rotation.set(-0.40, 0.05, 0.02);
-  piece(right, rbox(0.048, 0.082, 0.030, 0.013), glove, 0.006, 0.002, 0.030);
-  piece(right, rbox(0.040, 0.066, 0.014, 0.006), knuckle, 0.010, 0.006, 0.040);
+  piece(right, rbox(0.046, 0.084, 0.028, 0.012), glove, 0.007, 0.002, 0.031);
+  piece(right, rbox(0.040, 0.070, 0.013, 0.005), knuckle, 0.011, 0.004, 0.041);
+  piece(right, rbox(0.048, 0.016, 0.036, 0.007), glove, 0.006, 0.043, 0.022);       // web of the hand
+  // Fingers run right to left across the front of the grip. They point -Z in
+  // their own frame, so a quarter turn about Y lays them across it.
   for (let i = 0; i < 3; i++) {
-    piece(right, rbox(0.046, 0.0165, 0.0210, 0.0075), glove,
-      -0.001, 0.008 - i * 0.0205, -0.0235 + i * 0.0022, 0, 0, -0.10 + i * 0.05);
-    piece(right, rbox(0.0165, 0.0090, 0.0150, 0.004), knuckle,
-      0.020, 0.008 - i * 0.0205, -0.0225 + i * 0.0022);
+    finger(right, 0.0215, 0.010 - i * 0.0205, -0.0175 + i * 0.0020,
+      0.044, 0.0158, 0.30 + i * 0.06, Math.PI * 0.5 + 0.10);
   }
-  piece(right, rbox(0.0175, 0.0175, 0.0480, 0.0075), glove, 0.001, 0.0325, -0.0330, 0.34, 0, 0);
-  piece(right, rbox(0.0180, 0.0400, 0.0180, 0.0075), glove, -0.0215, 0.0230, 0.0080, 0, 0, 0.30);
+  // Thumb, up the left side of the grip with the tip on the receiver.
+  finger(right, -0.0195, 0.016, 0.014, 0.040, 0.0180, 0.16, Math.PI * 0.62);
   g.add(right);
 
-  // Support hand: C-clamp on the handguard. From the shooter's eye you see the
-  // fingertips come over the top of the tube and the heel of the hand below it,
-  // so those are what get modelled — the palm never faces the lens.
+  // Trigger finger, parented in weapon space rather than to the grip so it
+  // stays on the trigger no matter how the hand is raked.
+  const index = new THREE.Group();
+  index.position.set(0.0165, -0.0505, -0.0180);
+  index.rotation.set(0.10, 0.30, 0);
+  piece(index, rbox(0.0165, 0.0160, 0.0300, 0.0068), glove, 0, 0, -0.0140);
+  piece(index, rbox(0.0158, 0.0058, 0.0110, 0.0022), knuckle, 0, 0.0080, -0.0270);
+  piece(index, rbox(0.0150, 0.0148, 0.0200, 0.0062), glove, -0.0010, -0.0032, -0.0400, 0.34, 0, 0);
+  g.add(index);
+
+  // Support hand: C-clamp on the handguard. From the shooter's eye the
+  // fingertips come over the top of the tube, the heel sits below it and the
+  // thumb crosses the near side — that last one is what puts the hand *around*
+  // the handguard instead of floating beside it.
   const left = new THREE.Group();
-  left.position.set(-0.004, -0.006, -0.288);
-  left.rotation.set(0.20, 0.12, -0.26);
-  piece(left, rbox(0.0145, 0.0370, 0.0650, 0.011), glove, -0.0230, -0.0175, 0.0040);
-  piece(left, rbox(0.0230, 0.0140, 0.0580, 0.008), glove, -0.0130, -0.0295, 0.0030);
+  left.position.set(-0.002, -0.004, -0.286);
+  left.rotation.set(0.18, 0.10, -0.24);
+  piece(left, rbox(0.0150, 0.0360, 0.0640, 0.010), glove, -0.0232, -0.0165, 0.0040);
+  piece(left, rbox(0.0240, 0.0140, 0.0570, 0.007), glove, -0.0135, -0.0290, 0.0030);
+  piece(left, rbox(0.0170, 0.0150, 0.0600, 0.0055), knuckle, -0.0262, -0.0040, 0.0030);  // heel pad
   for (let i = 0; i < 4; i++) {
-    const z = -0.0270 + i * 0.0185;
-    piece(left, rbox(0.0300, 0.0165, 0.0158, 0.0072), glove, 0.0025, 0.0215 - i * 0.0012, z, 0, 0, 0.22);
-    piece(left, rbox(0.0130, 0.0060, 0.0130, 0.0025), knuckle, 0.0060, 0.0290 - i * 0.0012, z);
-    piece(left, rbox(0.0135, 0.0210, 0.0150, 0.0060), glove, 0.0175, 0.0075 - i * 0.0010, z, 0, 0, -0.30);
+    const z = -0.0250 + i * 0.0180;
+    finger(left, -0.0140, 0.0245 - i * 0.0014, z, 0.040, 0.0148, 0.34, -Math.PI * 0.5 - 0.12);
   }
-  piece(left, rbox(0.0160, 0.0150, 0.0480, 0.0068), glove, -0.0215, 0.0135, -0.0290, 0.10, 0, -0.12);
+  // Thumb along the near side of the tube, crossing the silhouette.
+  piece(left, rbox(0.0150, 0.0150, 0.0300, 0.0062), glove, -0.0215, 0.0110, -0.0130, 0.16, 0, -0.16);
+  piece(left, rbox(0.0140, 0.0060, 0.0110, 0.0024), knuckle, -0.0248, 0.0176, -0.0250);
+  piece(left, rbox(0.0136, 0.0138, 0.0230, 0.0056), glove, -0.0232, 0.0092, -0.0360, 0.30, 0, -0.20);
   g.add(left);
 
   // Cuffs — a hard edge where the glove meets the sleeve stops the hands from
-  // reading as blobs. The support forearm is kept short and aimed away from the
-  // lens: run it out to the side and it becomes a slab floating in mid-frame.
-  piece(g, new THREE.CylinderGeometry(0.0320, 0.0385, 0.105, 16), sleeve,
+  // reading as blobs, and the canvas is the one light value on either hand. The
+  // support forearm is kept short and aimed away from the lens: run it out to
+  // the side and it becomes a slab floating in mid-frame.
+  piece(g, new THREE.CylinderGeometry(0.0300, 0.0385, 0.105, 18), sleeve,
     0.0250, -0.1560, 0.0920, 1.06, 0, 0.20);
-  piece(g, new THREE.CylinderGeometry(0.0290, 0.0335, 0.070, 16), sleeve,
+  piece(g, new THREE.CylinderGeometry(0.0318, 0.0322, 0.014, 18), knuckle,
+    0.0148, -0.1300, 0.0640, 1.06, 0, 0.20);
+  piece(g, new THREE.CylinderGeometry(0.0272, 0.0335, 0.070, 18), sleeve,
     -0.0300, -0.0520, -0.2620, 0.95, 0.20, -0.62);
+  piece(g, new THREE.CylinderGeometry(0.0286, 0.0290, 0.012, 18), knuckle,
+    -0.0212, -0.0330, -0.2455, 0.95, 0.20, -0.62);
 
   return g;
 }

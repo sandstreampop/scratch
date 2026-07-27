@@ -59,16 +59,16 @@ const ShaftsShader = {
     tDiffuse: { value: null },
     tMask: { value: null },
     uSunScreen: { value: new THREE.Vector2(0.5, 0.5) },
-    uIntensity: { value: 0.55 },
-    uDecay: { value: 0.966 },
-    uDensity: { value: 1.02 },
+    uIntensity: { value: 0.11 },
+    uDecay: { value: 0.978 },
+    uDensity: { value: 1.0 },
     uWeight: { value: 1.0 },
     // How far from the sun a shaft can still be seen, in screen widths. Real
     // in-scatter reaches everywhere, but without a depth buffer this pass
     // cannot tell a distant silhouette from a near one, and letting it run to
     // the frame edge lifts the whole foreground into a flat veil.
-    uReach: { value: 0.55 },
-    uTint: { value: new THREE.Color(0xffc48c) },
+    uReach: { value: 0.34 },
+    uTint: { value: new THREE.Color(0xffd9b4) },
     uVisible: { value: 1.0 },
     uAspect: { value: 1.0 },
   },
@@ -93,6 +93,7 @@ const ShaftsShader = {
       vec2 uv = vUv;
       float decay = 1.0;
       float accum = 0.0;
+      float total = 0.0;
 
       // Per-pixel dither breaks the banding that fixed-step raymarching
       // otherwise leaves across smooth sky gradients.
@@ -102,15 +103,30 @@ const ShaftsShader = {
       for (int i = 0; i < SAMPLES; i++) {
         uv -= delta;
         accum += texture2D(tMask, clamp(uv, 0.0, 1.0)).r * decay * uWeight;
+        total += decay * uWeight;
         decay *= uDecay;
       }
-      accum /= float(SAMPLES);
+      // Normalised against a completely unoccluded march, so uIntensity is the
+      // in-scatter added under open sky and does not silently change every
+      // time the decay is retuned. Open sky adds that value flat — the shafts
+      // are the departures from it, so it has to stay small or it is a veil.
+      accum /= max(total, 1e-4);
 
       // Shafts fade out as the sun leaves frame, and never bloom behind you.
       vec2 d = (vUv - uSunScreen) * vec2(uAspect, 1.0);
       float falloff = 1.0 - smoothstep(0.03, uReach, length(d));
 
-      gl_FragColor = vec4(scene.rgb + accum * uTint * uIntensity * falloff * uVisible, scene.a);
+      // With no depth buffer the march cannot tell how much air lies in front
+      // of a silhouette, and a thin one — a guy wire, a crossarm — barely
+      // dents the accumulation, so it takes the full open-sky in-scatter and
+      // comes out amber against the sky it is meant to be blocking. Damping
+      // the contribution over occluders keeps the light in the air between
+      // them, which is the part the eye reads as a shaft.
+      float here = texture2D(tMask, vUv).r;
+      float onSky = mix(0.10, 1.0, here * here);
+
+      gl_FragColor = vec4(scene.rgb + accum * uTint * uIntensity * falloff * uVisible * onSky,
+                          scene.a);
     }
   `,
 };
@@ -138,7 +154,9 @@ class SunShaftsPass extends Pass {
     });
     this.setSize(width, height);
 
-    this.occluder = new THREE.MeshBasicMaterial({ color: 0x000000, fog: false });
+    this.occluder = new THREE.MeshBasicMaterial({
+      color: 0x000000, fog: false, side: THREE.DoubleSide,
+    });
     this.material = new THREE.ShaderMaterial({
       uniforms: THREE.UniformsUtils.clone(ShaftsShader.uniforms),
       vertexShader: ShaftsShader.vertexShader,
@@ -150,6 +168,8 @@ class SunShaftsPass extends Pass {
     this.fsQuad = new FullScreenQuad(this.material);
 
     this._hidden = [];
+    this._swapped = [];
+    this._cutouts = new Map();
     this._clear = new THREE.Color();
   }
 
@@ -158,45 +178,78 @@ class SunShaftsPass extends Pass {
   }
 
   /**
+   * The black stand-in a material occludes with: its own cutout, no colour.
+   *
+   * Everything solid can share one flat black. Only alpha-tested geometry —
+   * awning slats, chain-link, shed panels — needs a material of its own, and
+   * it needs one badly: with `transparent` geometry simply dropped from the
+   * mask, open sky shows through wherever those objects stand and the pass
+   * lays full in-scatter directly on top of them.
+   */
+  cutoutFor(source) {
+    if (!source.transparent && !(source.alphaTest > 0)) return this.occluder;
+    if (!source.map && !source.alphaMap) return this.occluder;
+    let mat = this._cutouts.get(source);
+    if (!mat) {
+      mat = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        fog: false,
+        side: THREE.DoubleSide,
+        map: source.map || null,
+        alphaMap: source.alphaMap || null,
+        alphaTest: source.alphaTest > 0 ? source.alphaTest : 0.5,
+      });
+      this._cutouts.set(source, mat);
+    }
+    return mat;
+  }
+
+  /**
    * White where open sky reaches the camera, black wherever a solid blocks it.
    *
-   * Transparent geometry is left out. The override material has no opacity, so
-   * smoke, tracers and decals would all draw as fully opaque black and cut
-   * hard notches out of the light where there is nothing but haze.
+   * Additively blended VFX are the one thing left out. Sparks, tracers and the
+   * mote field emit light rather than block it, and the override material has
+   * no opacity, so drawing them would cut hard notches out of the shafts where
+   * there is nothing but haze. Soft sprite smoke goes with them for the same
+   * reason: as a hard black silhouette it does far more damage than the little
+   * occlusion it really provides is worth.
    */
   renderMask(renderer) {
     const hidden = this._hidden;
+    const swapped = this._swapped;
     hidden.length = 0;
+    swapped.length = 0;
     this.scene.traverseVisible((o) => {
-      if (o.isMesh || o.isPoints || o.isLine || o.isSprite) {
-        const m = o.material;
-        const transparent = Array.isArray(m) ? m.some((x) => x && x.transparent) : m && m.transparent;
-        if (transparent) hidden.push(o);
-      } else if (o.isSky || o.name === 'sky') {
-        hidden.push(o);
-      }
+      if (o.isSky || o.name === 'sky' || o.isPoints || o.isSprite) { hidden.push(o); return; }
+      if (!o.isMesh && !o.isLine) return;
+      const m = o.material;
+      if (!m) return;
+      const additive = Array.isArray(m)
+        ? m.some((x) => x && x.blending === THREE.AdditiveBlending)
+        : m.blending === THREE.AdditiveBlending;
+      if (additive) { hidden.push(o); return; }
+      swapped.push(o, m);
+      o.material = Array.isArray(m) ? m.map((x) => this.cutoutFor(x)) : this.cutoutFor(m);
     });
     for (const o of hidden) o.visible = false;
 
     const target = renderer.getRenderTarget();
-    const override = this.scene.overrideMaterial;
     const shadowAuto = renderer.shadowMap.autoUpdate;
     renderer.getClearColor(this._clear);
     const alpha = renderer.getClearAlpha();
 
     // The shadow map was already built for this frame by the beauty pass.
     renderer.shadowMap.autoUpdate = false;
-    this.scene.overrideMaterial = this.occluder;
     renderer.setClearColor(0xffffff, 1);
     renderer.setRenderTarget(this.maskTarget);
     renderer.clear();
     renderer.render(this.scene, this.camera);
 
-    this.scene.overrideMaterial = override;
     renderer.setClearColor(this._clear, alpha);
     renderer.setRenderTarget(target);
     renderer.shadowMap.autoUpdate = shadowAuto;
     for (const o of hidden) o.visible = true;
+    for (let i = 0; i < swapped.length; i += 2) swapped[i].material = swapped[i + 1];
   }
 
   render(renderer, writeBuffer, readBuffer) {
@@ -212,6 +265,8 @@ class SunShaftsPass extends Pass {
   dispose() {
     this.maskTarget.dispose();
     this.occluder.dispose();
+    for (const m of this._cutouts.values()) m.dispose();
+    this._cutouts.clear();
     this.material.dispose();
     this.fsQuad.dispose();
   }
@@ -240,9 +295,13 @@ const GradeShader = {
     // hard enough to band without it.
     uGrain: { value: 0.026 },
     uSharpen: { value: 0.26 },
-    uContrast: { value: 1.26 },
+    uContrast: { value: 1.40 },
     uSaturation: { value: 1.06 },
-    uLift: { value: new THREE.Vector3(0.011, 0.016, 0.030) },
+    uLift: { value: new THREE.Vector3(0.0040, 0.0060, 0.0125) },
+    // Subtracted back off after the lift so the frame still has a true zero in
+    // it. A lift on its own is a floor, and a floor is why the darkest pixel
+    // anywhere was sRGB 21 and the silhouettes had no separation.
+    uBlackPoint: { value: 0.0028 },
     uGain: { value: new THREE.Vector3(1.030, 1.000, 0.968) },
     uSplit: { value: 0.20 },
     uHurt: { value: 0.0 },
@@ -257,7 +316,8 @@ const GradeShader = {
     uniform vec2  uResolution;
     uniform vec3  uLift, uGain;
     uniform float uTime, uExposure, uAberration, uVignette, uGrain,
-                  uSharpen, uContrast, uSaturation, uSplit, uHurt, uFlash;
+                  uSharpen, uContrast, uSaturation, uSplit, uHurt, uFlash,
+                  uBlackPoint;
     varying vec2 vUv;
 
     float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
@@ -326,8 +386,12 @@ const GradeShader = {
 
       // Lifted, tinted black point. Print film has a toe rather than a cliff,
       // and the cold cast sitting under the darkest part of the frame is most
-      // of what separates a dawn exterior from an underexposed one.
+      // of what separates a dawn exterior from an underexposed one. The
+      // stretch that follows is what keeps it a toe: the lift alone sets a
+      // floor no pixel can cross, and a frame with a floor and no clipped
+      // highlight has neither end of the range and reads as haze.
       color = uLift + color * (1.0 - uLift);
+      color = max(color - uBlackPoint, 0.0) / (1.0 - uBlackPoint);
 
       if (uHurt > 0.001) {
         color = mix(color, vec3(luma(color)) * vec3(1.35, 0.30, 0.24), uHurt * 0.55);
@@ -463,7 +527,14 @@ export class PostStack {
     this.shafts.uniforms.uAspect.value = w / h;
     this.composer.addPass(this.shafts);
 
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.20, 0.40, 0.70);
+    // The threshold is in scene-referred linear, and the scene is authored
+    // three stops under the buffer clip so the grade can put the exposure back
+    // (see PRESET.exposure). Display white therefore sits around 0.35 here, and
+    // a threshold below that catches sunlit sand, hot dust puffs and every
+    // work lamp in the outpost — which is how bloom ends up reading as fog with
+    // a second sun in it. Above 0.6 only the solar core and a muzzle flash
+    // qualify, which is the one thing in a dawn frame that should glare.
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.55, 0.62, 0.72);
     this.composer.addPass(this.bloom);
 
     this.grade = new ShaderPass(GradeShader);

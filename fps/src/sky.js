@@ -12,38 +12,56 @@ import { Sky } from 'three/addons/objects/Sky.js';
 export const PRESET = {
   elevation: 8.6,          // degrees above horizon
   azimuth: 104,            // degrees, clockwise from north
-  turbidity: 2.0,          // dust load
-  rayleigh: 4.2,
-  // A broad Mie lobe at this sun elevation smears the disc into a pale wash
-  // across a third of the sky. Tight forward scatter keeps a readable core
-  // with the glow wrapped close around it.
-  mieCoefficient: 0.0030,
+  // Turbidity scales Mie directly, and Mie at this sun elevation is what
+  // smears the disc into a pale wash across a third of the dome. Keeping the
+  // dust load low and the Rayleigh column high is what holds a cool zenith
+  // above a warm horizon inside one frame, which is the whole read of dawn.
+  turbidity: 1.4,
+  rayleigh: 5.5,
+  mieCoefficient: 0.0026,
   mieDirectionalG: 0.90,
-  exposure: 1.16,
-  // Preetham is scene-referred and lands the dawn dome around 0.6-0.8 linear,
-  // which the tone curve then flattens into a single pale wash across the top
-  // of the frame. Scaling it down puts the whole gradient back on the curve's
-  // steep section, where the eye can read it, and leaves the solar disc as the
-  // only thing in the frame that clips.
-  skyGain: 0.29,
-  skyTint: 0x8ec8ff,       // anti-solar cool, standing in for the missing ozone
+  // Everything below renders three stops under the buffer's clip point and is
+  // multiplied back here. The composite buffers are 8-bit in the capture path,
+  // so anything above 1.0 linear is gone before the tone curve can roll it
+  // off; holding the scene down is the only way to keep highlight headroom for
+  // the tone map to shape. Exposure and the light intensities move together.
+  exposure: 2.85,
+  skyGain: 0.115,
+  // Preetham's disc is the true 0.53 deg sun, which is six pixels at this
+  // field of view — too small to survive antialiasing, let alone read as the
+  // key light. A low sun seen through dust saturates a visibly wider core than
+  // its geometric size, and that is what the eye recognises.
+  sunDisc: 1.7,            // degrees, apparent diameter of the saturated core
+  skyTint: 0x9dc0ec,       // ozone stand-in: cools the zenith, not the horizon
   // Ambient hue is the trap here. A saturated orange sun halo and a saturated
   // blue zenith push red and blue from opposite sides and leave green behind,
   // and every shadowed surface in the frame comes out magenta. Both ends of
   // the ambient are deliberately pulled toward green.
   sunColor: 0xffd2a4,      // warm dawn key
-  sunIntensity: 9.4,
-  skyColor: 0x86a9d2,      // zenith
+  sunIntensity: 3.0,
+  skyColor: 0x6d94c8,      // zenith
   groundColor: 0x7a6042,   // sand bounce
-  hemiIntensity: 0.30,
-  hazeColor: 0x96a4b2,     // aerial perspective, away from the sun
+  // Key and fill have to differ in colour temperature, not just in level, or
+  // the cast shadows come back as a darker copy of the sunlit sand and the
+  // frame reads as one warm ramp at no particular hour.
+  hemiIntensity: 0.20,
+  hazeColor: 0x8fa3ba,     // aerial perspective, away from the sun
   hazeSunColor: 0xffcb9c,  // ... and looking into it
-  fogDensity: 0.0072,
-  fogHeight: 15,           // metres; e-folding height of the dust layer
+  // Haze is sky radiance seen end-on, so it has to sit on the same scale as
+  // the sky. A hex swatch decodes to something near 0.5 linear, which against
+  // a scene deliberately rendered around 0.1 is nine times too bright: every
+  // surface it touches is lifted rather than tinted, and the midground turns
+  // into a white wall at fog densities far too low to explain it.
+  hazeLuminance: 0.17,
+  // Thin enough that a ridge at a kilometre still keeps some of its own
+  // modelling. Saturated haze turns every distance into the same flat cut-out
+  // and the eye loses its only cue for how deep the scene is.
+  fogDensity: 0.0030,
+  fogHeight: 40,           // metres; e-folding height of the dust layer
   fillColor: 0xa6c2e6,     // cool sky fill on the shadow side
-  fillIntensity: 0.6,
-  skyLuminance: 0.62,      // scales the analytic IBL
-  environmentIntensity: 0.95,
+  fillIntensity: 0.22,
+  skyLuminance: 0.13,      // scales the analytic IBL
+  environmentIntensity: 1.0,
 };
 
 /**
@@ -66,7 +84,12 @@ export const PRESET = {
  * ShaderLib, and this preset's sun does not move.
  */
 function installAerialPerspective(settings, sunDirection) {
-  const warm = new THREE.Color(settings.hazeSunColor).convertSRGBToLinear();
+  // three's colour management already decodes a hex literal into the linear
+  // working space, so the usual convertSRGBToLinear() on top of it decodes
+  // twice and hands back something several times darker and more saturated
+  // than the swatch it came from.
+  const warm = new THREE.Color(settings.hazeSunColor)
+    .multiplyScalar(settings.hazeLuminance);
   const f = (v) => v.toFixed(6);
 
   THREE.ShaderChunk.fog_pars_vertex = /* glsl */`
@@ -118,7 +141,11 @@ function installAerialPerspective(settings, sunDirection) {
   vec3 haze = mix( fogColor, vec3( ${f(warm.r)}, ${f(warm.g)}, ${f(warm.b)} ),
                    pow( sunAmount, 1.9 ) * 0.92 );
 
-  gl_FragColor.rgb = mix( gl_FragColor.rgb, haze, clamp( fogFactor, 0.0, 1.0 ) );
+  // Never hand a surface entirely over to the haze. Full saturation is what
+  // turns a distant ridge into a single flat value with no sunlit face and no
+  // shadow face; leaving it a little of its own radiance keeps the internal
+  // modelling that lets the eye stack one distance behind another.
+  gl_FragColor.rgb = mix( gl_FragColor.rgb, haze, min( fogFactor, 0.88 ) );
 #endif`;
 }
 
@@ -138,25 +165,37 @@ export class Atmosphere {
 
     this.sky = new Sky();
     this.sky.material.uniforms.skyGain = { value: this.settings.skyGain };
-    this.sky.material.uniforms.skyTint = {
-      value: new THREE.Color(this.settings.skyTint).convertSRGBToLinear(),
-    };
-    this.sky.material.fragmentShader = 'uniform float skyGain;\nuniform vec3 skyTint;\n'
+    this.sky.material.uniforms.skyDiscCos = { value: 1 };
+    this.sky.material.uniforms.skyTint = { value: new THREE.Color(this.settings.skyTint) };
+    this.sky.material.fragmentShader =
+      'uniform float skyGain;\nuniform float skyDiscCos;\nuniform vec3 skyTint;\n'
       + this.sky.material.fragmentShader;
+    // Widen the solar core. Preetham draws the geometric disc, 0.53 deg, which
+    // is six pixels here and disappears into the edge filter; a low sun through
+    // dust saturates a much wider core than that, and without one the frame has
+    // no visible light source at all.
+    this.sky.material.fragmentShader = this.sky.material.fragmentShader.replace(
+      'float sundisk = smoothstep( sunAngularDiameterCos, sunAngularDiameterCos + 0.00002, cosTheta );',
+      'float sundisk = smoothstep( skyDiscCos, mix( skyDiscCos, 1.0, 0.55 ), cosTheta );',
+    );
     // Two things happen here.
     //
     // Preetham's final `pow(texColor, ...)` returns NaN for any negative or
     // overflowing component, and PMREM will smear one NaN across every mip, so
     // the result is guarded before anything downstream sees it.
     //
-    // And the model has no ozone term. Chappuis absorption is what makes a
-    // real twilight sky deepen to blue on the anti-solar side; without it
-    // Preetham hands back a flat teal there. Tinting by the angle from the sun
-    // puts that gradient back.
+    // And the model has no ozone term. Chappuis absorption is what deepens a
+    // real twilight sky to blue overhead; without it Preetham hands back a flat
+    // teal. Ozone is a vertical column, so the tint is keyed on elevation and
+    // not on the angle from the sun — keyed on the latter it contributes
+    // nothing to any frame that happens to face the sunrise, which is every
+    // frame here. It is held back inside the forward-scatter lobe, where Mie
+    // dominates and the light really is spectrally flat.
     this.sky.material.fragmentShader = this.sky.material.fragmentShader.replace(
       'gl_FragColor = vec4( retColor, 1.0 );',
-      `float away = 1.0 - max( cosTheta, 0.0 );
-       vec3 safeColor = retColor * skyGain * mix( vec3( 1.0 ), skyTint, away * away );
+      `float ozone = smoothstep( 0.03, 0.62, max( direction.y, 0.0 ) )
+                   * ( 1.0 - 0.75 * pow( max( cosTheta, 0.0 ), 8.0 ) );
+       vec3 safeColor = retColor * skyGain * mix( vec3( 1.0 ), skyTint, ozone );
        safeColor = mix( vec3( 0.0 ), safeColor, vec3( equal( safeColor, safeColor ) ) );
        gl_FragColor = vec4( max( safeColor, vec3( 0.0 ) ), 1.0 );`,
     );
@@ -195,6 +234,7 @@ export class Atmosphere {
     scene.add(this.bounce.target);
 
     scene.fog = new THREE.FogExp2(this.settings.hazeColor, this.settings.fogDensity);
+    scene.fog.color.multiplyScalar(this.settings.hazeLuminance);
 
     this.pmrem = new THREE.PMREMGenerator(renderer);
     this.pmrem.compileEquirectangularShader();
@@ -232,7 +272,8 @@ export class Atmosphere {
     u.mieCoefficient.value = s.mieCoefficient;
     u.mieDirectionalG.value = s.mieDirectionalG;
     u.skyGain.value = s.skyGain;
-    u.skyTint.value.set(s.skyTint).convertSRGBToLinear();
+    u.skyDiscCos.value = Math.cos(THREE.MathUtils.degToRad(s.sunDisc * 0.5));
+    u.skyTint.value.set(s.skyTint);
 
     const phi = THREE.MathUtils.degToRad(90 - s.elevation);
     const theta = THREE.MathUtils.degToRad(s.azimuth);
@@ -255,7 +296,7 @@ export class Atmosphere {
     this.hemi.intensity = s.hemiIntensity;
 
     if (this.scene.fog) {
-      this.scene.fog.color.set(s.hazeColor);
+      this.scene.fog.color.set(s.hazeColor).multiplyScalar(s.hazeLuminance);
       this.scene.fog.density = s.fogDensity;
     }
 
@@ -283,7 +324,7 @@ export class Atmosphere {
     const height = width / 2;
     const data = new Float32Array(width * height * 4);
 
-    const lin = (hex) => new THREE.Color(hex).convertSRGBToLinear();
+    const lin = (hex) => new THREE.Color(hex);
     const zenith = lin(this.settings.skyColor);
     const cool = lin(this.settings.hazeColor);
     const warm = lin(this.settings.hazeSunColor);
@@ -330,9 +371,13 @@ export class Atmosphere {
           b = hz[2] * 0.62 + (ground.b - hz[2] * 0.62) * t;
         }
 
-        // Forward-scattered glow around the sun. Bounded by construction.
+        // Forward-scattered glow around the sun — the aureole only. A term
+        // tight and strong enough to stand in for the disc puts the direct
+        // light back into an irradiance map that exists precisely to exclude
+        // it, and every shadowed surface then gets lit by the light it is
+        // shadowed from, which is what collapses key and fill onto one colour.
         const cosSun = Math.max(0, dx * sun.x + sy * sun.y + dz * sun.z);
-        const halo = Math.pow(cosSun, 5) * 1.5 + Math.pow(cosSun, 36) * 5.0;
+        const halo = Math.pow(cosSun, 8) * 0.25;
         r += glow.r * halo;
         g += glow.g * halo;
         b += glow.b * halo;
