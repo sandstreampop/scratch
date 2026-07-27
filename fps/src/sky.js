@@ -12,17 +12,21 @@ import { Sky } from 'three/addons/objects/Sky.js';
 export const PRESET = {
   elevation: 8.6,          // degrees above horizon
   azimuth: 104,            // degrees, clockwise from north
-  turbidity: 3.1,          // dust load
-  rayleigh: 2.9,
-  mieCoefficient: 0.0048,
-  mieDirectionalG: 0.865,
-  exposure: 1.12,
+  turbidity: 2.0,          // dust load
+  rayleigh: 4.2,
+  // A broad Mie lobe at this sun elevation smears the disc into a pale wash
+  // across a third of the sky. Tight forward scatter keeps a readable core
+  // with the glow wrapped close around it.
+  mieCoefficient: 0.0030,
+  mieDirectionalG: 0.90,
+  exposure: 1.16,
   // Preetham is scene-referred and lands the dawn dome around 0.6-0.8 linear,
   // which the tone curve then flattens into a single pale wash across the top
   // of the frame. Scaling it down puts the whole gradient back on the curve's
   // steep section, where the eye can read it, and leaves the solar disc as the
   // only thing in the frame that clips.
-  skyGain: 0.30,
+  skyGain: 0.29,
+  skyTint: 0xd6f2ff,       // anti-solar cool, standing in for the missing ozone
   // Ambient hue is the trap here. A saturated orange sun halo and a saturated
   // blue zenith push red and blue from opposite sides and leave green behind,
   // and every shadowed surface in the frame comes out magenta. Both ends of
@@ -32,9 +36,9 @@ export const PRESET = {
   skyColor: 0x86a9d2,      // zenith
   groundColor: 0x7a6042,   // sand bounce
   hemiIntensity: 0.30,
-  hazeColor: 0xacb8c2,     // aerial perspective, away from the sun
+  hazeColor: 0x96a4b2,     // aerial perspective, away from the sun
   hazeSunColor: 0xffcb9c,  // ... and looking into it
-  fogDensity: 0.0092,
+  fogDensity: 0.0072,
   fogHeight: 15,           // metres; e-folding height of the dust layer
   fillColor: 0xa6c2e6,     // cool sky fill on the shadow side
   fillIntensity: 0.6,
@@ -112,7 +116,7 @@ function installAerialPerspective(settings, sunDirection) {
   float sunAmount = max( dot( fogRay / fogDist,
     vec3( ${f(sunDirection.x)}, ${f(sunDirection.y)}, ${f(sunDirection.z)} ) ), 0.0 );
   vec3 haze = mix( fogColor, vec3( ${f(warm.r)}, ${f(warm.g)}, ${f(warm.b)} ),
-                   pow( sunAmount, 2.6 ) * 0.88 );
+                   pow( sunAmount, 1.9 ) * 0.92 );
 
   gl_FragColor.rgb = mix( gl_FragColor.rgb, haze, clamp( fogFactor, 0.0, 1.0 ) );
 #endif`;
@@ -134,13 +138,25 @@ export class Atmosphere {
 
     this.sky = new Sky();
     this.sky.material.uniforms.skyGain = { value: this.settings.skyGain };
-    this.sky.material.fragmentShader = 'uniform float skyGain;\n'
+    this.sky.material.uniforms.skyTint = {
+      value: new THREE.Color(this.settings.skyTint).convertSRGBToLinear(),
+    };
+    this.sky.material.fragmentShader = 'uniform float skyGain;\nuniform vec3 skyTint;\n'
       + this.sky.material.fragmentShader;
+    // Two things happen here.
+    //
     // Preetham's final `pow(texColor, ...)` returns NaN for any negative or
-    // overflowing component. Guard the visible sky as well as the IBL source.
+    // overflowing component, and PMREM will smear one NaN across every mip, so
+    // the result is guarded before anything downstream sees it.
+    //
+    // And the model has no ozone term. Chappuis absorption is what makes a
+    // real twilight sky deepen to blue on the anti-solar side; without it
+    // Preetham hands back a flat teal there. Tinting by the angle from the sun
+    // puts that gradient back.
     this.sky.material.fragmentShader = this.sky.material.fragmentShader.replace(
       'gl_FragColor = vec4( retColor, 1.0 );',
-      `vec3 safeColor = retColor * skyGain;
+      `float away = 1.0 - max( cosTheta, 0.0 );
+       vec3 safeColor = retColor * skyGain * mix( vec3( 1.0 ), skyTint, away * away );
        safeColor = mix( vec3( 0.0 ), safeColor, vec3( equal( safeColor, safeColor ) ) );
        gl_FragColor = vec4( max( safeColor, vec3( 0.0 ) ), 1.0 );`,
     );
@@ -216,6 +232,7 @@ export class Atmosphere {
     u.mieCoefficient.value = s.mieCoefficient;
     u.mieDirectionalG.value = s.mieDirectionalG;
     u.skyGain.value = s.skyGain;
+    u.skyTint.value.set(s.skyTint).convertSRGBToLinear();
 
     const phi = THREE.MathUtils.degToRad(90 - s.elevation);
     const theta = THREE.MathUtils.degToRad(s.azimuth);

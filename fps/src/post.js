@@ -1,11 +1,12 @@
 // Post-processing chain.
 //
-//   scene -> GTAO -> volumetric shafts -> bloom -> tonemap/sRGB
-//         -> grade (CA, vignette, grain, sharpen, lift/gamma/gain) -> SMAA
+//   scene -> GTAO -> sun shafts -> viewmodel -> bloom
+//         -> grade (CA, sharpen, contrast, tonemap, sRGB, vignette, grain)
+//         -> FXAA or SMAA
 //
-// The grade pass runs after tonemapping because chromatic aberration, grain
-// and vignette are lens/sensor artifacts — applying them in HDR makes bright
-// areas smear in a way no real camera does.
+// The grade owns the tone map so that contrast is applied to scene-referred
+// values and the lens/sensor artifacts — aberration, vignette, grain — are
+// applied after the encode, which is the only order that matches a camera.
 
 import * as THREE from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
@@ -58,7 +59,7 @@ const ShaftsShader = {
     tDiffuse: { value: null },
     tMask: { value: null },
     uSunScreen: { value: new THREE.Vector2(0.5, 0.5) },
-    uIntensity: { value: 0.62 },
+    uIntensity: { value: 0.55 },
     uDecay: { value: 0.966 },
     uDensity: { value: 1.02 },
     uWeight: { value: 1.0 },
@@ -66,7 +67,7 @@ const ShaftsShader = {
     // in-scatter reaches everywhere, but without a depth buffer this pass
     // cannot tell a distant silhouette from a near one, and letting it run to
     // the frame edge lifts the whole foreground into a flat veil.
-    uReach: { value: 0.62 },
+    uReach: { value: 0.55 },
     uTint: { value: new THREE.Color(0xffc48c) },
     uVisible: { value: 1.0 },
     uAspect: { value: 1.0 },
@@ -239,7 +240,7 @@ const GradeShader = {
     // hard enough to band without it.
     uGrain: { value: 0.026 },
     uSharpen: { value: 0.26 },
-    uContrast: { value: 1.22 },
+    uContrast: { value: 1.26 },
     uSaturation: { value: 1.06 },
     uLift: { value: new THREE.Vector3(0.011, 0.016, 0.030) },
     uGain: { value: new THREE.Vector3(1.030, 1.000, 0.968) },
@@ -347,6 +348,56 @@ const GradeShader = {
   `,
 };
 
+/* -------------------------------------------------------------- edge AA -- */
+
+// SMAA is the better edge filter and it is what the top tiers run. Below them
+// it is switched off, and raw stair-stepping on the overhead cables and the
+// rifle's rail teeth is the most obviously cheap thing in the frame. FXAA
+// costs a single tap-and-blend pass and covers exactly that gap.
+
+const FXAAShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uTexel: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse;
+    uniform vec2 uTexel;
+    varying vec2 vUv;
+
+    float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+    void main() {
+      vec3 m  = texture2D(tDiffuse, vUv).rgb;
+      vec3 nw = texture2D(tDiffuse, vUv + vec2(-1.0, -1.0) * uTexel).rgb;
+      vec3 ne = texture2D(tDiffuse, vUv + vec2( 1.0, -1.0) * uTexel).rgb;
+      vec3 sw = texture2D(tDiffuse, vUv + vec2(-1.0,  1.0) * uTexel).rgb;
+      vec3 se = texture2D(tDiffuse, vUv + vec2( 1.0,  1.0) * uTexel).rgb;
+
+      float lM = luma(m), lNW = luma(nw), lNE = luma(ne), lSW = luma(sw), lSE = luma(se);
+      float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+      float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+      if (lMax - lMin < max(0.045, lMax * 0.15)) { gl_FragColor = vec4(m, 1.0); return; }
+
+      vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
+      float reduce = max((lNW + lNE + lSW + lSE) * 0.03125, 0.0078125);
+      dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), -8.0, 8.0) * uTexel;
+
+      vec3 a = 0.5 * (texture2D(tDiffuse, vUv + dir * -0.16667).rgb
+                    + texture2D(tDiffuse, vUv + dir *  0.16667).rgb);
+      vec3 b = a * 0.5 + 0.25 * (texture2D(tDiffuse, vUv - dir * 0.5).rgb
+                               + texture2D(tDiffuse, vUv + dir * 0.5).rgb);
+
+      float lB = luma(b);
+      gl_FragColor = vec4((lB < lMin || lB > lMax) ? a : b, 1.0);
+    }
+  `,
+};
+
 /* ---------------------------------------------------------------- public -- */
 
 export class PostStack {
@@ -406,13 +457,17 @@ export class PostStack {
     this.shafts.uniforms.uAspect.value = w / h;
     this.composer.addPass(this.shafts);
 
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.28, 0.55, 0.70);
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.20, 0.40, 0.70);
     this.composer.addPass(this.bloom);
 
     this.grade = new ShaderPass(GradeShader);
     this.grade.uniforms.uResolution.value.set(w, h);
     this.grade.uniforms.uExposure.value = exposure;
     this.composer.addPass(this.grade);
+
+    this.fxaa = new ShaderPass(FXAAShader);
+    this.fxaa.uniforms.uTexel.value.set(1 / w, 1 / h);
+    this.composer.addPass(this.fxaa);
 
     this.smaa = new SMAAPass();
     this.composer.addPass(this.smaa);
@@ -465,6 +520,8 @@ export class PostStack {
 
   render(dt, elapsed) {
     this.grade.uniforms.uTime.value = elapsed;
+    // The quality tier owns `smaa.enabled`; FXAA takes over whenever it drops.
+    this.fxaa.enabled = !this.smaa.enabled;
     this.composer.render(dt);
   }
 
@@ -476,6 +533,7 @@ export class PostStack {
     this.bloom.setSize(w, h);
     this.shafts.setSize(w, h);
     this.grade.uniforms.uResolution.value.set(w, h);
+    this.fxaa.uniforms.uTexel.value.set(1 / w, 1 / h);
     this.shafts.uniforms.uAspect.value = width / height;
   }
 }

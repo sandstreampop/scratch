@@ -96,9 +96,13 @@ let exitCode = 0;
 
 try {
   const t0 = Date.now();
-  // Headless engines here are software rasterisers, which render half-float
-  // targets black; see the note in src/post.js.
-  await page.goto(`http://127.0.0.1:${port}/index.html?buffers=byte`,
+  // Both constraints come from the same fact: every engine available to this
+  // harness is a software rasteriser. They render half-float targets black
+  // (see src/post.js), and they cannot carry the higher tiers at any useful
+  // rate, so the tier is pinned rather than left to auto-downgrade — which
+  // needs sustained frames to make its decision, and would spend the whole run
+  // getting there.
+  await page.goto(`http://127.0.0.1:${port}/index.html?buffers=byte&quality=low`,
     { waitUntil: 'commit', timeout: 60000 });
 
   // Boot: procedural generation is synchronous and slow on a cold engine.
