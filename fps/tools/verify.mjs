@@ -373,6 +373,23 @@ try {
   if (tier === 'auto' && !desktop) {
     check('detected tier is not pinned to the floor', chosen !== 'low',
       `detectTier chose ${chosen} at ${await page.evaluate(() => navigator.hardwareConcurrency)} cores`);
+
+    // Starting a phone at medium is only safe because measured frame time can
+    // take it back down, so the net itself has to be under test. It never was:
+    // every other profile pins the tier through ?quality=, and a pinned tier
+    // sets `locked`, which makes sample() return before it does anything. Feed
+    // the real governor a sustained 5 fps and it must give a tier up. Last of
+    // the checks, because it deliberately mutates the running game.
+    const gov = await page.evaluate(() => {
+      const q = window.__GAME.quality;
+      const before = q.tierName;
+      let t = 100;                       // past the settling window
+      for (let i = 0; i < 200; i++) { t += 0.2; q.sample(0.2, t); }
+      return { before, after: q.tierName, locked: q.locked };
+    });
+    check('frame-time governor downgrades a struggling device',
+      !gov.locked && gov.after === 'low' && gov.after !== gov.before,
+      `${gov.before} -> ${gov.after} under a sustained 5 fps`);
   }
 
   const fatal = errors.filter((e) => !/favicon|404/i.test(e));
