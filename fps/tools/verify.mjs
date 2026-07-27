@@ -347,6 +347,20 @@ try {
   check('fire control consumes ammunition', afterFire < before.ammo,
     `${before.ammo} -> ${afterFire}`);
 
+  // How fast, not just whether. "Ammunition went down" passed happily while
+  // the rate limiter compared the page clock against a simulation timestamp
+  // and was therefore never once closed: the trigger put out one round per
+  // rendered frame, 3600 rpm against a specified 780, emptying a magazine in
+  // half a second. A burst of exactly 12 frames at a fixed 1/60 is 0.2 s of
+  // simulated time, so the round count is a direct measurement of cadence.
+  const spec = await page.evaluate(() => window.__GAME.weapon.constructor
+    && window.__SPEC_RPM);
+  const rpm = (before.ammo - afterFire) / 0.2 * 60;
+  const expected = spec || 780;
+  check('fire rate matches the weapon spec',
+    rpm > expected * 0.6 && rpm < expected * 1.5,
+    `${before.ammo - afterFire} rounds in 0.2 s = ${Math.round(rpm)} rpm, spec ${expected}`);
+
   // Sustained frame rate over a couple of seconds of real play.
   const fps = await page.evaluate(() => new Promise((resolve) => {
     let frames = 0;

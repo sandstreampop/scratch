@@ -706,6 +706,9 @@ async function main() {
 
   const game = new Game();
   window.__GAME = game;
+  // The harness measures cadence against this rather than hard-coding it, so
+  // retuning the weapon retunes the test with it.
+  window.__SPEC_RPM = SPEC.rpm;
   await game.build(SHOT ? () => {} : setProgress);
   mark('build');
 

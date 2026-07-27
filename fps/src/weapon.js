@@ -770,13 +770,25 @@ export class Weapon {
 
   /* --------------------------------------------------------------- fire -- */
 
-  get canFire() {
+  /**
+   * Rate limiter, on the simulation clock.
+   *
+   * This used to read performance.now() while fire() stamped lastShot with the
+   * simulation time, so the subtraction spanned two unrelated origins. The
+   * page clock is ahead of the sim clock by the whole boot — several seconds
+   * of procedural generation — so the difference was never once below the
+   * 77 ms interval and the limiter was permanently open. Holding the trigger
+   * fired a round per rendered frame: 3600 rpm against a specified 780, a full
+   * magazine in half a second instead of two and a third. Every other user of
+   * lastShot in this file already treats it as simulation time.
+   */
+  canFireAt(now) {
     return !this.reloading && this.ammo > 0
-      && (performance.now() / 1000 - this.lastShot) >= 60 / SPEC.rpm;
+      && (now - this.lastShot) >= 60 / SPEC.rpm;
   }
 
   fire(now, player) {
-    if (!this.canFire) return null;
+    if (!this.canFireAt(now)) return null;
     this.lastShot = now;
     this.ammo--;
     this._shotCount++;
