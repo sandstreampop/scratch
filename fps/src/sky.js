@@ -439,6 +439,56 @@ export class Atmosphere {
     return tex;
   }
 
+  /**
+   * Mean luminance of a surface lit only by the environment map.
+   *
+   * A direct test of the thing that broke on iOS. Scene brightness is a poor
+   * proxy for it — an unfilterable env texture darkens everything roughly
+   * uniformly, so ratios stay healthy and absolute thresholds have to be
+   * retuned per rasteriser. Lighting one sphere from the environment and
+   * nothing else answers the question directly, and gives the same answer on
+   * any renderer.
+   */
+  environmentLuma(renderer) {
+    const scene = new THREE.Scene();
+    scene.environment = this.scene.environment;
+    scene.environmentIntensity = this.scene.environmentIntensity;
+    const probe = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 16, 12),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1, metalness: 0 }),
+    );
+    scene.add(probe);
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 10);
+    camera.position.set(0, 0, 2.6);
+
+    const target = new THREE.WebGLRenderTarget(32, 32, {
+      type: THREE.UnsignedByteType, colorSpace: THREE.LinearSRGBColorSpace,
+    });
+    const previous = renderer.getRenderTarget();
+    renderer.setRenderTarget(target);
+    renderer.clear();
+    renderer.render(scene, camera);
+
+    const pixels = new Uint8Array(32 * 32 * 4);
+    let luma = -1;
+    try {
+      renderer.readRenderTargetPixels(target, 0, 0, 32, 32, pixels);
+      let sum = 0;
+      for (let i = 0; i < pixels.length; i += 4) {
+        sum += (0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2]) / 255;
+      }
+      luma = sum / (pixels.length / 4);
+    } catch (e) {
+      luma = -1;
+    }
+
+    renderer.setRenderTarget(previous);
+    probe.geometry.dispose();
+    probe.material.dispose();
+    target.dispose();
+    return luma;
+  }
+
   /** Re-convolves the analytic sky into scene.environment. */
   refreshEnvironment() {
     if (this.envTarget) this.envTarget.dispose();

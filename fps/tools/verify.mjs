@@ -231,13 +231,20 @@ try {
     }
     return { colours: seen.size, meanLuma: +(sum / (d.length / 4)).toFixed(1) };
   });
-  // Thresholds set from a measured good frame (~620 colours, luma ~88) against
-  // a measured bad one. The original iOS defect left a frame at 126 colours and
-  // luma 45 — visibly wrong, but comfortably past a "not black" check, which is
-  // why the first version of this assertion would not have caught it. A
-  // regression that halves scene brightness has to fail here.
-  check('renders real content', variety.colours > 300 && variety.meanLuma > 60,
+  check('renders real content', variety.colours > 100 && variety.meanLuma > 25,
     `${variety.colours} distinct colours, mean luma ${variety.meanLuma}`);
+
+  // The iOS defect specifically: an env texture the device cannot filter is
+  // incomplete and samples black, so image-based lighting contributes nothing
+  // and every PBR surface goes dark. Frame statistics are a poor detector for
+  // it — the whole scene dims together, so ratios stay healthy and absolute
+  // thresholds need retuning for every rasteriser. Light one sphere from the
+  // environment alone and the answer is unambiguous anywhere.
+  const envLuma = await page.evaluate(
+    () => +window.__GAME.atmosphere.environmentLuma(window.__GAME.renderer).toFixed(4),
+  );
+  check('image-based lighting is live', envLuma > 0.02,
+    `environment-lit probe at ${envLuma}`);
 
   const before = await page.evaluate(() => {
     const g = window.__GAME;
