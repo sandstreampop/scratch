@@ -805,9 +805,34 @@ export function material(name, repeat = 1, overrides = {}) {
     envMapIntensity: 1,
     dithering: true,
   });
-  Object.assign(mat, overrides);
+  applyOverrides(mat, overrides);
   if (MACRO[name]) applyMacro(mat, MACRO[name]);
   return mat;
+}
+
+/**
+ * Applies material overrides without destroying live three objects.
+ *
+ * `Object.assign(material, { color: 0x8899aa })` replaces the THREE.Color
+ * instance with a plain number. Nothing throws — the shader then reads .r/.g/.b
+ * as undefined, the diffuse uniform becomes zero, and the surface renders
+ * pure black regardless of how much light reaches it. Colors, vectors and
+ * euler angles all have to be written through their own setters.
+ */
+function applyOverrides(material, overrides) {
+  for (const [key, value] of Object.entries(overrides)) {
+    const current = material[key];
+    if (current && current.isColor) current.set(value);
+    else if (current && current.isVector2) {
+      if (Array.isArray(value)) current.set(value[0], value[1]);
+      else if (typeof value === 'number') current.set(value, value);
+      else current.copy(value);
+    } else if (current && current.isVector3 && Array.isArray(value)) {
+      current.set(value[0], value[1], value[2]);
+    } else {
+      material[key] = value;
+    }
+  }
 }
 
 export const SURFACES = Object.keys(SAMPLERS);
