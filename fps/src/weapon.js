@@ -168,34 +168,28 @@ function buildCarbine() {
   // Roughness low enough that the receiver flanks pick up a grazing sheen. Run
   // it fully matte and the whole part collapses onto one value, which is what
   // makes a viewmodel read as a cut-out rather than as machined steel.
-  const phosphate = material('gunmetal', [3.2, 3.2], { roughness: 0.62, metalness: 0.24 });
-  const barrelSteel = material('gunmetal', [5, 5], { roughness: 0.52, metalness: 0.75 });
-  const furniture = material('polymer', [3, 3], { roughness: 0.92 });
-  const gripPoly = material('polymer', [7, 7], { roughness: 0.98 });
+  const phosphate = material('gunmetal', [3.2, 3.2], { aoMap: null, roughness: 0.62, metalness: 0.24 });
+  const barrelSteel = material('gunmetal', [5, 5], { aoMap: null, roughness: 0.52, metalness: 0.75 });
+  const furniture = material('polymer', [3, 3], { aoMap: null, roughness: 0.92 });
+  const gripPoly = material('polymer', [7, 7], { aoMap: null, roughness: 0.98 });
   // An FDE magazine is the one value break a black rifle gets, and it is what
   // stops the lower right of frame being a single silhouette. The albedo map
   // is dropped so the tint is the base value rather than a multiply against
   // near-black polymer; normal and ORM stay, so the moulding still reads.
-  const magPoly = material('polymer', [1.6, 3], { map: null, color: 0x9c8763, roughness: 0.80 });
+  const magPoly = material('polymer', [1.6, 3], { aoMap: null, map: null, color: 0x9c8763, roughness: 0.80 });
   // Small hard parts sit a stop above the body, not below it. Authored darker
   // than the receiver they are holding, every pin, slot and control disappears
   // and the detail that is modelled might as well not exist. Tiled hard so the
   // sampler's polished-through wear lands as a highlight on a part this size
   // instead of averaging out — a flat swatch here reads as moulded plastic.
-  const small = material('gunmetal', [5, 5], { roughness: 1.0, metalness: 0.26 });
+  const small = material('gunmetal', [5, 5], { aoMap: null, roughness: 0.88, metalness: 0.26 });
   const railMat = new THREE.MeshStandardMaterial({ color: 0x2e3136, roughness: 0.80, metalness: 0.25 });
   // Tiled tight on purpose: at low repeat the gunmetal sampler's polished-through
   // wear blobs are bigger than the optic itself and turn the whole tube chrome.
-  const opticBody = material('gunmetal', [5, 5], { roughness: 0.74, metalness: 0.30 });
-  const worn = material('gunmetal', [8, 8], { roughness: 0.72, metalness: 0.60 });
+  const opticBody = material('gunmetal', [5, 5], { aoMap: null, roughness: 0.74, metalness: 0.30 });
+  const worn = material('gunmetal', [8, 8], { aoMap: null, roughness: 0.72, metalness: 0.60 });
   const rubber = new THREE.MeshStandardMaterial({ color: 0x2a2a2d, roughness: 0.90, metalness: 0.0 });
   const bore = new THREE.MeshStandardMaterial({ color: 0x0a0a0b, roughness: 1.0, metalness: 0.3 });
-
-  const T_ctrl = phosphate;
-  const T_nomap = material('gunmetal', [3.2, 3.2], { roughness: 0.62, metalness: 0.24, map: null, color: 0x5b5b5e });
-  const T_noao = material('gunmetal', [3.2, 3.2], { roughness: 0.62, metalness: 0.24, aoMap: null });
-  const T_nonrm = material('gunmetal', [3.2, 3.2], { roughness: 0.62, metalness: 0.24, normalMap: null });
-  const T_plain = new THREE.MeshStandardMaterial({ color: 0x5b5b5e, roughness: 0.43, metalness: 0.24 });
 
   const part = (geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
     const m = new THREE.Mesh(geo, mat);
@@ -232,7 +226,7 @@ function buildCarbine() {
   };
 
   // ---- upper receiver ------------------------------------------------------
-  part(rbox(0.038, 0.040, 0.202, 0.005), T_ctrl, 0, 0.001, -0.101);
+  part(rbox(0.038, 0.040, 0.202, 0.005), phosphate, 0, 0.001, -0.101);
   part(rbox(0.031, 0.031, 0.016, 0.004), phosphate, 0, 0.003, 0.005);       // rear takedown lug
   part(rbox(0.0224, 0.0062, 0.212, 0.001), phosphate, 0, RAIL_DECK - 0.0031, -0.100);
   railRun(railMat, -0.204, 0.004, RAIL_DECK);
@@ -257,8 +251,8 @@ function buildCarbine() {
   }
 
   // ---- lower receiver ------------------------------------------------------
-  part(rbox(0.0272, 0.038, 0.128, 0.004), T_nomap, 0, -0.031, -0.062);
-  part(rbox(0.0370, 0.058, 0.052, 0.004), T_noao, 0, -0.048, -0.086);
+  part(rbox(0.0272, 0.038, 0.128, 0.004), phosphate, 0, -0.031, -0.062);
+  part(rbox(0.0370, 0.058, 0.052, 0.004), phosphate, 0, -0.048, -0.086);
   part(rbox(0.0432, 0.0085, 0.0575, 0.002), phosphate, 0, -0.0790, -0.086);   // flare
   part(rbox(0.0446, 0.0018, 0.0590, 0.0006), worn, 0, -0.0836, -0.086);       // worn lip
   // The left flank of an AR is a big blank casting, so it needs the parting
@@ -370,12 +364,12 @@ function buildCarbine() {
     part(rbox(0.0035, 0.0035, 0.0105, 0.0008), small,
       Math.sin(a) * 0.0168, -0.0015 + Math.cos(a) * 0.0168, 0.0080);
   }
-  tubeAlongZ(0.0146, 0.0146, 0.2300, 18, T_nonrm, 0, -0.0015, 0.1280);
+  tubeAlongZ(0.0146, 0.0146, 0.2300, 18, phosphate, 0, -0.0015, 0.1280);
   for (let i = 0; i < 6; i++) {                                    // adjustment detents
     part(cyl(0.0026, 0.0026, 0.0035, 8), bore, 0, -0.0155, 0.0700 + i * 0.0250);
   }
   // Collapsible stock: body, cheek rise, toe, pad.
-  part(rbox(0.0480, 0.0520, 0.1250, 0.006), T_plain, 0, -0.0020, 0.1900);
+  part(rbox(0.0480, 0.0520, 0.1250, 0.006), furniture, 0, -0.0020, 0.1900);
   part(rbox(0.0400, 0.0140, 0.1020, 0.005), furniture, 0, 0.0270, 0.1840);
   part(rbox(0.0300, 0.0300, 0.0620, 0.006), furniture, 0, -0.0360, 0.2320, -0.22);
   part(rbox(0.0455, 0.0980, 0.0150, 0.004), furniture, 0, -0.0060, 0.2720);
@@ -519,11 +513,6 @@ function buildCarbine() {
   reticle.position.set(0, 0, -0.0240);
   reticle.renderOrder = 40;
   optic.add(reticle);
-
-  const PROBE = [T_ctrl, T_nomap, T_noao, T_nonrm, T_plain];
-  for (let i = 0; i < PROBE.length; i++) {
-    part(rbox(0.048, 0.048, 0.008, 0.001), PROBE[i], -0.115 + i * 0.058, 0.150, -0.300);
-  }
 
   // ---- anchors -------------------------------------------------------------
   const muzzleAnchor = new THREE.Object3D();
@@ -699,7 +688,7 @@ export class Weapon {
     // Cool sky on the shadow side. Kept low and to the side: raised overhead it
     // lights every top face at once and the receiver reads as light grey
     // plastic instead of phosphate.
-    this.fill = new THREE.DirectionalLight(0xa9c3e2, 10.0);
+    this.fill = new THREE.DirectionalLight(0xa9c3e2, 1.25);
     this.fill.position.set(-0.90, 0.42, 0.85);
     this.scene.add(this.fill);
 
@@ -721,8 +710,6 @@ export class Weapon {
     // curve's toe and the whole lower half of the weapon crushes to zero.
     this.scene.add(new THREE.HemisphereLight(0x9cc0e6, 0xb08a58, 0.55));
     this.scene.add(new THREE.AmbientLight(0xdfe4ee, 0.15));
-    this.key.visible=false;this.fill.visible=false;this.rim.visible=false;this.bounce.visible=false;
-    this.scene.add(new THREE.AmbientLight(0xffffff, 3.0));
   }
 
   /** Aligns the viewmodel rig with the world sun as the player turns. */
@@ -998,7 +985,7 @@ function buildHands() {
   // hand carries three values instead of one.
   const glove = new THREE.MeshStandardMaterial({ color: 0x3d362d, roughness: 0.90, metalness: 0.0 });
   const knuckle = new THREE.MeshStandardMaterial({ color: 0x211d19, roughness: 0.58, metalness: 0.0 });
-  const sleeve = material('canvas', [4, 4], { roughness: 1.0, color: 0x9e9075 });
+  const sleeve = material('canvas', [4, 4], { aoMap: null, roughness: 1.0, color: 0x9e9075 });
 
   const piece = (parent, geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
     const m = new THREE.Mesh(geo, mat);
