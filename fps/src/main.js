@@ -11,7 +11,7 @@ import { Director, STATE } from './ai.js';
 import { HUD } from './hud.js';
 import { Audio } from './audio.js';
 import { PostStack } from './post.js';
-import { setAnisotropy } from './textures.js';
+import { setAnisotropy, setResolutionScale } from './textures.js';
 import { Input, isTouchDevice } from './input.js';
 import { Quality, platform } from './quality.js';
 
@@ -107,6 +107,8 @@ class Game {
 
     setAnisotropy(Math.min(this.quality.get('anisotropy'),
       this.renderer.capabilities.getMaxAnisotropy()));
+    // Must precede any material construction; textures are cached on first use.
+    setResolutionScale(SHOT ? 1 : this.quality.get('textureScale'));
 
     // A phone on a low tier renders shadows at a quarter of the desktop
     // resolution; below that they cost more than they contribute.

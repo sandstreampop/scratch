@@ -107,6 +107,40 @@ try {
   const bootMs = Date.now() - t0;
   check('boots', true, `${(bootMs / 1000).toFixed(1)}s`);
 
+  // WebKit refuses `new Touch()` ("Illegal constructor") and historically had
+  // no TouchEvent constructor either, so synthetic touches need a per-engine
+  // ladder. Real devices are unaffected — this only exists to drive the test.
+  await page.addInitScript(() => {});
+  await page.evaluate(() => {
+    const makeTouch = (target, id, x, y) => {
+      try { return new Touch({ identifier: id, target, clientX: x, clientY: y, pageX: x, pageY: y }); }
+      catch (e) { /* WebKit */ }
+      if (document.createTouch) return document.createTouch(window, target, id, x, y, x, y);
+      return { identifier: id, target, clientX: x, clientY: y, pageX: x, pageY: y };
+    };
+    window.__touch = (type, points) => {
+      const target = window.__GAME.renderer.domElement;
+      const list = points.map((p) => makeTouch(target, p.id, p.x, p.y));
+      const active = type === 'touchend' || type === 'touchcancel' ? [] : list;
+      let ev;
+      try {
+        ev = new TouchEvent(type, {
+          touches: active, changedTouches: list, targetTouches: active,
+          bubbles: true, cancelable: true,
+        });
+      } catch (e) {
+        // Generic event with the touch lists attached; the handlers only
+        // iterate them, so plain arrays are sufficient.
+        ev = document.createEvent('Event');
+        ev.initEvent(type, true, true);
+        Object.defineProperty(ev, 'touches', { value: active });
+        Object.defineProperty(ev, 'changedTouches', { value: list });
+        Object.defineProperty(ev, 'targetTouches', { value: active });
+      }
+      target.dispatchEvent(ev);
+    };
+  });
+
   await page.screenshot({ path: path.join(SHOTS, `${label}-1-start.png`) });
 
   // Start the game the way a player would.
@@ -155,21 +189,10 @@ try {
   if (desktop) {
     await page.keyboard.down('KeyW');
   } else {
-    const cx = 140, cy = 300;
-    await page.evaluate(([x, y]) => {
-      const c = window.__GAME.renderer.domElement;
-      const mk = (type, id, px, py) => {
-        const t = new Touch({ identifier: id, target: c, clientX: px, clientY: py });
-        c.dispatchEvent(new TouchEvent(type, {
-          touches: type === 'touchend' ? [] : [t],
-          changedTouches: [t], targetTouches: type === 'touchend' ? [] : [t],
-          bubbles: true, cancelable: true,
-        }));
-      };
-      mk('touchstart', 1, x, y);
-      for (let i = 1; i <= 6; i++) mk('touchmove', 1, x, y - i * 12);
-      window.__release = () => mk('touchend', 1, x, y - 72);
-    }, [cx, cy]);
+    await page.evaluate(() => {
+      window.__touch('touchstart', [{ id: 1, x: 140, y: 300 }]);
+      for (let i = 1; i <= 6; i++) window.__touch('touchmove', [{ id: 1, x: 140, y: 300 - i * 12 }]);
+    });
   }
 
   await page.evaluate(() => {
@@ -178,7 +201,7 @@ try {
   });
 
   if (desktop) await page.keyboard.up('KeyW');
-  else await page.evaluate(() => window.__release());
+  else await page.evaluate(() => window.__touch('touchend', [{ id: 1, x: 140, y: 228 }]));
 
   const afterMove = await page.evaluate(() => {
     const g = window.__GAME;
@@ -192,18 +215,9 @@ try {
     await page.evaluate(() => window.__GAME.player.look(220, 0));
   } else {
     await page.evaluate(() => {
-      const c = window.__GAME.renderer.domElement;
-      const mk = (type, px, py) => {
-        const t = new Touch({ identifier: 7, target: c, clientX: px, clientY: py });
-        c.dispatchEvent(new TouchEvent(type, {
-          touches: type === 'touchend' ? [] : [t],
-          changedTouches: [t], targetTouches: type === 'touchend' ? [] : [t],
-          bubbles: true, cancelable: true,
-        }));
-      };
-      mk('touchstart', 600, 200);
-      for (let i = 1; i <= 8; i++) mk('touchmove', 600 + i * 14, 200);
-      mk('touchend', 600 + 112, 200);
+      window.__touch('touchstart', [{ id: 7, x: 600, y: 200 }]);
+      for (let i = 1; i <= 8; i++) window.__touch('touchmove', [{ id: 7, x: 600 + i * 14, y: 200 }]);
+      window.__touch('touchend', [{ id: 7, x: 712, y: 200 }]);
       // Touch look accumulates and is drained once per frame; at software
       // rasteriser speeds that frame may be a second away.
       window.__GAME.inputManager.update();

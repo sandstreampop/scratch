@@ -501,8 +501,22 @@ const NORMAL_STRENGTH = {
 
 const cache = new Map();
 let anisotropy = 8;
+let resolutionScale = 1;
 
 export function setAnisotropy(value) { anisotropy = value; }
+
+/**
+ * Scales every surface's authored resolution.
+ *
+ * Generation is CPU-bound fractal noise, so cost falls with the square of this
+ * value: at 0.25 a phone builds the whole material set in roughly a
+ * sixteenth of the time and holds a sixteenth of the texture memory, which is
+ * the difference between booting and having iOS discard the WebGL context.
+ * Must be set before the first `maps()` call.
+ */
+export function setResolutionScale(value) {
+  resolutionScale = Math.max(0.125, Math.min(1, value));
+}
 
 /** Returns `{ map, normalMap, ormMap }` for a named surface. Cached. */
 export function maps(name) {
@@ -510,7 +524,10 @@ export function maps(name) {
   if (!entry) {
     const sampler = SAMPLERS[name];
     if (!sampler) throw new Error(`unknown surface "${name}"`);
-    entry = build(RESOLUTION[name] ?? 512, sampler, NORMAL_STRENGTH[name] ?? 1.2, anisotropy);
+    // Round to a power of two so mipmaps stay clean.
+    const base = RESOLUTION[name] ?? 512;
+    const size = Math.max(64, 2 ** Math.round(Math.log2(base * resolutionScale)));
+    entry = build(size, sampler, NORMAL_STRENGTH[name] ?? 1.2, anisotropy);
     cache.set(name, entry);
   }
   return entry;
