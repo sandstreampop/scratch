@@ -41,10 +41,10 @@ jobs:
       # can be obtained. It is not iOS Safari, but it is the same engine family
       # and it catches the JavaScriptCore and WebKit-WebGL differences that
       # Chromium silently tolerates.
-      - name: Install WebKit for the Safari-engine smoke test
+      - name: Install browser engines
         run: |
           npm install --no-save playwright
-          npx playwright install --with-deps webkit
+          npx playwright install --with-deps webkit chromium
 
       # Informational: a CI runner has no GPU, so WebKit here exercises the
       # engine's JS and WebGL semantics but not a phone's rasteriser. Engine
