@@ -10,20 +10,22 @@ import { Sky } from 'three/addons/objects/Sky.js';
 
 /** 0547 hrs: sun just clear of the ridgeline, heavy dust in the air. */
 export const PRESET = {
-  elevation: 3.6,          // degrees above horizon
+  elevation: 9.5,          // degrees above horizon
   azimuth: 104,            // degrees, clockwise from north
-  turbidity: 7.4,          // dust load
+  turbidity: 4.6,          // dust load
   rayleigh: 2.15,
-  mieCoefficient: 0.0068,
-  mieDirectionalG: 0.86,
-  exposure: 0.82,
+  mieCoefficient: 0.0032,
+  mieDirectionalG: 0.79,
+  exposure: 1.0,
   sunColor: 0xffc389,      // warm dawn key
-  sunIntensity: 5.6,
+  sunIntensity: 4.4,
   skyColor: 0x8fb6dd,      // zenith bounce
   groundColor: 0x6b5535,   // sand bounce
   hemiIntensity: 0.55,
   fogColor: 0xcfb392,
-  fogDensity: 0.0072,
+  fogDensity: 0.0026,
+  skyLuminance: 1.35,        // scales the analytic IBL
+  environmentIntensity: 1.0,
 };
 
 export class Atmosphere {
@@ -33,7 +35,18 @@ export class Atmosphere {
     this.renderer = renderer;
 
     this.sky = new Sky();
-    this.sky.scale.setScalar(45000);
+    // Preetham's final `pow(texColor, ...)` returns NaN for any negative or
+    // overflowing component. Guard the visible sky as well as the IBL source.
+    this.sky.material.fragmentShader = this.sky.material.fragmentShader.replace(
+      'gl_FragColor = vec4( retColor, 1.0 );',
+      `vec3 safeColor = retColor;
+       safeColor = mix( vec3( 0.0 ), safeColor, vec3( equal( safeColor, safeColor ) ) );
+       gl_FragColor = vec4( max( safeColor, vec3( 0.0 ) ), 1.0 );`,
+    );
+    this.sky.material.needsUpdate = true;
+    // Must sit inside the camera far plane or it is clipped away entirely,
+    // taking both the visible sky and the PMREM capture with it.
+    this.sky.scale.setScalar(1000);
     this.sky.frustumCulled = false;
     scene.add(this.sky);
 
@@ -63,6 +76,7 @@ export class Atmosphere {
 
     this.pmrem = new THREE.PMREMGenerator(renderer);
     this.pmrem.compileEquirectangularShader();
+    this.envSource = null;
 
     this.apply();
   }
@@ -121,14 +135,91 @@ export class Atmosphere {
     this.refreshEnvironment();
   }
 
-  /** Re-convolves the sky into an environment map. */
+  /**
+   * Builds the environment map from an analytic equirectangular sky computed
+   * on the CPU, rather than by capturing the Preetham mesh.
+   *
+   * Capturing the mesh is the obvious approach and it is what broke the
+   * renderer: Preetham's solar disc term is `vSunE * 19000`, the result goes
+   * through a fractional `pow`, and any negative or overflowing component
+   * comes back NaN. PMREM's convolution then smears that NaN across every mip,
+   * and every PBR surface sampling the environment renders as NaN — which is
+   * invisible until you read the buffer back, because NaN clamps to black.
+   *
+   * Generating the irradiance source directly is both immune to that and more
+   * useful: ambient colour and strength become art-directable values instead
+   * of emergent properties of a shader we do not control. The sun's direct
+   * contribution stays out of it, since the directional light already carries
+   * it and including it here would double-count.
+   */
+  buildEnvironmentTexture(width = 256) {
+    const height = width / 2;
+    const data = new Float32Array(width * height * 4);
+
+    const zenith = new THREE.Color(this.settings.skyColor).convertSRGBToLinear();
+    const horizon = new THREE.Color(this.settings.fogColor).convertSRGBToLinear();
+    const ground = new THREE.Color(this.settings.groundColor).convertSRGBToLinear();
+    const glow = new THREE.Color(this.settings.sunColor).convertSRGBToLinear();
+    const sun = this.sunDirection;
+
+    for (let y = 0; y < height; y++) {
+      // three's equirectUv: v = asin(dir.y)/PI + 0.5, so row 0 looks straight down.
+      const elevation = ((y + 0.5) / height - 0.5) * Math.PI;
+      const sy = Math.sin(elevation), cy = Math.cos(elevation);
+      for (let x = 0; x < width; x++) {
+        const azimuth = ((x + 0.5) / width - 0.5) * Math.PI * 2;
+        const dx = cy * Math.cos(azimuth), dz = cy * Math.sin(azimuth);
+
+        let r, g, b;
+        if (sy >= 0) {
+          // Horizon haze grading into zenith blue. The exponent keeps the
+          // warm band tight to the horizon the way real dawn haze sits.
+          const t = Math.pow(sy, 0.42);
+          r = horizon.r + (zenith.r - horizon.r) * t;
+          g = horizon.g + (zenith.g - horizon.g) * t;
+          b = horizon.b + (zenith.b - horizon.b) * t;
+        } else {
+          // Below the horizon: sand bounce, falling off with depth.
+          const t = Math.min(1, -sy * 2.2);
+          r = horizon.r * 0.55 + (ground.r - horizon.r * 0.55) * t;
+          g = horizon.g * 0.55 + (ground.g - horizon.g * 0.55) * t;
+          b = horizon.b * 0.55 + (ground.b - horizon.b * 0.55) * t;
+        }
+
+        // Forward-scattered glow around the sun. Bounded by construction.
+        const cosSun = Math.max(0, dx * sun.x + sy * sun.y + dz * sun.z);
+        const halo = Math.pow(cosSun, 6) * 2.6 + Math.pow(cosSun, 40) * 5.5;
+        r += glow.r * halo;
+        g += glow.g * halo;
+        b += glow.b * halo;
+
+        const i = (y * width + x) * 4;
+        data[i] = r * this.settings.skyLuminance;
+        data[i + 1] = g * this.settings.skyLuminance;
+        data[i + 2] = b * this.settings.skyLuminance;
+        data[i + 3] = 1;
+      }
+    }
+
+    const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    tex.colorSpace = THREE.NoColorSpace;      // already linear
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  /** Re-convolves the analytic sky into scene.environment. */
   refreshEnvironment() {
     if (this.envTarget) this.envTarget.dispose();
-    // The Sky mesh is BackSide and enormous; PMREM's scene capture handles it
-    // directly, giving a physically consistent horizon gradient in the IBL.
-    this.envTarget = this.pmrem.fromScene(new THREE.Scene().add(this.sky.clone()), 0.04, 0.1, 1000);
+    this.envSource?.dispose();
+
+    this.envSource = this.buildEnvironmentTexture();
+    this.envTarget = this.pmrem.fromEquirectangular(this.envSource);
     this.scene.environment = this.envTarget.texture;
-    this.scene.environmentIntensity = 1.0;
+    this.scene.environmentIntensity = this.settings.environmentIntensity;
   }
 
   /**
@@ -137,6 +228,9 @@ export class Atmosphere {
    * re-centring ahead of the camera buys roughly 4x effective resolution.
    */
   update(camera) {
+    // Keep the sky centred on the viewer so it never leaves the far plane.
+    this.sky.position.copy(camera.position);
+
     const focus = camera.position.clone();
     const forward = new THREE.Vector3();
     camera.getWorldDirection(forward);

@@ -614,12 +614,12 @@ export class VFX {
 
           vec4 mv = modelViewMatrix * vec4(p, 1.0);
           float dist = -mv.z;
-          gl_PointSize = (0.9 + 1.6 * fract(aSeed)) * (110.0 / max(dist, 0.4)) * uPixelRatio;
+          gl_PointSize = clamp((0.5 + 0.9 * fract(aSeed)) * (26.0 / max(dist, 0.6)), 0.6, 7.0) * uPixelRatio;
 
           // Motes only really show when they are between you and the sun.
           vec3 toCam = normalize(uCam - p);
           float back = pow(max(dot(-toCam, -uSun), 0.0), 3.0);
-          vAlpha = (0.05 + back * 0.55) * smoothstep(60.0, 5.0, dist) * smoothstep(0.0, 3.0, dist);
+          vAlpha = (0.018 + back * 0.20) * smoothstep(48.0, 4.0, dist) * smoothstep(0.4, 3.5, dist);
           gl_Position = projectionMatrix * mv;
         }
       `,

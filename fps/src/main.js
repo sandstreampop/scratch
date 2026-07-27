@@ -1,7 +1,7 @@
 // Bootstrap and game loop.
 
 import * as THREE from 'three';
-import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import './patch.js';   // must precede any material compilation
 import { Atmosphere, PRESET } from './sky.js';
 import { Level } from './level.js';
 import { Player, TUNING } from './player.js';
@@ -21,25 +21,25 @@ const SHOT = params.get('shot');
 
 const SHOT_PRESETS = {
   hero: {
-    position: [-9.5, 0, 15.5], yaw: 2.31, pitch: -0.035, ads: 0,
+    position: [-14.0, 0, 6.5], yaw: -1.035, pitch: -0.020, ads: 0,
     enemies: [[14, -6, 3.6], [19.5, 2.5, 4.1], [8.5, -14, 3.9]],
     warmup: 150,
     action: 'idle',
   },
   combat: {
-    position: [-2.0, 0, 9.0], yaw: 2.10, pitch: 0.010, ads: 0,
+    position: [-6.0, 0, 4.0], yaw: -1.010, pitch: 0.015, ads: 0,
     enemies: [[11.5, -3.0, 3.5], [16.0, 3.5, 4.0], [6.0, -11.0, 3.8], [20, -8, 4.2]],
     warmup: 150,
     action: 'firing',
   },
   ads: {
-    position: [-4.0, 0, 11.0], yaw: 2.16, pitch: -0.012, ads: 1,
+    position: [-8.0, 0, 5.0], yaw: -1.060, pitch: -0.005, ads: 1,
     enemies: [[13.0, -4.0, 3.6], [18.0, 1.0, 4.0]],
     warmup: 150,
     action: 'aiming',
   },
   detail: {
-    position: [4.5, 0, 6.0], yaw: 2.55, pitch: -0.10, ads: 0,
+    position: [1.0, 0, 8.5], yaw: -1.180, pitch: -0.055, ads: 0,
     enemies: [[9.0, -3.5, 3.7]],
     warmup: 150,
     action: 'idle',
@@ -80,8 +80,7 @@ class Game {
     this.renderer.setPixelRatio(dpr);
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = PRESET.exposure;
+    this.renderer.toneMapping = THREE.NoToneMapping;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.info.autoReset = true;
@@ -93,32 +92,32 @@ class Game {
   setupScene() {
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(
-      78, window.innerWidth / window.innerHeight, 0.06, 1200,
+      78, window.innerWidth / window.innerHeight, 0.10, 700,
     );
 
+    window.__MARK?.('scene:init');
     this.atmosphere = new Atmosphere(this.renderer, this.scene);
+    window.__MARK?.('atmosphere');
 
     this.level = new Level().build();
+    window.__MARK?.('level');
     this.scene.add(this.level.group);
   }
 
   setupSystems() {
     this.player = new Player(this.level, this.camera);
     this.weapon = new Weapon(this.renderer, this.camera, this.scene.environment);
+    window.__MARK?.('weapon');
     this.vfx = new VFX(this.scene, this.camera, this.level);
     this.vfx.setPixelRatio(this.renderer.getPixelRatio());
     this.director = new Director(this.scene, this.level);
     this.hud = new HUD();
     this.audio = new Audio();
 
-    this.post = new PostStack(this.renderer, this.scene, this.camera);
-    // Viewmodel is composited over the world with a fresh depth buffer, after
-    // world-space AO and shafts but before bloom, so the weapon glows and
-    // grades with the frame but never receives screen-space world effects.
-    this.viewmodelPass = new RenderPass(this.weapon.scene, this.weapon.camera);
-    this.viewmodelPass.clear = false;
-    this.viewmodelPass.clearDepth = true;
-    this.post.composer.insertPass(this.viewmodelPass, 3);
+    window.__MARK?.('vfx+ai+hud');
+    this.post = new PostStack(this.renderer, this.scene, this.camera, PRESET.exposure);
+    this.viewmodelPass = this.post.setViewmodel(this.weapon.scene, this.weapon.camera);
+    window.__MARK?.('post');
 
     this.wireCallbacks();
     this.director.populate(6);
@@ -457,6 +456,9 @@ async function runShotMode(game, preset) {
   document.getElementById('start').style.display = 'none';
   game.hud.show();
   game.audio.enabled = false;
+  // Enemies are placed already engaging; without this they kill the player
+  // over the warmup and every capture comes back as a red death screen.
+  game.player.damage = () => {};
 
   // Clear the procedurally-populated roster and place enemies deliberately.
   for (const e of game.director.enemies) game.scene.remove(e.group);
@@ -480,31 +482,34 @@ async function runShotMode(game, preset) {
     e.lastKnown = game.camera.position.clone();
   }
 
-  // Warm up: settle springs, populate particles, compile every shader.
+  // Warm up the simulation without rendering. Springs, bob phases, particle
+  // fields and AI poses all settle on CPU; there is no reason to pay for a
+  // full post-processed frame 150 times to get there.
   const dt = 1 / 60;
   for (let i = 0; i < cfg.warmup; i++) {
-    game.step(dt);
-
-    if (cfg.action === 'firing') {
-      // Hold the trigger for the last stretch so the frame has a live muzzle
-      // flash, smoke, tracers and casings in it.
-      if (i > cfg.warmup - 26) {
-        game.weapon.lastShot = -99;
-        game.playerShoot();
-      }
-    }
     if (cfg.action === 'aiming') {
       game.input.ads = true;
       game.player.ads = 1;
+      game.player.adsTarget = 1;
     }
-
-    game.render(dt);
-    if (i % 12 === 0) await new Promise((r) => setTimeout(r, 0));
+    if (cfg.action === 'firing' && i > cfg.warmup - 26) {
+      // Hold the trigger over the last stretch so the captured frame has a
+      // live muzzle flash, smoke, tracers and casings in it.
+      game.weapon.lastShot = -99;
+      game.playerShoot();
+    }
+    game.step(dt);
+    if (i % 25 === 0) await new Promise((r) => setTimeout(r, 0));
   }
+  window.__MARK?.('warmup-sim');
 
-  // Two more settled frames so SMAA has clean history.
-  game.render(dt);
-  game.render(dt);
+  // Now render for real. The first frame pays for every shader compile, so
+  // draw a few and let the last one be the capture.
+  for (let i = 0; i < 3; i++) {
+    game.render(dt);
+    window.__MARK?.(`render-${i}`);
+    await new Promise((r) => setTimeout(r, 0));
+  }
 
   window.__SHOT_READY = true;
 }
@@ -512,7 +517,16 @@ async function runShotMode(game, preset) {
 /* ------------------------------------------------------------- entry ----- */
 
 async function main() {
+  const t0 = performance.now();
+  const mark = (label) => {
+    const t = performance.now();
+    console.log(`[boot] ${label}: ${(t - (mark.last ?? t0)).toFixed(0)}ms`);
+    mark.last = t;
+  };
+  window.__MARK = mark;
+
   const game = new Game();
+  mark('construct');
   window.__GAME = game;
 
   if (SHOT) {

@@ -54,6 +54,8 @@ async function main() {
     const errors = [];
     page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text().slice(0, 500)); });
     page.on('pageerror', (e) => errors.push(String(e).slice(0, 500)));
+    page.on('response', (r) => { if (r.status() >= 400) errors.push(`HTTP ${r.status()} ${r.url()}`); });
+    page.on('requestfailed', (r) => errors.push(`REQFAIL ${r.url()} ${r.failure()?.errorText}`));
     const t0 = Date.now();
     try {
       await page.goto(`http://127.0.0.1:${port}/index.html?shot=${preset}`, { timeout: 60000 });
