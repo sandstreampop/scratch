@@ -191,8 +191,8 @@ export class Atmosphere {
     // teal. Ozone is a vertical column, so the tint is keyed on elevation and
     // not on the angle from the sun — keyed on the latter it contributes
     // nothing to any frame that happens to face the sunrise, which is every
-    // frame here. It is held back inside the forward-scatter lobe, where Mie
-    // dominates and the light really is spectrally flat.
+    // frame here. It is held back inside the aureole, where what reaches the
+    // eye is the sun's own colour barely deflected, not a scattered blue.
     this.sky.material.fragmentShader = this.sky.material.fragmentShader.replace(
       'gl_FragColor = vec4( retColor, 1.0 );',
       `float ozone = smoothstep( 0.03, 0.62, max( direction.y, 0.0 ) )
@@ -326,6 +326,9 @@ export class Atmosphere {
     const height = width / 2;
     const data = new Float32Array(width * height * 4);
 
+    // Already linear: colour management decodes the hex on the way in, and the
+    // texture below is tagged NoColorSpace. A second decode here is the reason
+    // the ambient used to come back several times darker than its swatches.
     const lin = (hex) => new THREE.Color(hex);
     const zenith = lin(this.settings.skyColor);
     const cool = lin(this.settings.hazeColor);

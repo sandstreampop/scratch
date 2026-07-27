@@ -139,7 +139,7 @@ const ShaftsShader = {
  * threshold low enough to catch the sky catches the ground too and the pass
  * collapses into an omnidirectional glow. Drawing the occluders into a
  * half-resolution black-on-white mask separates the two exactly, and costs one
- * cheap depth-only-ish scene pass with every material replaced by flat black.
+ * cheap depth-only-ish scene pass with every material stripped to its cutout.
  */
 class SunShaftsPass extends Pass {
   constructor(scene, camera, width, height) {
@@ -207,12 +207,13 @@ class SunShaftsPass extends Pass {
   /**
    * White where open sky reaches the camera, black wherever a solid blocks it.
    *
-   * Additively blended VFX are the one thing left out. Sparks, tracers and the
-   * mote field emit light rather than block it, and the override material has
-   * no opacity, so drawing them would cut hard notches out of the shafts where
-   * there is nothing but haze. Soft sprite smoke goes with them for the same
-   * reason: as a hard black silhouette it does far more damage than the little
-   * occlusion it really provides is worth.
+   * Additively blended VFX are the one thing left out: sparks, tracers and the
+   * mote field emit light rather than block it. Sprite smoke goes with them,
+   * because the mask has no partial opacity and a soft puff drawn as a hard
+   * black silhouette costs far more than the little occlusion it really owes.
+   * Everything else stays in, cutout and all — dropping alpha-tested geometry
+   * instead is what let open sky show through the awnings and the shed panels,
+   * and the pass then laid full in-scatter straight on top of them.
    */
   renderMask(renderer) {
     const hidden = this._hidden;
@@ -299,8 +300,8 @@ const GradeShader = {
     uSaturation: { value: 1.06 },
     uLift: { value: new THREE.Vector3(0.0040, 0.0060, 0.0125) },
     // Subtracted back off after the lift so the frame still has a true zero in
-    // it. A lift on its own is a floor, and a floor is why the darkest pixel
-    // anywhere was sRGB 21 and the silhouettes had no separation.
+    // it. A lift on its own is a floor no pixel can cross, and every silhouette
+    // in the frame then piles up on that one value with nothing between them.
     uBlackPoint: { value: 0.0028 },
     uGain: { value: new THREE.Vector3(1.030, 1.000, 0.968) },
     uSplit: { value: 0.20 },
