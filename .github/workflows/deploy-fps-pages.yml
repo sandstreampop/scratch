@@ -46,16 +46,25 @@ jobs:
           npm install --no-save playwright
           npx playwright install --with-deps webkit chromium
 
-      # Informational: a CI runner has no GPU, so WebKit here exercises the
-      # engine's JS and WebGL semantics but not a phone's rasteriser. Engine
-      # bugs it surfaces are real and worth seeing; its frame rate is not, and
-      # a harness quirk should not block a deploy.
-      - name: Smoke test the built game (WebKit, iPhone viewport)
-        continue-on-error: true
+      # Two engines against the profile that actually ships. WebKit is the
+      # closest available stand-in for iOS Safari and is only obtainable on the
+      # runner; it is what caught the readPixels type bug that Chromium
+      # tolerated silently.
+      - name: Smoke test (WebKit, iPhone viewport)
         working-directory: fps
         run: xvfb-run -a node tools/verify.mjs --dist --engine=webkit
 
-      - name: Smoke test the built game (Chromium, desktop)
+      - name: Smoke test (Chromium, iPhone viewport)
+        working-directory: fps
+        run: xvfb-run -a node tools/verify.mjs --dist --engine=chromium
+
+      # Keyboard and mouse coverage. Advisory: the desktop profile is heavier,
+      # the runner has no GPU, and this consistently needs minutes there while
+      # the same check finishes in seconds on a machine with one. A timeout
+      # here says nothing about the build and must not block a deploy.
+      - name: Smoke test (Chromium, desktop, advisory)
+        continue-on-error: true
+        timeout-minutes: 6
         working-directory: fps
         run: xvfb-run -a node tools/verify.mjs --dist --engine=chromium --desktop
 
