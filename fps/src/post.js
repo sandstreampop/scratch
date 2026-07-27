@@ -301,37 +301,35 @@ export class PostStack {
   }
 
   /**
-   * Renders a known colour into a half-float target and reads it back. Some
-   * software rasterisers advertise the extension but return zeroes.
+   * Decides whether half-float colour targets are usable.
+   *
+   * This is a capability question in name only: every GPU worth shipping to
+   * supports them, including every iOS device. The one environment that does
+   * not is a software rasteriser — SwiftShader renders black into a half-float
+   * target once a real multi-pass scene is involved, though it will happily
+   * clear one, draw a single quad into one, and read either back. A functional
+   * probe therefore reports success and the whole frame comes out empty, so
+   * the renderer is identified directly instead.
+   *
+   * Cost of being wrong is asymmetric: a needless 8-bit buffer costs some
+   * highlight range, while a wrong half-float buffer costs the entire image.
    */
   static probeHalfFloat(renderer) {
     if (PostStack._halfFloatOK !== undefined) return PostStack._halfFloatOK;
-    const target = new THREE.WebGLRenderTarget(4, 4, {
-      type: THREE.HalfFloatType, colorSpace: THREE.LinearSRGBColorSpace,
-    });
-    const previous = renderer.getRenderTarget();
-    const previousClear = new THREE.Color();
-    renderer.getClearColor(previousClear);
-    const previousAlpha = renderer.getClearAlpha();
 
-    renderer.setRenderTarget(target);
-    renderer.setClearColor(0x336699, 1);
-    renderer.clear(true, true, true);
-    const pixels = new Uint8Array(4 * 4 * 4);
-    let ok = false;
+    let software = false;
     try {
-      renderer.readRenderTargetPixels(target, 0, 0, 4, 4, pixels);
-      ok = pixels[0] !== 0 || pixels[1] !== 0 || pixels[2] !== 0;
+      const gl = renderer.getContext();
+      const info = gl.getExtension('WEBGL_debug_renderer_info');
+      const name = info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : '';
+      software = /swiftshader|llvmpipe|software|basic render|mesa offscreen/i.test(name);
+      if (software) console.info(`post: software renderer (${name}), using 8-bit buffers`);
     } catch (e) {
-      ok = false;
+      // A blocked debug-renderer extension is not evidence either way.
     }
-    renderer.setClearColor(previousClear, previousAlpha);
-    renderer.setRenderTarget(previous);
-    target.dispose();
 
-    PostStack._halfFloatOK = ok;
-    if (!ok) console.info('post: half-float render targets unusable, using 8-bit buffers');
-    return ok;
+    PostStack._halfFloatOK = !software && renderer.capabilities.isWebGL2;
+    return PostStack._halfFloatOK;
   }
 
   /**

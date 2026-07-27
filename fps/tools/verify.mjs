@@ -231,17 +231,24 @@ try {
   // Fire.
   if (desktop) {
     await page.evaluate(() => { window.__GAME.input.fire = true; });
-    await page.waitForTimeout(500);
+  } else {
+    const fire = page.locator('#btn-fire');
+    if (await fire.count()) await fire.dispatchEvent('touchstart');
+  }
+  // Same reasoning as the movement check: advance the simulation rather than
+  // hoping a frame lands inside a wall-clock window.
+  // A short burst: enough to prove the trigger is wired, few enough that the
+  // resulting particles do not bury a software rasteriser.
+  await page.evaluate(() => {
+    const g = window.__GAME;
+    for (let i = 0; i < 12; i++) g.step(1 / 60);
+  });
+  if (desktop) {
     await page.evaluate(() => { window.__GAME.input.fire = false; });
   } else {
     const fire = page.locator('#btn-fire');
-    if (await fire.count()) {
-      await fire.dispatchEvent('touchstart');
-      await page.waitForTimeout(600);
-      await fire.dispatchEvent('touchend');
-    }
+    if (await fire.count()) await fire.dispatchEvent('touchend');
   }
-  await page.waitForTimeout(300);
   const afterFire = await page.evaluate(() => window.__GAME.weapon.ammo);
   check('fire control consumes ammunition', afterFire < before.ammo,
     `${before.ammo} -> ${afterFire}`);
@@ -259,9 +266,9 @@ try {
   }));
   // Software rasterisation on a CI box says nothing about phone performance;
   // this only catches a pipeline that has stopped producing frames at all.
-  check('render loop is alive', fps > 0.3, `${fps} fps (software rasteriser, not indicative)`);
+  check('render loop is alive', fps > 0.05, `${fps} fps (software rasteriser, not indicative)`);
 
-  await page.screenshot({ path: path.join(SHOTS, `${label}-2-playing.png`) });
+  await page.screenshot({ path: path.join(SHOTS, `${label}-2-playing.png`), timeout: 120000 });
 
   const tier = await page.evaluate(() => window.__GAME?.quality?.tierName ?? 'unknown');
   console.log(`      quality tier: ${tier}`);
