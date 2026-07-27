@@ -434,19 +434,25 @@ export class PostStack {
     this.renderPass = new RenderPass(scene, camera);
     this.composer.addPass(this.renderPass);
 
-    // Ground-truth ambient occlusion. Off by default: it needs a tight
-    // camera near/far ratio to reconstruct position from depth, and on a
-    // 130 m sightline it zeroes the ground plane outright. Enable via
-    // `setAmbientOcclusion(true)` once tuned for the current frustum.
+    // Ground-truth ambient occlusion, off by default.
+    //
+    // It no longer zeroes the ground plane at the current 0.1/700 frustum —
+    // OUTPUT.Normal is a correct view-space normal buffer and the beauty pass
+    // survives it. It also contributes nothing: OUTPUT.Denoise comes back at
+    // 1.0 across the whole frame for every world-space radius from 0.4 m to
+    // 2 m and for screenSpaceRadius at 32 px. Paying a full extra depth and
+    // normal prepass for an all-white occlusion buffer is worse than having
+    // no AO, so this stays off until someone finds what the horizon search
+    // is doing on this depth range.
     this.gtao = new GTAOPass(scene, camera, w, h);
     this.gtao.enabled = false;
     this.gtao.output = GTAOPass.OUTPUT.Default;
     this.gtao.updateGtaoMaterial({
-      radius: 0.42,
+      radius: 0.6,
       distanceExponent: 1.0,
-      thickness: 0.85,
-      scale: 1.05,
-      samples: 20,
+      thickness: 1.0,
+      scale: 1.1,
+      samples: 16,
       distanceFallOff: 1.0,
       screenSpaceRadius: false,
     });

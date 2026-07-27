@@ -26,7 +26,7 @@ export const PRESET = {
   // steep section, where the eye can read it, and leaves the solar disc as the
   // only thing in the frame that clips.
   skyGain: 0.29,
-  skyTint: 0xd6f2ff,       // anti-solar cool, standing in for the missing ozone
+  skyTint: 0x8ec8ff,       // anti-solar cool, standing in for the missing ozone
   // Ambient hue is the trap here. A saturated orange sun halo and a saturated
   // blue zenith push red and blue from opposite sides and leave green behind,
   // and every shadowed surface in the frame comes out magenta. Both ends of
