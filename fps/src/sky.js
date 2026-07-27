@@ -28,13 +28,13 @@ export const PRESET = {
   // off; holding the scene down is the only way to keep highlight headroom for
   // the tone map to shape. Exposure and the light intensities move together.
   exposure: 2.85,
-  skyGain: 0.115,
+  skyGain: 0.130,
   // Preetham's disc is the true 0.53 deg sun, which is six pixels at this
   // field of view — too small to survive antialiasing, let alone read as the
   // key light. A low sun seen through dust saturates a visibly wider core than
   // its geometric size, and that is what the eye recognises.
   sunDisc: 1.7,            // degrees, apparent diameter of the saturated core
-  skyTint: 0x9dc0ec,       // ozone stand-in: cools the zenith, not the horizon
+  skyTint: 0x8ab4e8,       // ozone stand-in: cools the zenith, not the horizon
   // Ambient hue is the trap here. A saturated orange sun halo and a saturated
   // blue zenith push red and blue from opposite sides and leave green behind,
   // and every shadowed surface in the frame comes out magenta. Both ends of

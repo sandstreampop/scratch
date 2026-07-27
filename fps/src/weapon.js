@@ -15,10 +15,10 @@ import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.j
 import { material } from './textures.js';
 
 const TAU = Math.PI * 2;
-// Rig-space pull applied to the sun-tracked key: over the camera's left
-// shoulder and above, which is the only quadrant that lights the flank of a
-// right-hand-carried weapon.
-const KEY_BIAS = new THREE.Vector3(-0.95, 0.78, 0.62);
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
+// Rig-space pull applied to the sun-tracked key: right, up, and behind the
+// lens. Large enough that the key never falls entirely behind the weapon.
+const KEY_BIAS = new THREE.Vector3(0.55, 0.62, 0.90);
 
 // Every viewmodel material is built from `material()` with these applied on
 // top. Three of the slots have to go.
@@ -588,6 +588,7 @@ export class Weapon {
     this.scene.add(this.rig);
 
     this.setupLighting();
+    this.scene.overrideMaterial = material('gunmetal', [3.2, 3.2], { ...VM_MAPS, roughness: 0.62, metalness: 0.24 });
 
     // --- pose ---------------------------------------------------------------
     // Hip: tucked down and to the right, the way a carbine is actually carried
@@ -688,9 +689,9 @@ export class Weapon {
     // sun 8 degrees above the horizon backlights the carbine from most player
     // headings, and an honest key would silhouette the hero prop on half the
     // compass. Direction tracks the sun; placement is pulled toward the lens.
-    this.key = new THREE.DirectionalLight(0xff0000, 8.0);
+    this.key = new THREE.DirectionalLight(0xffd6ab, 3.6);
     this.key.position.set(0.6, 1.0, 0.35);
-    this.key.castShadow = false;
+    this.key.castShadow = true;
     this.key.shadow.mapSize.set(1024, 1024);
     this.key.shadow.camera.near = 0.05;
     this.key.shadow.camera.far = 3;
@@ -703,18 +704,17 @@ export class Weapon {
     this.scene.add(this.key);
     this.scene.add(this.key.target);
 
-    // Cool sky, fixed in rig space over the camera's right shoulder. It picks
-    // up the top and the rear faces the key misses and gives the phosphate its
-    // colour break; anything sun-driven here swings across the weapon as the
-    // player turns and periodically lands on the faces nobody can see.
-    this.fill = new THREE.DirectionalLight(0xa9c3e2, 1.6);
-    this.fill.position.set(0.85, 0.75, 0.90);
+    // Cool sky on the shadow side. Kept low and to the side: raised overhead it
+    // lights every top face at once and the receiver reads as light grey
+    // plastic instead of phosphate.
+    this.fill = new THREE.DirectionalLight(0xa9c3e2, 3.0);
+    this.fill.position.set(-0.90, 0.42, 0.85);
     this.scene.add(this.fill);
 
-    // Rim comes from behind and above so the top rail, the optic housing and
-    // the handguard get an edge no frontal light can give a flat-topped part.
-    this.rim = new THREE.DirectionalLight(0xffb877, 2.4);
-    this.rim.position.set(-0.25, 0.95, -1.0);
+    // Rim rides past the sun and high, so the top rail and the optic tube keep
+    // a hot edge that no amount of key can give a flat-topped receiver.
+    this.rim = new THREE.DirectionalLight(0xffb877, 1.05);
+    this.rim.position.set(-0.3, 0.9, -1.0);
     this.scene.add(this.rim);
 
     // Sand bounce. At this hour the ground is the brightest surface in frame
@@ -735,19 +735,23 @@ export class Weapon {
   syncLighting(sunDirection, worldCamera) {
     const sun = sunDirection.clone().applyQuaternion(worldCamera.quaternion.clone().invert());
 
-    // Anchored to the sun for azimuth, biased hard toward the camera's left for
-    // exposure. The weapon is carried on the right, so the only large surface
-    // the lens ever sees is its left flank; a key that honours the sun puts
-    // that flank in shade on most headings and the hero prop goes to
-    // silhouette. Sun weight is low enough to keep the direction believable and
-    // high enough that turning into the light visibly changes the weapon.
-    this.key.position.copy(sun).multiplyScalar(0.40).add(KEY_BIAS).normalize().multiplyScalar(2);
+    // Anchored to the sun for azimuth, biased toward the lens for exposure. A
+    // pure sun placement is correct and unusable; a pure rig light is usable
+    // and reads as a studio shot. The mix keeps the direction the player
+    // expects while guaranteeing the faces they can see are the lit ones.
+    this.key.position.copy(sun).multiplyScalar(0.85).add(KEY_BIAS).normalize().multiplyScalar(2);
     this.key.target.position.set(0, -0.05, -0.2);
     this.key.target.updateMatrixWorld();
 
-    // Rim swings with the sun's azimuth but stays behind and above, so the top
-    // rail keeps its edge whichever heading the player is on.
-    this.rim.position.set(-sun.x * 0.5 - 0.20, 0.95, -1.0);
+    // A third of a turn past the sun and lifted, so the top rail catches an
+    // edge whichever heading the player is on.
+    this.rim.position.copy(sun).applyAxisAngle(WORLD_UP, 2.35);
+    this.rim.position.y = 0.80;
+    this.rim.position.normalize().multiplyScalar(2);
+
+    // Fill opposes the key in azimuth only; it is sky, so it never comes from
+    // below and never picks up the sun's warmth.
+    this.fill.position.set(-sun.x * 1.3 - 0.35, 0.55, 0.95);
 
     // The rig lives in camera space but the environment is authored in world
     // space, so without this the weapon reflects a fixed patch of sky that

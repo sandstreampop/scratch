@@ -59,7 +59,7 @@ const ShaftsShader = {
     tDiffuse: { value: null },
     tMask: { value: null },
     uSunScreen: { value: new THREE.Vector2(0.5, 0.5) },
-    uIntensity: { value: 0.11 },
+    uIntensity: { value: 0.13 },
     uDecay: { value: 0.978 },
     uDensity: { value: 1.0 },
     uWeight: { value: 1.0 },
@@ -67,7 +67,7 @@ const ShaftsShader = {
     // in-scatter reaches everywhere, but without a depth buffer this pass
     // cannot tell a distant silhouette from a near one, and letting it run to
     // the frame edge lifts the whole foreground into a flat veil.
-    uReach: { value: 0.34 },
+    uReach: { value: 0.38 },
     uTint: { value: new THREE.Color(0xffd9b4) },
     uVisible: { value: 1.0 },
     uAspect: { value: 1.0 },
@@ -534,7 +534,7 @@ export class PostStack {
     // work lamp in the outpost — which is how bloom ends up reading as fog with
     // a second sun in it. Above 0.6 only the solar core and a muzzle flash
     // qualify, which is the one thing in a dawn frame that should glare.
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.50, 0.60, 0.85);
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.45, 0.35, 0.85);
     this.composer.addPass(this.bloom);
 
     this.grade = new ShaderPass(GradeShader);
