@@ -351,7 +351,13 @@ const SAMPLERS = {
     c.h = 0.60 + coarse * 0.14 + fine * 0.07 + grit * 0.06
       - blown * 0.26 - mortar * blown * 0.28 - crack * 0.30;
 
-    const l = 0.748 + fine * 0.055 + grit * 0.028 - coarse * 0.072;
+    // Diffuse albedo, and it has to stay in the range real pigment occupies.
+    // At 0.748 the red channel peaked near 0.83 — fresh paper — on the largest
+    // sunlit surface in the level, so the wall clipped against any exposure
+    // that left the ground readable, and no amount of grading could recover a
+    // value the material never had. Weathered limewash over mud brick sits
+    // around 0.55 to 0.65; the variation is unchanged, only the level.
+    const l = 0.580 + fine * 0.055 + grit * 0.028 - coarse * 0.072;
     c.r = l * 1.000; c.g = l * 0.958; c.b = l * 0.862;              // warm limewash
     // Exposed mud brick beneath. Sun-bleached to nearly the value of the
     // render itself — the relief is what shows, not a change of colour.

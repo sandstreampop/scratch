@@ -290,20 +290,27 @@ const GradeShader = {
     uTime: { value: 0 },
     uResolution: { value: new THREE.Vector2(1, 1) },
     uExposure: { value: 1.0 },
-    uAberration: { value: 0.00045 },
-    uVignette: { value: 0.30 },
+    // Off. At 0.00045 this is 0.72 px of radial offset at 1600 wide, which was
+    // invisible while the scene only had a stop of range in it and turned into
+    // obvious red and cyan banding along every container edge, roofline and
+    // strand of razor wire the moment the lighting carried three. A lens
+    // artefact that reads as a filter costs more than it buys, and a bisection
+    // with it zeroed is what identified it — the fringes survived fixing the
+    // unsharp mask, which was the other suspect.
+    uAberration: { value: 0.0 },
+    uVignette: { value: 0.55 },
     // Also dithers the 8-bit composite buffers, which quantise the shadows
     // hard enough to band without it.
     uGrain: { value: 0.026 },
     uSharpen: { value: 0.26 },
-    uContrast: { value: 1.40 },
+    uContrast: { value: 1.12 },
     uSaturation: { value: 1.06 },
-    uLift: { value: new THREE.Vector3(0.0040, 0.0060, 0.0125) },
+    uLift: { value: new THREE.Vector3(0.0060, 0.0060, 0.0060) },
     // Subtracted back off after the lift so the frame still has a true zero in
     // it. A lift on its own is a floor no pixel can cross, and every silhouette
     // in the frame then piles up on that one value with nothing between them.
-    uBlackPoint: { value: 0.0028 },
-    uGain: { value: new THREE.Vector3(1.030, 1.000, 0.968) },
+    uBlackPoint: { value: 0.0060 },
+    uGain: { value: new THREE.Vector3(1.000, 0.971, 0.940) },
     uSplit: { value: 0.20 },
     uHurt: { value: 0.0 },
     uFlash: { value: 0.0 },
@@ -362,7 +369,19 @@ const GradeShader = {
         + texture2D(tDiffuse, uv + vec2(-texel.x, 0.0)).rgb
         + texture2D(tDiffuse, uv + vec2(0.0,  texel.y)).rgb
         + texture2D(tDiffuse, uv + vec2(0.0, -texel.y)).rgb;
-      color += (color - max(blur, 0.0) * 0.25) * uSharpen;
+      // Luma-only, and bounded. Applying the correction per channel and then
+      // flooring each one at zero independently is a hue shift, not a sharpen:
+      // on the dark side of a high-contrast edge one channel clamps to zero
+      // while the others stay positive, which is what sprayed saturated red
+      // and blue fringes along every roofline, container edge and wire in the
+      // frame. Driving the whole pixel by a single luma ratio cannot change
+      // hue. The clamp keeps the overshoot proportional to the pixel rather
+      // than to its unbounded HDR magnitude, so a bright edge against sky
+      // stops growing a halo the size of its own radiance.
+      float lSharp = luma(color);
+      float corr = (lSharp - luma(max(blur, 0.0) * 0.25)) * uSharpen;
+      corr = clamp(corr, -0.30 * lSharp, 0.30 * lSharp);
+      color *= lSharp > 1e-5 ? (lSharp + corr) / lSharp : 1.0;
       color = max(color, 0.0);
 
       // --- exposure, contrast, tone map -------------------------------------
@@ -374,23 +393,39 @@ const GradeShader = {
       // pivot cannot go negative, and the tone curve's shoulder then absorbs
       // what the same boost does to the highlights.
       color = 0.18 * pow(max(color, 1e-5) / 0.18, vec3(uContrast));
-      color = aces(color);
 
-      // --- grade, in display-linear ----------------------------------------
+      // Gain and saturation belong on scene-referred light, above the curve.
+      // Below it they were multiplying a value aces() had already clamped to
+      // 1.0, so a red gain above unity could only push red past the ceiling
+      // and hard-clip, while a blue gain below unity capped blue at code 251
+      // however bright the scene got. The result was a frame in which red was
+      // the only channel that ever saturated, no neutral white existed
+      // anywhere, and every highlight plateaued at a fixed warm rgb(255,227,
+      // 211). Above the curve the same numbers are a white balance, and the
+      // shoulder rolls all three channels together.
       color = max(color * uGain, 0.0);
       color = mix(vec3(luma(color)), color, uSaturation);
+
+      // Bright saturated sources go white at the core, as film and sensors
+      // both do. Without this a strong warm emitter keeps its hue all the way
+      // up and reads as a coloured card rather than something incandescent.
+      float hot = smoothstep(0.55, 1.6, luma(color));
+      color = mix(color, vec3(luma(color)), hot * 0.65);
+
+      color = aces(color);
 
       // Cool the shadows against the warm dawn key — the split-tone that
       // reads as "modern military shooter" more than any other single choice.
       float shadowMask = 1.0 - smoothstep(0.0, 0.34, luma(color));
       color = mix(color, color * vec3(0.90, 0.965, 1.12), shadowMask * uSplit);
 
-      // Lifted, tinted black point. Print film has a toe rather than a cliff,
-      // and the cold cast sitting under the darkest part of the frame is most
-      // of what separates a dawn exterior from an underexposed one. The
-      // stretch that follows is what keeps it a toe: the lift alone sets a
-      // floor no pixel can cross, and a frame with a floor and no clipped
-      // highlight has neither end of the range and reads as haze.
+      // Lifted black point with a toe rather than a cliff. The lift has to be
+      // neutral and the subtraction has to match it, or the frame never
+      // reaches zero: the old lift was (0.0040, 0.0060, 0.0125) against a
+      // scalar subtraction of 0.0028, so blue could not go below 0.0097
+      // display-linear and every silhouette in the game piled up on a floor of
+      // rgb(4, 11, 25) — a visibly blue black. uSplit above already cools the
+      // shadows, and it does it proportionally instead of as a pedestal.
       color = uLift + color * (1.0 - uLift);
       color = max(color - uBlackPoint, 0.0) / (1.0 - uBlackPoint);
 
@@ -399,10 +434,15 @@ const GradeShader = {
       }
       color += uFlash;
 
-      color = toSRGB(clamp(color, 0.0, 1.0));
-
-      // --- sensor domain ----------------------------------------------------
+      // Vignetting is aperture falloff: it happens to the light on its way to
+      // the sensor, so it multiplies linear radiance. Below the encode it was
+      // scaling a gamma-coded value, where a 0.30 constant costs 1.23 stops at
+      // the corner rather than the 0.51 it reads as, and skews corner
+      // saturation on the way. Grain stays below — that one really is added
+      // after the response curve.
       color *= 1.0 - uVignette * smoothstep(0.10, 0.82, r2 * 2.0);
+
+      color = toSRGB(clamp(color, 0.0, 1.0));
 
       // Grain lives mostly in the shadows, as it does on a real sensor.
       float g = hash(gl_FragCoord.xy + fract(uTime) * 371.13) - 0.5;

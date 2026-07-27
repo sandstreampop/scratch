@@ -255,7 +255,14 @@ try {
   const envLuma = await page.evaluate(
     () => +window.__GAME.atmosphere.environmentLuma(window.__GAME.renderer).toFixed(4),
   );
-  check('image-based lighting is live', envLuma > 0.02,
+  // A collapse detector, and only that. The threshold used to be 0.02, which
+  // was the measured value at the time minus a little — so it failed the
+  // moment environmentIntensity was deliberately retuned, reporting a lighting
+  // regression for a lighting decision. Whether the magnitude is *right* is
+  // the next check's job, and that one compares against what the sky builder
+  // integrates rather than against a number frozen into the harness. This one
+  // answers the original iOS question: did image-based lighting go to zero?
+  check('image-based lighting is live', envLuma > 0.005,
     `environment-lit probe at ${envLuma}`);
 
   // The device-side guard behind that: it measures the environment's actual

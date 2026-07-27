@@ -27,7 +27,7 @@ export const PRESET = {
   // so anything above 1.0 linear is gone before the tone curve can roll it
   // off; holding the scene down is the only way to keep highlight headroom for
   // the tone map to shape. Exposure and the light intensities move together.
-  exposure: 2.85,
+  exposure: 2.55,
   skyGain: 0.130,
   // Preetham's disc is the true 0.53 deg sun, which is six pixels at this
   // field of view — too small to survive antialiasing, let alone read as the
@@ -40,13 +40,24 @@ export const PRESET = {
   // and every shadowed surface in the frame comes out magenta. Both ends of
   // the ambient are deliberately pulled toward green.
   sunColor: 0xffd2a4,      // warm dawn key
-  sunIntensity: 3.0,
+  sunIntensity: 13.0,
   skyColor: 0x6d94c8,      // zenith
   groundColor: 0x7a6042,   // sand bounce
   // Key and fill have to differ in colour temperature, not just in level, or
   // the cast shadows come back as a darker copy of the sunlit sand and the
   // frame reads as one warm ramp at no particular hour.
-  hemiIntensity: 0.34,
+  // Measured, not guessed: tools/ratio.mjs forward-renders and switches each
+  // contribution off in turn. The ground used to come back 54% image-based
+  // lighting, 27% fill, 18% hemisphere and 3.6% sun, for 0.55 stops between
+  // the sunlit decile and the same pixels with the sun off. A clear-sky dawn
+  // wants three to four, and at half a stop the sand reads as a painted
+  // texture rather than a lit surface.
+  //
+  // Part of that is honest physics — an 8.6-degree sun meets flat ground at
+  // N.L = 0.15 — so the key has to be much stronger than a noon rig would
+  // need to put the same light on the floor. The rest was the ambient stack
+  // being loud enough to drown what the sun did put there.
+  hemiIntensity: 0.16,
   hazeColor: 0x8fa3ba,     // aerial perspective, away from the sun
   hazeSunColor: 0xffcb9c,  // ... and looking into it
   // Haze is sky radiance seen end-on, so it has to sit on the same scale as
@@ -61,9 +72,9 @@ export const PRESET = {
   fogDensity: 0.0030,
   fogHeight: 40,           // metres; e-folding height of the dust layer
   fillColor: 0xa6c2e6,     // cool sky fill on the shadow side
-  fillIntensity: 0.40,
+  fillIntensity: 0.16,
   skyLuminance: 0.26,      // scales the analytic IBL
-  environmentIntensity: 1.0,
+  environmentIntensity: 0.45,
 };
 
 /**
@@ -290,7 +301,8 @@ export class Atmosphere {
 
     this.bounce.color.set(s.fillColor);
     this.bounce.intensity = s.fillIntensity;
-    this.bounce.position.set(-this.sunDirection.x * 200, 90, -this.sunDirection.z * 200);
+    // Same 12-degree elevation update() uses; see the note there.
+    this.bounce.position.set(-this.sunDirection.x * 200, 42, -this.sunDirection.z * 200);
     this.bounce.target.position.set(0, 0, 0);
 
     this.hemi.color.set(s.skyColor);
@@ -621,8 +633,15 @@ export class Atmosphere {
     this.sun.target.position.copy(focus);
     this.sun.target.updateMatrixWorld();
 
+    // Low, from the anti-sun side. At 90 units up over 119 of horizontal reach
+    // this sat at 37 degrees, meeting flat ground at N.L = 0.60 against the
+    // 8.6-degree sun's 0.15 — so a light nominally seven times dimmer than the
+    // key still put half as much light on the floor as the key did, and the
+    // ground lost its shadows. A fill exists to reach the faces the sun
+    // cannot; dropping it to 12 degrees puts it on vertical surfaces on the
+    // shadow side and leaves the floor to the key.
     this.bounce.position.copy(focus).add(
-      new THREE.Vector3(-this.sunDirection.x * 120, 90, -this.sunDirection.z * 120),
+      new THREE.Vector3(-this.sunDirection.x * 120, 25, -this.sunDirection.z * 120),
     );
     this.bounce.target.position.copy(focus);
     this.bounce.target.updateMatrixWorld();
