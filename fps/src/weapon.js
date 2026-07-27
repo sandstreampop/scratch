@@ -16,6 +16,15 @@ import { material } from './textures.js';
 
 const TAU = Math.PI * 2;
 
+// Vertical field of view for the viewmodel lens, in degrees, and how far the
+// eye sits behind the ocular when aiming. Eye relief is the only thing setting
+// how much of the frame the sight tube fills, so it is a tuning knob, not a
+// consequence of the pose.
+const FOV_HIP = 48;
+const FOV_ADS = 40;
+const ADS_EYE_RELIEF = 0.105;
+const OCULAR_OFFSET = 0.0285;   // rear glass, forward of the optic's centre
+
 export const SPEC = {
   name: 'M4A1',
   magSize: 30,
@@ -79,17 +88,61 @@ function reticleTexture() {
 }
 
 /* ------------------------------------------------------------ the model -- */
+//
+// Everything below is the real carbine in metres: 0.838 m overall with the
+// stock collapsed, a 0.038 m receiver, a 21.2 mm MIL-STD-1913 rail deck and a
+// 30 mm optic tube. Modelling to size rather than to taste is what lets the
+// framing come out of the camera placement instead of a scale fudge, and it is
+// the difference between a carbine and a prop.
+//
+// Origin is on the bore axis at the rear face of the upper receiver; -Z is
+// downrange, +X is the shooter's right.
+
+const BORE_TO_MUZZLE = 0.560;
+const RAIL_DECK = 0.0262;        // slot floor above the bore
+const RAIL_PITCH = 0.0100;       // recoil-groove spacing
+const SIGHT_HEIGHT = 0.068;      // optical axis over bore
+
+/** One picatinny recoil lug, chamfered like the real extrusion. */
+function railToothGeometry() {
+  const s = new THREE.Shape();
+  s.moveTo(-0.0106, 0);
+  s.lineTo(0.0106, 0);
+  s.lineTo(0.0106, 0.0014);
+  s.lineTo(0.0086, 0.0034);
+  s.lineTo(-0.0086, 0.0034);
+  s.lineTo(-0.0106, 0.0014);
+  s.closePath();
+  const g = new THREE.ExtrudeGeometry(s, { depth: 0.0050, bevelEnabled: false, curveSegments: 1 });
+  g.translate(0, 0, -0.0025);
+  return g;
+}
 
 function buildCarbine() {
   const root = new THREE.Group();
   root.name = 'carbine';
 
-  const steel = material('gunmetal', [2, 2]);
-  const steelFine = material('gunmetal', [4, 4], { roughness: 0.42, metalness: 1 });
-  const poly = material('polymer', [3, 3]);
-  const polyGrip = material('polymer', [6, 6], { roughness: 0.74 });
-  const black = new THREE.MeshStandardMaterial({ color: 0x0a0a0b, roughness: 0.55, metalness: 0.85 });
-  const anodised = new THREE.MeshStandardMaterial({ color: 0x121316, roughness: 0.38, metalness: 1.0 });
+  // Phosphate is a matte conversion coating that scatters wide, so only the
+  // worn-through high points ever specular. Modelled at full metalness it has no
+  // diffuse term at all and the receiver becomes a hole in a backlit frame;
+  // backing metalness off gives the flanks something for the fill to catch.
+  const phosphate = material('gunmetal', [3.2, 3.2], { roughness: 0.88, metalness: 0.30 });
+  const barrelSteel = material('gunmetal', [5, 5], { roughness: 0.58, metalness: 0.75 });
+  const furniture = material('polymer', [3, 3], { roughness: 1.0 });
+  const gripPoly = material('polymer', [7, 7], { roughness: 1.05 });
+  // An FDE magazine is the one value break a black rifle gets, and it is what
+  // stops the lower right of frame being a single silhouette.
+  const magPoly = material('polymer', [2.4, 4], { map: null, color: 0x6f5f48, roughness: 0.88 });
+  // Small hard parts are the trap: at low roughness a near-black metal still
+  // mirrors a dawn sky straight back at the lens and reads as bare aluminium.
+  const small = new THREE.MeshStandardMaterial({ color: 0x1a1c1f, roughness: 0.86, metalness: 0.15 });
+  const railMat = new THREE.MeshStandardMaterial({ color: 0x232529, roughness: 0.54, metalness: 0.45 });
+  // Tiled tight on purpose: at low repeat the gunmetal sampler's polished-through
+  // wear blobs are bigger than the optic itself and turn the whole tube chrome.
+  const opticBody = material('gunmetal', [5, 5], { roughness: 0.92, metalness: 0.28 });
+  const worn = new THREE.MeshStandardMaterial({ color: 0x4a4c51, roughness: 0.45, metalness: 0.80 });
+  const rubber = new THREE.MeshStandardMaterial({ color: 0x1b1b1d, roughness: 0.94, metalness: 0.0 });
+  const bore = new THREE.MeshStandardMaterial({ color: 0x030303, roughness: 1.0, metalness: 0.3 });
 
   const part = (geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
     const m = new THREE.Mesh(geo, mat);
@@ -100,193 +153,268 @@ function buildCarbine() {
     root.add(m);
     return m;
   };
-  const rbox = (w, h, d, r = 0.003) => new RoundedBoxGeometry(w, h, d, 2, Math.min(r, Math.min(w, h, d) * 0.32));
-  const cyl = (rt, rb, h, seg = 20) => new THREE.CylinderGeometry(rt, rb, h, seg);
+  const rbox = (w, h, d, r = 0.002) =>
+    new RoundedBoxGeometry(w, h, d, 2, Math.min(r, Math.min(w, h, d) * 0.32));
+  const cyl = (rt, rb, h, seg = 18) => new THREE.CylinderGeometry(rt, rb, h, seg);
+  // Cylinders default to the Y axis; almost everything here runs down the bore.
+  const tubeAlongZ = (rt, rb, len, seg, mat, x, y, z, open = false) =>
+    part(new THREE.CylinderGeometry(rt, rb, len, seg, 1, open), mat, x, y, z, Math.PI / 2);
+  const pinAlongX = (r, len, mat, x, y, z) =>
+    part(cyl(r, r, len, 12), mat, x, y, z, 0, 0, Math.PI / 2);
+
+  /** Lays a run of recoil lugs between two Z stations. */
+  const railRun = (mat, zFront, zRear, deck) => {
+    const count = Math.floor((zRear - zFront) / RAIL_PITCH);
+    const tooth = new THREE.InstancedMesh(railToothGeometry(), mat, count);
+    tooth.castShadow = true;
+    tooth.receiveShadow = true;
+    const m = new THREE.Matrix4();
+    for (let i = 0; i < count; i++) {
+      m.makeTranslation(0, deck, zFront + (i + 0.5) * RAIL_PITCH);
+      tooth.setMatrixAt(i, m);
+    }
+    tooth.instanceMatrix.needsUpdate = true;
+    root.add(tooth);
+    return tooth;
+  };
 
   // ---- upper receiver ------------------------------------------------------
-  part(rbox(0.052, 0.050, 0.200, 0.006), anodised, 0, 0.006, -0.030);
-  // Carry-handle-less flat-top with a full-length picatinny rail.
-  const railBase = part(rbox(0.040, 0.008, 0.208, 0.001), anodised, 0, 0.035, -0.030);
-  for (let i = 0; i < 17; i++) {
-    part(rbox(0.038, 0.0075, 0.0062, 0.0008), anodised, 0, 0.0425, -0.128 + i * 0.0122);
-  }
-  // Ejection port, brass deflector, forward assist.
-  part(rbox(0.006, 0.026, 0.052, 0.002), black, 0.0275, 0.010, -0.010);
-  part(new THREE.SphereGeometry(0.013, 12, 10), anodised, 0.026, 0.020, 0.018).scale.set(1, 0.7, 1.5);
-  part(cyl(0.008, 0.008, 0.020, 12), anodised, 0.028, -0.002, 0.026, 0, 0, Math.PI / 2);
+  part(rbox(0.038, 0.040, 0.202, 0.005), phosphate, 0, 0.001, -0.101);
+  part(rbox(0.031, 0.031, 0.016, 0.004), phosphate, 0, 0.003, 0.005);       // rear takedown lug
+  part(rbox(0.0224, 0.0062, 0.212, 0.001), phosphate, 0, RAIL_DECK - 0.0031, -0.100);
+  railRun(railMat, -0.204, 0.004, RAIL_DECK);
 
-  // ---- handguard -----------------------------------------------------------
-  // Slim free-float tube with M-LOK cutouts and a top rail continuation.
-  const hg = part(cyl(0.0245, 0.0255, 0.230, 14), poly, 0, 0.006, -0.245);
-  hg.rotation.x = Math.PI / 2;
-  for (let i = 0; i < 15; i++) {
-    part(rbox(0.036, 0.0075, 0.0062, 0.0008), anodised, 0, 0.0325, -0.148 - i * 0.0122);
+  // Ejection port: a recessed door with its hinge rod and latch, plus the
+  // brass deflector that gives the right side its distinctive lump.
+  part(rbox(0.0050, 0.0230, 0.0570, 0.0015), small, 0.0186, 0.0035, -0.052);
+  part(cyl(0.0022, 0.0022, 0.062, 8), worn, 0.0176, -0.0085, -0.052, Math.PI / 2);
+  part(rbox(0.0042, 0.0075, 0.0130, 0.001), small, 0.0195, 0.0075, -0.020);
+  const deflector = part(new THREE.SphereGeometry(0.0105, 12, 10), phosphate, 0.0158, 0.0125, 0.000);
+  deflector.scale.set(0.85, 0.62, 1.35);
+  // Forward assist.
+  pinAlongX(0.0058, 0.013, phosphate, 0.0212, -0.0035, -0.0085);
+  pinAlongX(0.0076, 0.0055, small, 0.0262, -0.0035, -0.0085);
+  // Charging handle: a thin shaft under the rail with the latch wing on the
+  // left, serrated on its rear face where a thumb pulls it.
+  part(rbox(0.0150, 0.0062, 0.0230, 0.0015), small, 0, RAIL_DECK - 0.0104, 0.0110);
+  part(rbox(0.0300, 0.0060, 0.0085, 0.0015), small, 0, RAIL_DECK - 0.0104, 0.0180);
+  part(rbox(0.0150, 0.0078, 0.0095, 0.0015), worn, -0.0190, RAIL_DECK - 0.0104, 0.0186);
+  for (let i = 0; i < 4; i++) {
+    part(rbox(0.0011, 0.0072, 0.0082, 0.0004), bore, -0.0140 - i * 0.0025, RAIL_DECK - 0.0104, 0.0188);
   }
-  // M-LOK slots at 3, 6 and 9 o'clock.
-  for (const ang of [0, Math.PI / 2, Math.PI]) {
-    for (let i = 0; i < 6; i++) {
-      const z = -0.170 - i * 0.031;
-      const m = part(rbox(0.010, 0.0075, 0.021, 0.002), black,
-        Math.cos(ang + Math.PI / 2) * 0.0235, 0.006 + Math.sin(ang + Math.PI / 2) * 0.0235, z);
-      m.rotation.z = ang + Math.PI / 2;
-    }
+
+  // ---- lower receiver ------------------------------------------------------
+  part(rbox(0.0272, 0.038, 0.128, 0.004), phosphate, 0, -0.031, -0.062);
+  part(rbox(0.0370, 0.058, 0.052, 0.004), phosphate, 0, -0.048, -0.086);
+  part(rbox(0.0432, 0.0085, 0.0575, 0.002), phosphate, 0, -0.0790, -0.086);   // flare
+  part(rbox(0.0446, 0.0018, 0.0590, 0.0006), worn, 0, -0.0836, -0.086);       // worn lip
+  // The left flank of an AR is a big blank casting, so it needs the parting
+  // line, the fluting and the controls to stop it reading as a slab.
+  for (const side of [1, -1]) {
+    part(rbox(0.0016, 0.0030, 0.1280, 0.0004), bore, side * 0.0137, -0.0120, -0.0620);
+    part(rbox(0.0022, 0.0300, 0.0300, 0.0020), bore, side * 0.0186, -0.0480, -0.0870);
+    part(rbox(0.0018, 0.0230, 0.0150, 0.0015), bore, side * 0.0140, -0.0330, -0.0210);
   }
-  // Handstop and a short angled foregrip.
-  part(rbox(0.026, 0.030, 0.040, 0.004), polyGrip, 0, -0.026, -0.268, 0.42);
-
-  // ---- barrel, gas block, muzzle ------------------------------------------
-  const barrel = part(cyl(0.0088, 0.0100, 0.170, 16), steelFine, 0, 0.006, -0.415);
-  barrel.rotation.x = Math.PI / 2;
-  // Barrel nut / gas block.
-  const gb = part(rbox(0.024, 0.026, 0.030, 0.003), steel, 0, 0.008, -0.372);
-  const gasTube = part(cyl(0.0032, 0.0032, 0.185, 8), steelFine, 0, 0.021, -0.290);
-  gasTube.rotation.x = Math.PI / 2;
-
-  // A2-pattern birdcage.
-  const muzzle = part(cyl(0.0132, 0.0132, 0.052, 18), steel, 0, 0.006, -0.500);
-  muzzle.rotation.x = Math.PI / 2;
-  for (let i = 0; i < 5; i++) {
-    const a = -Math.PI * 0.42 + (i / 4) * Math.PI * 0.84;
-    const slot = part(rbox(0.0055, 0.010, 0.026, 0.001), black,
-      Math.sin(a) * 0.0118, 0.006 + Math.cos(a) * 0.0118, -0.502);
-    slot.rotation.z = -a;
+  // Takedown pins, controls. The selector is ambidextrous; the catch is not.
+  pinAlongX(0.0050, 0.0300, small, 0, -0.0250, -0.1210);
+  pinAlongX(0.0050, 0.0300, small, 0, -0.0250, -0.0040);
+  pinAlongX(0.0062, 0.0075, small, 0.0175, -0.0345, -0.0630);                 // mag release
+  part(rbox(0.0060, 0.0180, 0.0175, 0.002), phosphate, 0.0160, -0.0345, -0.0630);
+  part(rbox(0.0055, 0.0140, 0.0300, 0.002), small, -0.0165, -0.0290, -0.0880); // bolt catch
+  part(rbox(0.0065, 0.0090, 0.0110, 0.002), worn, -0.0172, -0.0330, -0.0985);  // catch paddle
+  for (const side of [1, -1]) {
+    pinAlongX(0.0052, 0.0100, small, side * 0.0158, -0.0300, -0.0215);
+    part(rbox(0.0040, 0.0080, 0.0210, 0.0012), worn, side * 0.0186, -0.0326, -0.0130);
   }
-  part(cyl(0.0136, 0.0136, 0.008, 18), steel, 0, 0.006, -0.478, Math.PI / 2);
-  // Crown / bore.
-  part(cyl(0.0058, 0.0058, 0.012, 14), new THREE.MeshStandardMaterial({ color: 0x000000, roughness: 0.9 }),
-    0, 0.006, -0.522, Math.PI / 2);
+  // Trigger, guard, and the bow that ties them into the grip.
+  part(rbox(0.0062, 0.0195, 0.0075, 0.002), worn, 0, -0.0565, -0.0305, 0.22);
+  const guard = new THREE.Mesh(new THREE.TorusGeometry(0.0195, 0.0032, 8, 22, Math.PI * 1.15), phosphate);
+  guard.position.set(0, -0.0510, -0.0175);
+  guard.rotation.set(0, Math.PI / 2, -1.05);
+  guard.castShadow = true; guard.receiveShadow = true;
+  root.add(guard);
 
-  // ---- lower receiver, magwell, magazine ----------------------------------
-  part(rbox(0.044, 0.046, 0.150, 0.005), anodised, 0, -0.032, -0.010);
-  // Magwell flare.
-  const well = part(rbox(0.036, 0.052, 0.080, 0.004), anodised, 0, -0.062, -0.045);
-  // STANAG magazine — three tapered segments approximate the curve.
-  const magMat = material('polymer', [2, 4], { roughness: 0.62, color: 0x2a2c26 });
-  const magSegs = 4;
+  // ---- magazine ------------------------------------------------------------
+  // A 30-round STANAG is 24.5 mm across and curves forward as it drops.
   const magGroup = new THREE.Group();
+  const magSegs = 5;
   for (let i = 0; i < magSegs; i++) {
     const t = i / (magSegs - 1);
-    const y = -0.092 - t * 0.116;
-    const z = -0.045 + Math.pow(t, 1.5) * 0.030;                    // curve toward the rear
-    const seg = new THREE.Mesh(rbox(0.030, 0.042, 0.070 - t * 0.004, 0.004), magMat);
-    seg.position.set(0, y, z);
-    seg.rotation.x = -t * 0.22;
+    const seg = new THREE.Mesh(rbox(0.0245 - t * 0.0006, 0.0345, 0.0410 - t * 0.0022, 0.0022), magPoly);
+    seg.position.set(0, -0.0700 - t * 0.0330, -0.0860 - Math.pow(t, 1.45) * 0.0250);
+    seg.rotation.x = t * 0.155;
     seg.castShadow = true; seg.receiveShadow = true;
     magGroup.add(seg);
+    if (i > 0 && i < magSegs) {                                    // moulded stiffening ribs
+      const rib = new THREE.Mesh(rbox(0.0258, 0.0030, 0.0395, 0.0010), magPoly);
+      rib.position.copy(seg.position).y += 0.0172;
+      rib.rotation.x = seg.rotation.x;
+      rib.castShadow = true;
+      magGroup.add(rib);
+    }
   }
-  // Baseplate.
-  const plate = new THREE.Mesh(rbox(0.034, 0.010, 0.074, 0.002), magMat);
-  plate.position.set(0, -0.212, -0.008);
-  plate.rotation.x = -0.22;
-  plate.castShadow = true;
+  const plate = new THREE.Mesh(rbox(0.0282, 0.0092, 0.0448, 0.0016), magPoly);
+  plate.position.set(0, -0.2215, -0.1130);
+  plate.rotation.x = 0.155;
+  plate.castShadow = true; plate.receiveShadow = true;
   magGroup.add(plate);
+  const pad = new THREE.Mesh(rbox(0.0272, 0.0060, 0.0430, 0.0014), rubber);
+  pad.position.set(0, -0.2280, -0.1140);
+  pad.rotation.x = 0.155;
+  pad.castShadow = true;
+  magGroup.add(pad);
+  magGroup.rotation.z = 0.006;                                     // never seats dead square
   root.add(magGroup);
 
-  // Trigger group.
-  part(rbox(0.020, 0.026, 0.040, 0.006), anodised, 0, -0.056, 0.030);
-  const guard = new THREE.Mesh(new THREE.TorusGeometry(0.019, 0.0035, 8, 20, Math.PI * 1.25), anodised);
-  guard.position.set(0, -0.062, 0.034);
-  guard.rotation.set(0, Math.PI / 2, -0.4);
-  guard.castShadow = true;
-  root.add(guard);
-  part(rbox(0.006, 0.020, 0.006, 0.002), steelFine, 0, -0.060, 0.030, 0.25);
-  // Magazine release and selector.
-  part(cyl(0.005, 0.005, 0.010, 10), anodised, 0.024, -0.030, -0.006, 0, 0, Math.PI / 2);
-  part(cyl(0.006, 0.006, 0.016, 10), anodised, 0.023, -0.030, 0.030, 0, 0, Math.PI / 2);
-
   // ---- pistol grip ---------------------------------------------------------
-  const grip = part(rbox(0.030, 0.098, 0.042, 0.008), polyGrip, 0, -0.088, 0.062, 0.28);
-  part(rbox(0.032, 0.016, 0.038, 0.006), polyGrip, 0, -0.135, 0.076, 0.28);
+  part(rbox(0.0320, 0.1050, 0.0400, 0.010), gripPoly, 0, -0.0980, 0.0140, -0.40);
+  part(rbox(0.0300, 0.0170, 0.0330, 0.008), gripPoly, 0, -0.0500, 0.0075, -0.40);   // beavertail
+  part(rbox(0.0330, 0.0150, 0.0125, 0.004), rubber, 0, -0.1490, 0.0355, -0.40);     // butt cap
+  for (let i = 0; i < 3; i++) {                                    // finger grooves
+    part(cyl(0.0035, 0.0035, 0.0310, 8), gripPoly,
+      0, -0.0790 - i * 0.0235, -0.0035 + i * 0.0100, 0, 0, Math.PI / 2);
+  }
+
+  // ---- handguard -----------------------------------------------------------
+  // Slim free-float tube, flat-topped so the rail runs unbroken off the
+  // receiver, with M-LOK real estate at 3, 6 and 9 o'clock.
+  tubeAlongZ(0.0196, 0.0202, 0.238, 20, furniture, 0, 0, -0.325);
+  tubeAlongZ(0.0216, 0.0216, 0.020, 20, phosphate, 0, 0, -0.2110);        // barrel nut shroud
+  tubeAlongZ(0.0206, 0.0198, 0.010, 20, furniture, 0, 0, -0.4400);        // end cap
+  part(rbox(0.0224, 0.0090, 0.2370, 0.001), furniture, 0, RAIL_DECK - 0.0045, -0.3255);
+  railRun(railMat, -0.442, -0.208, RAIL_DECK);
+
+  const slot = rbox(0.0098, 0.0075, 0.0320, 0.0018);
+  for (const ang of [-Math.PI / 2, Math.PI, Math.PI / 2]) {
+    for (let i = 0; i < 5; i++) {
+      const z = -0.2400 - i * 0.0420;
+      const r = 0.0176;
+      part(slot, small, -Math.sin(ang) * r, Math.cos(ang) * r, z, 0, 0, ang);
+    }
+  }
+  // Handstop, and a flush QD sling socket on the right where a sling would run.
+  part(rbox(0.0230, 0.0175, 0.0300, 0.004), gripPoly, 0, -0.0250, -0.3960, 0.36);
+  pinAlongX(0.0072, 0.0040, small, 0.0198, -0.0060, -0.2320);
+  pinAlongX(0.0040, 0.0050, bore, 0.0206, -0.0060, -0.2320);
+
+  // ---- barrel and muzzle ---------------------------------------------------
+  tubeAlongZ(0.0082, 0.0090, 0.0680, 16, barrelSteel, 0, 0, -0.4720);
+  tubeAlongZ(0.0112, 0.0112, 0.0060, 18, worn, 0, 0, -0.5075);            // crush washer
+  tubeAlongZ(0.0110, 0.0110, 0.0440, 18, barrelSteel, 0, 0, -0.5320);
+  tubeAlongZ(0.0098, 0.0110, 0.0060, 18, barrelSteel, 0, 0, -0.5525);     // crowned front
+  tubeAlongZ(0.0059, 0.0059, 0.0140, 14, bore, 0, 0, -0.5540);
+  // A2 birdcage: five ports, closed at six o'clock so muzzle blast lifts dust.
+  for (let i = 0; i < 5; i++) {
+    const a = -Math.PI * 0.40 + (i / 4) * Math.PI * 0.80;
+    part(rbox(0.0042, 0.0075, 0.0260, 0.0010), bore,
+      Math.sin(a) * 0.0098, Math.cos(a) * 0.0098, -0.5310, 0, 0, a);
+  }
 
   // ---- buffer tube and stock ----------------------------------------------
-  const tube = part(cyl(0.0165, 0.0165, 0.170, 16), anodised, 0, 0.002, 0.140);
-  tube.rotation.x = Math.PI / 2;
-  for (let i = 0; i < 6; i++) {
-    part(new THREE.TorusGeometry(0.0172, 0.0018, 6, 18), anodised, 0, 0.002, 0.085 + i * 0.021, Math.PI / 2);
+  tubeAlongZ(0.0178, 0.0178, 0.0100, 16, phosphate, 0, -0.0015, 0.0080);  // castle nut
+  for (let i = 0; i < 6; i++) {                                    // castle nut notches
+    const a = (i / 6) * TAU + 0.3;
+    part(rbox(0.0035, 0.0035, 0.0105, 0.0008), small,
+      Math.sin(a) * 0.0168, -0.0015 + Math.cos(a) * 0.0168, 0.0080);
   }
-  // Collapsible stock body.
-  part(rbox(0.044, 0.062, 0.062, 0.008), poly, 0, -0.006, 0.145);
-  part(rbox(0.050, 0.086, 0.026, 0.008), poly, 0, -0.010, 0.196);          // butt pad face
-  part(rbox(0.052, 0.090, 0.012, 0.004),
-    new THREE.MeshStandardMaterial({ color: 0x08090a, roughness: 0.92 }), 0, -0.010, 0.210);
-  // Cheek weld ridge and sling loop.
-  part(rbox(0.036, 0.014, 0.070, 0.005), poly, 0, 0.026, 0.150);
-  const loop = new THREE.Mesh(new THREE.TorusGeometry(0.010, 0.0025, 6, 14), anodised);
-  loop.position.set(0.024, -0.020, 0.176);
-  loop.rotation.y = Math.PI / 2;
-  root.add(loop);
+  tubeAlongZ(0.0146, 0.0146, 0.2300, 18, phosphate, 0, -0.0015, 0.1280);
+  for (let i = 0; i < 6; i++) {                                    // adjustment detents
+    part(cyl(0.0026, 0.0026, 0.0035, 8), bore, 0, -0.0155, 0.0700 + i * 0.0250);
+  }
+  // Collapsible stock: body, cheek rise, toe, pad.
+  part(rbox(0.0480, 0.0520, 0.1250, 0.006), furniture, 0, -0.0020, 0.1900);
+  part(rbox(0.0400, 0.0140, 0.1020, 0.005), furniture, 0, 0.0270, 0.1840);
+  part(rbox(0.0300, 0.0300, 0.0620, 0.006), furniture, 0, -0.0360, 0.2320, -0.22);
+  part(rbox(0.0455, 0.0980, 0.0150, 0.004), furniture, 0, -0.0060, 0.2720);
+  part(rbox(0.0470, 0.1010, 0.0095, 0.003), rubber, 0, -0.0060, 0.2790);
+  part(rbox(0.0165, 0.0130, 0.0480, 0.004), small, 0, -0.0300, 0.2020);   // release lever
+  for (const side of [1, -1]) {                                    // ambi sling slots
+    part(rbox(0.0075, 0.0110, 0.0175, 0.0025), bore, side * 0.0210, -0.0120, 0.2360);
+  }
 
-  // ---- charging handle -----------------------------------------------------
-  part(rbox(0.052, 0.010, 0.014, 0.002), anodised, 0, 0.024, 0.070);
-  part(rbox(0.014, 0.012, 0.044, 0.002), anodised, -0.022, 0.024, 0.056);
+  // ---- back-up irons, folded ----------------------------------------------
+  part(rbox(0.0200, 0.0080, 0.0330, 0.0020), small, 0, RAIL_DECK + 0.0072, -0.0230);
+  part(rbox(0.0175, 0.0075, 0.0300, 0.0020), small, 0, RAIL_DECK + 0.0070, -0.4200);
 
-  // ---- optic: red dot on a cantilever mount -------------------------------
+  // ---- optic: 30 mm red dot on a cantilever mount -------------------------
+  // `optic` carries the true optical axis and nothing else, so the dot stays
+  // exactly on it. The visible hardware hangs off `housing`, which is canted a
+  // few tenths of a degree because no mount is ever torqued down square.
   const optic = new THREE.Group();
-  optic.position.set(0, 0.0465, -0.052);
+  optic.position.set(0, SIGHT_HEIGHT, -0.0810);
   root.add(optic);
-
-  const mount = new THREE.Mesh(rbox(0.030, 0.016, 0.062, 0.003), anodised);
-  mount.position.set(0, 0.008, 0.004);
-  mount.castShadow = true; mount.receiveShadow = true;
-  optic.add(mount);
-  for (const z of [-0.020, 0.022]) {
-    const screw = new THREE.Mesh(cyl(0.0035, 0.0035, 0.034, 8), steelFine);
-    screw.position.set(0.016, 0.006, z);
-    screw.rotation.z = Math.PI / 2;
-    optic.add(screw);
-  }
-
-  // Housing: a squared tube open front and back.
   const housing = new THREE.Group();
-  housing.position.set(0, 0.030, 0);
+  housing.rotation.set(0, 0.009, 0.014);
   optic.add(housing);
-  const wall = (w, h, d, x, y, z) => {
-    const m = new THREE.Mesh(rbox(w, h, d, 0.002), anodised);
+
+  const add = (geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
+    const m = new THREE.Mesh(geo, mat);
     m.position.set(x, y, z);
+    m.rotation.set(rx, ry, rz);
     m.castShadow = true; m.receiveShadow = true;
     housing.add(m);
     return m;
   };
-  wall(0.034, 0.006, 0.060, 0, 0.019, 0);          // top
-  wall(0.034, 0.006, 0.060, 0, -0.019, 0);         // bottom
-  wall(0.006, 0.044, 0.060, -0.014, 0, 0);         // left
-  wall(0.006, 0.044, 0.060, 0.014, 0, 0);          // right
-  // Adjustment turrets.
-  const turret = new THREE.Mesh(cyl(0.0058, 0.0062, 0.010, 12), anodised);
-  turret.position.set(0.017, 0.006, 0.014);
-  turret.rotation.z = Math.PI / 2;
-  housing.add(turret);
-  const turret2 = new THREE.Mesh(cyl(0.0058, 0.0062, 0.010, 12), anodised);
-  turret2.position.set(0, 0.024, 0.014);
-  housing.add(turret2);
 
-  // Objective lens — tinted, glossy, and slightly transmissive so the world
-  // reads faintly through it even at hip.
-  const lensGeo = new THREE.CircleGeometry(0.0128, 32);
+  // Mount stack. Everything here has to clear the tube's outer wall — a riser
+  // or a ring that dips inside the bore puts a black slab across the sight
+  // picture, which is exactly what you notice and cannot un-notice.
+  add(rbox(0.0290, 0.0112, 0.0460, 0.002), small, 0, -0.0362, 0.0025);      // rail clamp
+  add(rbox(0.0165, 0.0165, 0.0320, 0.003), small, 0, -0.0234, 0.0025);      // riser neck
+  for (const z of [-0.0165, 0.0185]) {
+    add(new THREE.TorusGeometry(0.0176, 0.0024, 8, 26), small, 0, 0, z);
+    add(rbox(0.0150, 0.0110, 0.0070, 0.002), small, 0, -0.0210, z);
+  }
+  add(rbox(0.0052, 0.0150, 0.0230, 0.002), worn, -0.0170, -0.0362, 0.0025); // throw lever
+  add(cyl(0.0030, 0.0030, 0.0310, 8), worn, 0.0000, -0.0362, -0.0150, 0, 0, Math.PI / 2);
+
+  // The tube and both bells are open cylinders drawn from the inside too:
+  // capping them plugs the sight with a solid disc, which is the single fastest
+  // way to make an optic read as a painted-on prop. A matte black liner runs the
+  // full length so the bore swallows light instead of glowing like a drainpipe.
+  const anodised = opticBody.clone();
+  anodised.side = THREE.DoubleSide;
+  const boreWall = new THREE.MeshStandardMaterial({
+    color: 0x08090a, roughness: 0.96, metalness: 0.0, side: THREE.DoubleSide,
+  });
+  const ocyl = (rt, rb, len, seg) => new THREE.CylinderGeometry(rt, rb, len, seg, 1, true);
+  add(ocyl(0.0150, 0.0150, 0.0570, 40), anodised, 0, 0, 0, Math.PI / 2);
+  add(ocyl(0.0140, 0.0140, 0.0840, 40), boreWall, 0, 0, 0, Math.PI / 2);
+  add(ocyl(0.0164, 0.0150, 0.0120, 40), anodised, 0, 0, -0.0290, Math.PI / 2);
+  add(ocyl(0.0150, 0.0168, 0.0130, 40), anodised, 0, 0, 0.0295, Math.PI / 2);
+  add(cyl(0.0066, 0.0070, 0.0110, 16), small, 0, 0.0172, -0.0120);          // elevation turret
+  add(cyl(0.0066, 0.0070, 0.0110, 16), small, 0.0172, 0, -0.0120, 0, 0, Math.PI / 2);
+  add(cyl(0.0088, 0.0088, 0.0060, 18), small, -0.0172, 0, 0.0060, 0, 0, Math.PI / 2);  // battery cap
+  add(cyl(0.0070, 0.0070, 0.0040, 18), worn, -0.0208, 0, 0.0060, 0, 0, Math.PI / 2);
+  add(cyl(0.0056, 0.0060, 0.0070, 14), small, -0.0152, 0, 0.0230, 0, 0, Math.PI / 2);  // brightness dial
+
+  // Glass. Real transmission is no use here: the viewmodel scene is empty, so
+  // three would refract a black backdrop. Plain alpha over the already-composited
+  // world plus a clearcoat sheen is what actually reads as a coated lens.
   const lensMat = new THREE.MeshPhysicalMaterial({
-    color: 0x0d1b24,
-    roughness: 0.045,
+    color: 0x0c1a20,
+    roughness: 0.04,
     metalness: 0.0,
-    transmission: 0.72,
-    thickness: 0.004,
-    ior: 1.52,
-    iridescence: 0.55,
-    iridescenceIOR: 1.9,
-    iridescenceThicknessRange: [180, 460],
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.02,
+    iridescence: 0.9,
+    iridescenceIOR: 1.85,
+    iridescenceThicknessRange: [220, 520],
     transparent: true,
-    opacity: 0.94,
+    opacity: 0.26,
+    depthWrite: false,
     side: THREE.DoubleSide,
   });
-  const lensFront = new THREE.Mesh(lensGeo, lensMat);
-  lensFront.position.set(0, 0, -0.028);
-  housing.add(lensFront);
-  const lensRear = new THREE.Mesh(lensGeo, lensMat.clone());
-  lensRear.position.set(0, 0, 0.028);
-  housing.add(lensRear);
+  const front = add(new THREE.CircleGeometry(0.0134, 40), lensMat, 0, 0, -0.0300);
+  front.castShadow = false;
+  const rear = add(new THREE.CircleGeometry(0.0136, 40), lensMat.clone(), 0, 0, 0.0300);
+  rear.castShadow = false;
+  rear.material.iridescenceThicknessRange = [320, 700];
 
-  // Reticle: additive, depth-tested off so it always floats in the tube.
+  // Reticle: additive, depth-tested off so it always floats in the tube, and
+  // parented to the true axis rather than the canted housing.
   const reticle = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.023, 0.023),
+    new THREE.PlaneGeometry(0.0195, 0.0195),
     new THREE.MeshBasicMaterial({
       map: reticleTexture(),
       transparent: true,
@@ -297,22 +425,23 @@ function buildCarbine() {
       opacity: 1,
     }),
   );
-  reticle.position.set(0, 0, -0.0255);
+  reticle.position.set(0, 0, -0.0240);
   reticle.renderOrder = 40;
-  housing.add(reticle);
+  optic.add(reticle);
 
   // ---- anchors -------------------------------------------------------------
   const muzzleAnchor = new THREE.Object3D();
-  muzzleAnchor.position.set(0, 0.006, -0.532);
+  muzzleAnchor.position.set(0, 0, -BORE_TO_MUZZLE);
   root.add(muzzleAnchor);
 
   const ejectAnchor = new THREE.Object3D();
-  ejectAnchor.position.set(0.032, 0.012, -0.008);
+  ejectAnchor.position.set(0.024, 0.006, -0.045);
   root.add(ejectAnchor);
 
-  // Where the sightline must land when aiming.
+  // Where the sightline must land when aiming. The reticle shares this axis,
+  // so cancelling this offset in the ADS pose puts the dot on screen centre.
   const sightAnchor = new THREE.Object3D();
-  sightAnchor.position.set(0, 0.0765, -0.052);
+  sightAnchor.position.set(0, SIGHT_HEIGHT, -0.0810);
   root.add(sightAnchor);
 
   return { root, muzzleAnchor, ejectAnchor, sightAnchor, reticle, magGroup, lensMat };
@@ -327,11 +456,16 @@ export class Weapon {
 
     this.scene = new THREE.Scene();
     this.scene.environment = environment;
-    this.scene.environmentIntensity = 1.0;
+    // The weapon is the one object always between the player and a blown-out
+    // dawn sky, so it needs more ambient than the world does or it collapses
+    // into a black cut-out.
+    this.scene.environmentIntensity = 0.85;
 
-    this.camera = new THREE.PerspectiveCamera(
-      worldCamera.fov * 0.70, worldCamera.aspect, 0.008, 8,
-    );
+    // Viewmodel FOV is deliberately decoupled from the world camera. The world
+    // runs very wide for peripheral awareness; putting a 0.84 m object through
+    // that lens at arm's length gives it a fisheye bulge and doubles its
+    // apparent size. A separate, tighter lens is what every shooter does.
+    this.camera = new THREE.PerspectiveCamera(FOV_HIP, worldCamera.aspect, 0.006, 8);
 
     const built = buildCarbine();
     this.model = built.root;
@@ -350,18 +484,23 @@ export class Weapon {
     this.rig.add(this.model);
     this.scene.add(this.rig);
 
+
     this.setupLighting();
 
     // --- pose ---------------------------------------------------------------
-    this.hipPosition = new THREE.Vector3(0.088, -0.082, -0.180);
-    this.hipRotation = new THREE.Euler(0.012, 0.052, 0.014);
-    // Aligning the sight to the optical axis: cancel the sight's local offset
-    // and push the weapon forward so the eyebox sits just off the lens.
+    // Hip: muzzle at 58% across and 55% up, receiver running out through the
+    // bottom-right corner, nothing crossing the vertical centreline. The muzzle
+    // rides above the stock purely from perspective convergence, so the numbers
+    // that matter are the offsets, not the on-screen result of any one part.
+    this.hipPosition = new THREE.Vector3(0.126, -0.041, -0.300);
+    this.hipRotation = new THREE.Euler(0.151, 0.062, 0.060);
+    // Aiming cancels the sight's offset from the bore so the optical axis is
+    // the camera axis; ADS_EYE_RELIEF then sets how much eyebox the tube fills.
     const s = this.sightAnchor.position;
-    this.adsPosition = new THREE.Vector3(-s.x, -s.y, -0.155);
+    this.adsPosition = new THREE.Vector3(-s.x, -s.y, -(s.z + OCULAR_OFFSET) - ADS_EYE_RELIEF);
     this.adsRotation = new THREE.Euler(0, 0, 0);
-    this.sprintPosition = new THREE.Vector3(0.135, -0.145, -0.115);
-    this.sprintRotation = new THREE.Euler(0.30, 0.78, -0.20);
+    this.sprintPosition = new THREE.Vector3(0.150, -0.115, -0.245);
+    this.sprintRotation = new THREE.Euler(0.34, 0.62, -0.30);
 
     this.position = this.hipPosition.clone();
     this.rotation = this.hipRotation.clone();
@@ -430,7 +569,7 @@ export class Weapon {
   setupLighting() {
     // Matches the world key so the weapon reads as being in the same place,
     // with a tight fill that keeps the left side of the receiver off black.
-    this.key = new THREE.DirectionalLight(0xffd0a0, 3.1);
+    this.key = new THREE.DirectionalLight(0xffd0a0, 2.6);
     this.key.position.set(0.6, 1.0, 0.35);
     this.key.castShadow = true;
     this.key.shadow.mapSize.set(1024, 1024);
@@ -445,13 +584,22 @@ export class Weapon {
     this.scene.add(this.key);
     this.scene.add(this.key.target);
 
-    this.fill = new THREE.DirectionalLight(0x9dbede, 0.55);
-    this.fill.position.set(-0.8, 0.2, 0.6);
+    // Fixed in view space rather than chased to the sun. Turning to face a
+    // dawn sun would otherwise flatten the weapon into a black cut-out, and no
+    // shooter ships that; a constant three-quarter fill is the standard cheat.
+    this.fill = new THREE.DirectionalLight(0xa8c6e8, 2.6);
+    this.fill.position.set(-0.75, 0.85, 0.9);
     this.scene.add(this.fill);
 
-    this.rim = new THREE.DirectionalLight(0xffb066, 1.15);
+    this.rim = new THREE.DirectionalLight(0xffb066, 1.5);
     this.rim.position.set(-0.3, 0.4, -1.0);
     this.scene.add(this.rim);
+
+    // Sky-over-sand bounce plus a flat floor. A black rifle sits around 0.06
+    // albedo; without this much indirect the shadow side lands under the tone
+    // curve's toe and the whole lower half of the weapon crushes to zero.
+    this.scene.add(new THREE.HemisphereLight(0x9cc0e6, 0x8a6842, 2.1));
+    this.scene.add(new THREE.AmbientLight(0xdfe4ee, 0.8));
   }
 
   /** Aligns the viewmodel key light with the world sun as the player turns. */
@@ -460,7 +608,9 @@ export class Weapon {
     this.key.position.copy(local).multiplyScalar(2).add(new THREE.Vector3(0, 0.2, 0));
     this.key.target.position.set(0, -0.05, -0.2);
     this.key.target.updateMatrixWorld();
-    this.rim.position.copy(local).multiplyScalar(-2);
+    // Bounce sits opposite the sun so a backlit weapon still gets a warm edge
+    // down the side facing the camera.
+    this.rim.position.copy(local).multiplyScalar(-2).add(new THREE.Vector3(0, 0.9, 0));
   }
 
   /* --------------------------------------------------------------- fire -- */
@@ -671,7 +821,7 @@ export class Weapon {
     // off-eyebox in reality, and hiding it keeps the HUD crosshair readable.
     this.reticle.material.opacity = THREE.MathUtils.lerp(0.28, 1.0, player.ads);
 
-    this.camera.fov = this.worldCamera.fov * THREE.MathUtils.lerp(0.70, 0.60, player.ads);
+    this.camera.fov = THREE.MathUtils.lerp(FOV_HIP, FOV_ADS, player.ads);
     this.camera.aspect = this.worldCamera.aspect;
     this.camera.updateProjectionMatrix();
   }
@@ -692,59 +842,61 @@ export class Weapon {
 
 function buildHands() {
   const g = new THREE.Group();
-  const glove = new THREE.MeshStandardMaterial({ color: 0x312c26, roughness: 0.88, metalness: 0.0 });
-  const skin = new THREE.MeshStandardMaterial({ color: 0x8c6247, roughness: 0.72, metalness: 0.0 });
+  const glove = new THREE.MeshStandardMaterial({ color: 0x241f19, roughness: 0.92, metalness: 0.0 });
+  const knuckle = new THREE.MeshStandardMaterial({ color: 0x17161a, roughness: 0.62, metalness: 0.0 });
+  const sleeve = material('canvas', [3, 3], { roughness: 1.0, color: 0x4a4536 });
 
-  const finger = (parent, x, y, z, len, rot, mat) => {
-    const f = new THREE.Mesh(new RoundedBoxGeometry(0.017, 0.017, len, 2, 0.007), mat);
-    f.position.set(x, y, z);
-    f.rotation.set(rot, 0, 0);
-    f.castShadow = true; f.receiveShadow = true;
-    parent.add(f);
-    return f;
+  const piece = (parent, geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z);
+    m.rotation.set(rx, ry, rz);
+    m.castShadow = true; m.receiveShadow = true;
+    parent.add(m);
+    return m;
   };
+  const rbox = (w, h, d, r) => new RoundedBoxGeometry(w, h, d, 2, r);
 
-  // Firing hand wrapped around the pistol grip.
+  // Firing hand: palm on the backstrap, fingers wrapped across the frontstrap,
+  // index laid along the receiver above the trigger.
   const right = new THREE.Group();
-  right.position.set(0.006, -0.098, 0.062);
-  right.rotation.set(0.28, 0, 0);
-  const rPalm = new THREE.Mesh(new RoundedBoxGeometry(0.042, 0.088, 0.052, 3, 0.016), glove);
-  rPalm.position.set(0.016, 0.004, 0.006);
-  rPalm.castShadow = true; rPalm.receiveShadow = true;
-  right.add(rPalm);
-  for (let i = 0; i < 3; i++) finger(right, -0.010, 0.022 - i * 0.024, -0.020, 0.040, -0.5, glove);
-  finger(right, 0.004, 0.040, -0.014, 0.036, -0.9, glove);          // trigger finger
+  right.position.set(0.002, -0.098, 0.016);
+  right.rotation.set(-0.40, 0.05, 0.02);
+  piece(right, rbox(0.048, 0.082, 0.030, 0.013), glove, 0.006, 0.002, 0.030);
+  piece(right, rbox(0.040, 0.066, 0.014, 0.006), knuckle, 0.010, 0.006, 0.040);
+  for (let i = 0; i < 3; i++) {
+    piece(right, rbox(0.046, 0.0165, 0.0210, 0.0075), glove,
+      -0.001, 0.008 - i * 0.0205, -0.0235 + i * 0.0022, 0, 0, -0.10 + i * 0.05);
+    piece(right, rbox(0.0165, 0.0090, 0.0150, 0.004), knuckle,
+      0.020, 0.008 - i * 0.0205, -0.0225 + i * 0.0022);
+  }
+  piece(right, rbox(0.0175, 0.0175, 0.0480, 0.0075), glove, 0.001, 0.0325, -0.0330, 0.34, 0, 0);
+  piece(right, rbox(0.0180, 0.0400, 0.0180, 0.0075), glove, -0.0215, 0.0230, 0.0080, 0, 0, 0.30);
   g.add(right);
 
-  // Support hand on the handguard.
+  // Support hand: C-clamp on the handguard. From the shooter's eye you see the
+  // fingertips come over the top of the tube and the heel of the hand below it,
+  // so those are what get modelled — the palm never faces the lens.
   const left = new THREE.Group();
-  left.position.set(-0.010, -0.026, -0.268);
-  left.rotation.set(0.30, 0.16, -0.55);
-  const lPalm = new THREE.Mesh(new RoundedBoxGeometry(0.046, 0.038, 0.076, 3, 0.016), glove);
-  lPalm.castShadow = true; lPalm.receiveShadow = true;
-  left.add(lPalm);
+  left.position.set(-0.004, -0.006, -0.300);
+  left.rotation.set(0.20, 0.12, -0.26);
+  piece(left, rbox(0.0155, 0.0400, 0.0700, 0.011), glove, -0.0230, -0.0170, 0.0040);
+  piece(left, rbox(0.0250, 0.0150, 0.0620, 0.008), glove, -0.0130, -0.0300, 0.0030);
   for (let i = 0; i < 4; i++) {
-    const f = finger(left, 0.020, 0.006, -0.026 + i * 0.021, 0.044, 0, glove);
-    f.rotation.set(0, 0, -1.15 - i * 0.05);
-    f.position.set(0.016 + i * 0.0008, -0.014, -0.026 + i * 0.021);
+    const z = -0.0270 + i * 0.0185;
+    piece(left, rbox(0.0300, 0.0165, 0.0158, 0.0072), glove, 0.0025, 0.0215 - i * 0.0012, z, 0, 0, 0.22);
+    piece(left, rbox(0.0130, 0.0060, 0.0130, 0.0025), knuckle, 0.0060, 0.0290 - i * 0.0012, z);
+    piece(left, rbox(0.0135, 0.0210, 0.0150, 0.0060), glove, 0.0175, 0.0075 - i * 0.0010, z, 0, 0, -0.30);
   }
-  const thumb = finger(left, -0.020, 0.008, -0.012, 0.038, 0, glove);
-  thumb.rotation.set(0.2, 0, 0.9);
+  piece(left, rbox(0.0160, 0.0150, 0.0480, 0.0068), glove, -0.0215, 0.0135, -0.0290, 0.10, 0, -0.12);
   g.add(left);
 
-  // Cuffs — a hard edge where the glove meets the sleeve stops the hands
-  // from reading as floating blobs at the bottom of frame.
-  const cuffMat = new THREE.MeshStandardMaterial({ color: 0x4a4437, roughness: 0.93 });
-  const rCuff = new THREE.Mesh(new THREE.CylinderGeometry(0.030, 0.034, 0.075, 14), cuffMat);
-  rCuff.position.set(0.024, -0.150, 0.098);
-  rCuff.rotation.set(0.85, 0, 0.18);
-  rCuff.castShadow = true;
-  g.add(rCuff);
-  const lCuff = new THREE.Mesh(new THREE.CylinderGeometry(0.030, 0.036, 0.085, 14), cuffMat);
-  lCuff.position.set(-0.056, -0.078, -0.252);
-  lCuff.rotation.set(0.42, 0.2, -1.02);
-  lCuff.castShadow = true;
-  g.add(lCuff);
+  // Cuffs — a hard edge where the glove meets the sleeve stops the hands from
+  // reading as blobs. The support forearm is kept short and aimed away from the
+  // lens: run it out to the side and it becomes a slab floating in mid-frame.
+  piece(g, new THREE.CylinderGeometry(0.0320, 0.0385, 0.105, 16), sleeve,
+    0.0250, -0.1560, 0.0920, 1.06, 0, 0.20);
+  piece(g, new THREE.CylinderGeometry(0.0290, 0.0335, 0.070, 16), sleeve,
+    -0.0300, -0.0520, -0.2620, 0.95, 0.20, -0.62);
 
   return g;
 }
