@@ -14,7 +14,7 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
-import { Pass } from 'three/addons/postprocessing/Pass.js';
+import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 
 /* ------------------------------------------------------ viewmodel pass -- */
 
@@ -52,21 +52,22 @@ class ViewmodelPass extends Pass {
 }
 
 /* ------------------------------------------------- volumetric sun shafts -- */
-// Occlusion-masked radial blur toward the sun's screen position. The sky near
-// the sun is by far the brightest thing in frame, so thresholding luminance
-// and smearing it radially reproduces crepuscular rays through the outpost
-// geometry without a second scene render.
 
 const ShaftsShader = {
   uniforms: {
     tDiffuse: { value: null },
+    tMask: { value: null },
     uSunScreen: { value: new THREE.Vector2(0.5, 0.5) },
     uIntensity: { value: 0.62 },
-    uDecay: { value: 0.962 },
-    uDensity: { value: 0.72 },
-    uWeight: { value: 0.42 },
-    uThreshold: { value: 0.86 },
-    uTint: { value: new THREE.Color(0xffc99a) },
+    uDecay: { value: 0.966 },
+    uDensity: { value: 1.02 },
+    uWeight: { value: 1.0 },
+    // How far from the sun a shaft can still be seen, in screen widths. Real
+    // in-scatter reaches everywhere, but without a depth buffer this pass
+    // cannot tell a distant silhouette from a near one, and letting it run to
+    // the frame edge lifts the whole foreground into a flat veil.
+    uReach: { value: 0.62 },
+    uTint: { value: new THREE.Color(0xffc48c) },
     uVisible: { value: 1.0 },
     uAspect: { value: 1.0 },
   },
@@ -75,15 +76,13 @@ const ShaftsShader = {
     void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
   `,
   fragmentShader: /* glsl */`
-    uniform sampler2D tDiffuse;
+    uniform sampler2D tDiffuse, tMask;
     uniform vec2  uSunScreen;
-    uniform float uIntensity, uDecay, uDensity, uWeight, uThreshold, uVisible, uAspect;
+    uniform float uIntensity, uDecay, uDensity, uWeight, uReach, uVisible, uAspect;
     uniform vec3  uTint;
     varying vec2 vUv;
 
-    const int SAMPLES = 48;
-
-    float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+    const int SAMPLES = 40;
 
     void main() {
       vec4 scene = texture2D(tDiffuse, vUv);
@@ -92,7 +91,7 @@ const ShaftsShader = {
       vec2 delta = (vUv - uSunScreen) * (uDensity / float(SAMPLES));
       vec2 uv = vUv;
       float decay = 1.0;
-      vec3 accum = vec3(0.0);
+      float accum = 0.0;
 
       // Per-pixel dither breaks the banding that fixed-step raymarching
       // otherwise leaves across smooth sky gradients.
@@ -101,22 +100,121 @@ const ShaftsShader = {
 
       for (int i = 0; i < SAMPLES; i++) {
         uv -= delta;
-        vec3 s = texture2D(tDiffuse, clamp(uv, 0.0, 1.0)).rgb;
-        // Only the sky above the occluders contributes to a shaft.
-        float mask = smoothstep(uThreshold, uThreshold + 0.35, luma(s));
-        accum += s * mask * decay * uWeight;
+        accum += texture2D(tMask, clamp(uv, 0.0, 1.0)).r * decay * uWeight;
         decay *= uDecay;
       }
       accum /= float(SAMPLES);
 
       // Shafts fade out as the sun leaves frame, and never bloom behind you.
       vec2 d = (vUv - uSunScreen) * vec2(uAspect, 1.0);
-      float falloff = 1.0 - smoothstep(0.15, 1.25, length(d));
+      float falloff = 1.0 - smoothstep(0.03, uReach, length(d));
 
       gl_FragColor = vec4(scene.rgb + accum * uTint * uIntensity * falloff * uVisible, scene.a);
     }
   `,
 };
+
+/**
+ * Crepuscular rays, driven by a real occlusion mask rather than by frame luma.
+ *
+ * Thresholding the composited frame is the cheap way to do this and it does
+ * not work at dawn: the sky is barely brighter than the sunlit sand, so any
+ * threshold low enough to catch the sky catches the ground too and the pass
+ * collapses into an omnidirectional glow. Drawing the occluders into a
+ * half-resolution black-on-white mask separates the two exactly, and costs one
+ * cheap depth-only-ish scene pass with every material replaced by flat black.
+ */
+class SunShaftsPass extends Pass {
+  constructor(scene, camera, width, height) {
+    super();
+    this.scene = scene;
+    this.camera = camera;
+
+    this.maskTarget = new THREE.WebGLRenderTarget(1, 1, {
+      type: THREE.UnsignedByteType,
+      colorSpace: THREE.LinearSRGBColorSpace,
+      depthBuffer: true,
+    });
+    this.setSize(width, height);
+
+    this.occluder = new THREE.MeshBasicMaterial({ color: 0x000000, fog: false });
+    this.material = new THREE.ShaderMaterial({
+      uniforms: THREE.UniformsUtils.clone(ShaftsShader.uniforms),
+      vertexShader: ShaftsShader.vertexShader,
+      fragmentShader: ShaftsShader.fragmentShader,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.uniforms = this.material.uniforms;
+    this.fsQuad = new FullScreenQuad(this.material);
+
+    this._hidden = [];
+    this._clear = new THREE.Color();
+  }
+
+  setSize(width, height) {
+    this.maskTarget.setSize(Math.max(2, width >> 1), Math.max(2, height >> 1));
+  }
+
+  /**
+   * White where open sky reaches the camera, black wherever a solid blocks it.
+   *
+   * Transparent geometry is left out. The override material has no opacity, so
+   * smoke, tracers and decals would all draw as fully opaque black and cut
+   * hard notches out of the light where there is nothing but haze.
+   */
+  renderMask(renderer) {
+    const hidden = this._hidden;
+    hidden.length = 0;
+    this.scene.traverseVisible((o) => {
+      if (o.isMesh || o.isPoints || o.isLine || o.isSprite) {
+        const m = o.material;
+        const transparent = Array.isArray(m) ? m.some((x) => x && x.transparent) : m && m.transparent;
+        if (transparent) hidden.push(o);
+      } else if (o.isSky || o.name === 'sky') {
+        hidden.push(o);
+      }
+    });
+    for (const o of hidden) o.visible = false;
+
+    const target = renderer.getRenderTarget();
+    const override = this.scene.overrideMaterial;
+    const shadowAuto = renderer.shadowMap.autoUpdate;
+    renderer.getClearColor(this._clear);
+    const alpha = renderer.getClearAlpha();
+
+    // The shadow map was already built for this frame by the beauty pass.
+    renderer.shadowMap.autoUpdate = false;
+    this.scene.overrideMaterial = this.occluder;
+    renderer.setClearColor(0xffffff, 1);
+    renderer.setRenderTarget(this.maskTarget);
+    renderer.clear();
+    renderer.render(this.scene, this.camera);
+
+    this.scene.overrideMaterial = override;
+    renderer.setClearColor(this._clear, alpha);
+    renderer.setRenderTarget(target);
+    renderer.shadowMap.autoUpdate = shadowAuto;
+    for (const o of hidden) o.visible = true;
+  }
+
+  render(renderer, writeBuffer, readBuffer) {
+    if (this.uniforms.uVisible.value > 0.001) this.renderMask(renderer);
+
+    this.uniforms.tDiffuse.value = readBuffer.texture;
+    this.uniforms.tMask.value = this.maskTarget.texture;
+    renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
+    if (this.clear) renderer.clear();
+    this.fsQuad.render(renderer);
+  }
+
+  dispose() {
+    this.maskTarget.dispose();
+    this.occluder.dispose();
+    this.material.dispose();
+    this.fsQuad.dispose();
+  }
+}
 
 /* ------------------------------------------------------------- the grade -- */
 
@@ -135,14 +233,17 @@ const GradeShader = {
     uTime: { value: 0 },
     uResolution: { value: new THREE.Vector2(1, 1) },
     uExposure: { value: 1.0 },
-    uAberration: { value: 0.0014 },
-    uVignette: { value: 0.34 },
-    uGrain: { value: 0.022 },
-    uSharpen: { value: 0.30 },
-    uContrast: { value: 1.045 },
-    uSaturation: { value: 1.05 },
-    uLift: { value: new THREE.Vector3(0.004, 0.005, 0.011) },
-    uGain: { value: new THREE.Vector3(1.025, 1.000, 0.960) },
+    uAberration: { value: 0.0007 },
+    uVignette: { value: 0.30 },
+    // Also dithers the 8-bit composite buffers, which quantise the shadows
+    // hard enough to band without it.
+    uGrain: { value: 0.026 },
+    uSharpen: { value: 0.26 },
+    uContrast: { value: 1.22 },
+    uSaturation: { value: 1.06 },
+    uLift: { value: new THREE.Vector3(0.011, 0.016, 0.030) },
+    uGain: { value: new THREE.Vector3(1.030, 1.000, 0.968) },
+    uSplit: { value: 0.20 },
     uHurt: { value: 0.0 },
     uFlash: { value: 0.0 },
   },
@@ -155,7 +256,7 @@ const GradeShader = {
     uniform vec2  uResolution;
     uniform vec3  uLift, uGain;
     uniform float uTime, uExposure, uAberration, uVignette, uGrain,
-                  uSharpen, uContrast, uSaturation, uHurt, uFlash;
+                  uSharpen, uContrast, uSaturation, uSplit, uHurt, uFlash;
     varying vec2 vUv;
 
     float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
@@ -202,19 +303,30 @@ const GradeShader = {
       color += (color - max(blur, 0.0) * 0.25) * uSharpen;
       color = max(color, 0.0);
 
-      // --- exposure and tone map ------------------------------------------
-      color = aces(color * uExposure);
+      // --- exposure, contrast, tone map -------------------------------------
+      color *= uExposure;
+      // Contrast pivoted on scene mid-grey, applied where it belongs: before
+      // the curve. The straight (x - p) * c + p form drives everything below
+      // p - p/c negative, and clamping that is what flattened the shadows
+      // into a dead black with no separation in them. A power about the same
+      // pivot cannot go negative, and the tone curve's shoulder then absorbs
+      // what the same boost does to the highlights.
+      color = 0.18 * pow(max(color, 1e-5) / 0.18, vec3(uContrast));
+      color = aces(color);
 
       // --- grade, in display-linear ----------------------------------------
-      color = color * uGain + uLift;
-      color = (color - 0.18) * uContrast + 0.18;
-      color = max(color, 0.0);
+      color = max(color * uGain, 0.0);
       color = mix(vec3(luma(color)), color, uSaturation);
 
       // Cool the shadows against the warm dawn key — the split-tone that
       // reads as "modern military shooter" more than any other single choice.
       float shadowMask = 1.0 - smoothstep(0.0, 0.34, luma(color));
-      color = mix(color, color * vec3(0.90, 0.965, 1.12), shadowMask * 0.35);
+      color = mix(color, color * vec3(0.90, 0.965, 1.12), shadowMask * uSplit);
+
+      // Lifted, tinted black point. Print film has a toe rather than a cliff,
+      // and the cold cast sitting under the darkest part of the frame is most
+      // of what separates a dawn exterior from an underexposed one.
+      color = uLift + color * (1.0 - uLift);
 
       if (uHurt > 0.001) {
         color = mix(color, vec3(luma(color)) * vec3(1.35, 0.30, 0.24), uHurt * 0.55);
@@ -290,10 +402,11 @@ export class PostStack {
     this.gtao.blendIntensity = 1.0;
     this.composer.addPass(this.gtao);
 
-    this.shafts = new ShaderPass(ShaftsShader);
+    this.shafts = new SunShaftsPass(scene, camera, w, h);
+    this.shafts.uniforms.uAspect.value = w / h;
     this.composer.addPass(this.shafts);
 
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.30, 0.72, 0.86);
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.28, 0.55, 0.70);
     this.composer.addPass(this.bloom);
 
     this.grade = new ShaderPass(GradeShader);
@@ -321,10 +434,13 @@ export class PostStack {
 
   /** Projects the sun into screen space so the shaft pass knows where to smear. */
   updateSun(sunDirection) {
-    const world = this.camera.position.clone().add(sunDirection.clone().multiplyScalar(6000));
+    // The proxy has to sit inside the far plane. Projecting one at 6 km put
+    // it past it, every frame reported the sun as behind the camera, and the
+    // shaft pass switched itself off — which is why it never contributed.
+    const world = this.camera.position.clone()
+      .addScaledVector(sunDirection, this.camera.far * 0.5);
     this._sunNDC.copy(world).project(this.camera);
 
-    const behind = this._sunNDC.z > 1;
     const forward = new THREE.Vector3();
     this.camera.getWorldDirection(forward);
     const facing = forward.dot(sunDirection);
@@ -332,7 +448,7 @@ export class PostStack {
     const u = this.shafts.uniforms;
     u.uSunScreen.value.set(this._sunNDC.x * 0.5 + 0.5, this._sunNDC.y * 0.5 + 0.5);
     // Ramp off smoothly as the sun swings behind the player.
-    u.uVisible.value = behind || facing <= 0 ? 0 : Math.min(1, Math.max(0, (facing - 0.05) / 0.45));
+    u.uVisible.value = Math.min(1, Math.max(0, (facing - 0.05) / 0.45));
   }
 
   /** Enables screen-space AO and retunes it for the current frustum. */
@@ -358,6 +474,7 @@ export class PostStack {
     this.composer.setSize(width, height);
     this.gtao.setSize(w, h);
     this.bloom.setSize(w, h);
+    this.shafts.setSize(w, h);
     this.grade.uniforms.uResolution.value.set(w, h);
     this.shafts.uniforms.uAspect.value = width / height;
   }

@@ -1,10 +1,10 @@
 // First-person weapon: an M4A1-pattern carbine, built from primitives.
 //
-// The viewmodel lives in its own scene rendered with a cleared depth buffer
-// and a narrower FOV than the world camera. That is the standard solution to
-// the two problems a camera-parented weapon always has — clipping through
-// geometry, and the barrel-distortion you get when a 0.4 m object is rendered
-// through an 80-degree lens.
+// The viewmodel lives in its own scene, rendered with a cleared depth buffer
+// through its own lens. That solves the two problems a camera-parented weapon
+// always has — clipping through geometry, and the barrel distortion you get
+// when a 0.84 m object 30 cm from the eye is put through the world's very wide
+// field of view.
 //
 // Pose is composed additively: base -> stance (hip/ads/sprint) -> bob -> sway
 // -> recoil spring -> reload track. Each layer is independent, so any one can
@@ -456,9 +456,8 @@ export class Weapon {
 
     this.scene = new THREE.Scene();
     this.scene.environment = environment;
-    // The weapon is the one object always between the player and a blown-out
-    // dawn sky, so it needs more ambient than the world does or it collapses
-    // into a black cut-out.
+    // Held back below the world's: at full strength a dawn sky reflects off
+    // every small anodised part and the carbine reads as bare aluminium.
     this.scene.environmentIntensity = 0.85;
 
     // Viewmodel FOV is deliberately decoupled from the world camera. The world
@@ -483,7 +482,6 @@ export class Weapon {
     this.rig = new THREE.Group();
     this.rig.add(this.model);
     this.scene.add(this.rig);
-
 
     this.setupLighting();
 
@@ -569,7 +567,7 @@ export class Weapon {
   setupLighting() {
     // Matches the world key so the weapon reads as being in the same place,
     // with a tight fill that keeps the left side of the receiver off black.
-    this.key = new THREE.DirectionalLight(0xffd0a0, 2.6);
+    this.key = new THREE.DirectionalLight(0xffd0a0, 3.0);
     this.key.position.set(0.6, 1.0, 0.35);
     this.key.castShadow = true;
     this.key.shadow.mapSize.set(1024, 1024);
@@ -587,8 +585,10 @@ export class Weapon {
     // Fixed in view space rather than chased to the sun. Turning to face a
     // dawn sun would otherwise flatten the weapon into a black cut-out, and no
     // shooter ships that; a constant three-quarter fill is the standard cheat.
-    this.fill = new THREE.DirectionalLight(0xa8c6e8, 2.6);
-    this.fill.position.set(-0.75, 0.85, 0.9);
+    // Kept low and to the side. Raised overhead it lights every top face at
+    // once and the receiver reads as light grey plastic instead of phosphate.
+    this.fill = new THREE.DirectionalLight(0xb6c8dc, 2.3);
+    this.fill.position.set(-0.90, 0.42, 0.85);
     this.scene.add(this.fill);
 
     this.rim = new THREE.DirectionalLight(0xffb066, 1.5);
@@ -760,7 +760,9 @@ export class Weapon {
 
     // --- idle breathing -------------------------------------------------------
     this._breathe += dt;
-    const breathAmp = THREE.MathUtils.lerp(1, 0.30, player.ads) * (1 - this._bobWeight * 0.6);
+    // Aiming all but kills the breathing loop: the dot has to sit on the point
+    // of impact, and a couple of pixels of drift reads as a misaligned sight.
+    const breathAmp = THREE.MathUtils.lerp(1, 0.10, player.ads) * (1 - this._bobWeight * 0.6);
     bob.y += Math.sin(this._breathe * 1.35) * 0.0026 * breathAmp;
     bob.x += Math.sin(this._breathe * 0.83) * 0.0019 * breathAmp;
     bobRot.z += Math.sin(this._breathe * 0.71) * 0.007 * breathAmp;
@@ -776,12 +778,18 @@ export class Weapon {
     this._sway.y += this._swayVel.y * dt;
 
     // --- recoil springs --------------------------------------------------------
+    // The springs are clamped, not just damped. Sustained fire otherwise stacks
+    // impulses faster than they decay and walks the receiver into the lens.
     const rk = 190, rd = 21;
+    const posLimit = { x: 0.018, y: 0.018, z: 0.042 };
+    const rotLimit = { x: 0.085, y: 0.045, z: 0.065 };
     for (const axis of ['x', 'y', 'z']) {
       this._recoilVel[axis] += (-this._recoil[axis] * rk - this._recoilVel[axis] * rd) * dt;
-      this._recoil[axis] += this._recoilVel[axis] * dt;
+      this._recoil[axis] = THREE.MathUtils.clamp(
+        this._recoil[axis] + this._recoilVel[axis] * dt, -posLimit[axis], posLimit[axis]);
       this._recoilRotVel[axis] += (-this._recoilRot[axis] * rk * 0.85 - this._recoilRotVel[axis] * rd) * dt;
-      this._recoilRot[axis] += this._recoilRotVel[axis] * dt;
+      this._recoilRot[axis] = THREE.MathUtils.clamp(
+        this._recoilRot[axis] + this._recoilRotVel[axis] * dt, -rotLimit[axis], rotLimit[axis]);
     }
 
     // --- compose ---------------------------------------------------------------
@@ -844,9 +852,9 @@ export class Weapon {
 
 function buildHands() {
   const g = new THREE.Group();
-  const glove = new THREE.MeshStandardMaterial({ color: 0x241f19, roughness: 0.92, metalness: 0.0 });
-  const knuckle = new THREE.MeshStandardMaterial({ color: 0x17161a, roughness: 0.62, metalness: 0.0 });
-  const sleeve = material('canvas', [3, 3], { roughness: 1.0, color: 0x4a4536 });
+  const glove = new THREE.MeshStandardMaterial({ color: 0x171310, roughness: 0.93, metalness: 0.0 });
+  const knuckle = new THREE.MeshStandardMaterial({ color: 0x0e0d0c, roughness: 0.66, metalness: 0.0 });
+  const sleeve = material('canvas', [3, 3], { roughness: 1.0, color: 0x34302a });
 
   const piece = (parent, geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
     const m = new THREE.Mesh(geo, mat);
@@ -879,10 +887,10 @@ function buildHands() {
   // fingertips come over the top of the tube and the heel of the hand below it,
   // so those are what get modelled — the palm never faces the lens.
   const left = new THREE.Group();
-  left.position.set(-0.004, -0.006, -0.300);
+  left.position.set(-0.004, -0.006, -0.288);
   left.rotation.set(0.20, 0.12, -0.26);
-  piece(left, rbox(0.0155, 0.0400, 0.0700, 0.011), glove, -0.0230, -0.0170, 0.0040);
-  piece(left, rbox(0.0250, 0.0150, 0.0620, 0.008), glove, -0.0130, -0.0300, 0.0030);
+  piece(left, rbox(0.0145, 0.0370, 0.0650, 0.011), glove, -0.0230, -0.0175, 0.0040);
+  piece(left, rbox(0.0230, 0.0140, 0.0580, 0.008), glove, -0.0130, -0.0295, 0.0030);
   for (let i = 0; i < 4; i++) {
     const z = -0.0270 + i * 0.0185;
     piece(left, rbox(0.0300, 0.0165, 0.0158, 0.0072), glove, 0.0025, 0.0215 - i * 0.0012, z, 0, 0, 0.22);

@@ -6,10 +6,12 @@
 // the difference between "programmer blockout" and "art-passed".
 //
 // The sun sits 9.5° above the horizon to the east-south-east, so every metre
-// of height throws six metres of shadow. Vertical elements are therefore the
-// cheapest lighting tool in the level: poles, cables, railings and parapets
-// are placed east of the courtyard specifically so their shadows rake back
-// across the sand toward the player.
+// of height throws six metres of shadow back toward the west. That ratio
+// dictates where things stand: a seven-metre pole has to be forty metres east
+// of the sand it is meant to stripe, while anything meant to shadow the ground
+// at the player's feet has to be knee to chest high and close. Both kinds are
+// placed deliberately — the raking bars they lay across the courtyard are the
+// strongest dawn cue in the level.
 //
 // Exposes:
 //   group        scene contents
@@ -36,6 +38,30 @@ const WALL_X = 31, WALL_Z = 26;
 /* Horizontal unit vector pointing at the sun (azimuth 104°). Wind ripples run
  * across it so their faces alternate lit/unlit under the grazing key. */
 const SUN_X = 0.9703, SUN_Z = -0.2419;
+
+/* A bag is 58 cm across and the burlap map carries 34 threads per tile, so the
+ * tiling has to be this high before the weave stops reading as basketwork. The
+ * softened normal is the other half of the fix: at full strength the thread
+ * pattern aliases into rainbow moiré as soon as the bags are a few metres out. */
+const SANDBAG_WEAVE = [5.0, 3.5];
+const SANDBAG_TWEAK = { normalScale: new THREE.Vector2(0.85, 0.85) };
+
+/** Shortest distance from a point to any segment of a set of xz polylines. */
+function polyDistance(x, z, lines) {
+  let best = Infinity;
+  for (let i = 0; i < lines.length; i++) {
+    const p = lines[i];
+    for (let k = 0; k < p.length - 1; k++) {
+      const ax = p[k][0], az = p[k][1];
+      const dx = p[k + 1][0] - ax, dz = p[k + 1][1] - az;
+      const t = clamp(((x - ax) * dx + (z - az) * dz) / (dx * dx + dz * dz), 0, 1);
+      const qx = x - (ax + dx * t), qz = z - (az + dz * t);
+      const d = qx * qx + qz * qz;
+      if (d < best) best = d;
+    }
+  }
+  return Math.sqrt(best);
+}
 
 /* Deterministic RNG so the level is identical every run (and every screenshot). */
 function rng(seed) {
@@ -169,7 +195,10 @@ export class Level {
       const a2 = p * 0.58 + q * 0.05 + 1.7;
       const ripple = (Math.sin(a1) + Math.sin(a1 * 2) * 0.28) * 0.036
         + (Math.sin(a2) + Math.sin(a2 * 2) * 0.24) * 0.066;
-      h += flat * (swell + ripple * amp);
+      // Wheels grade the ripple out of the roadway; without this the track
+      // ribbon inherits it and the ruts stop reading as ruts.
+      const groom = 1 - 0.88 * (1 - smoothstep(polyDistance(x, z, this._tracks), 1.4, 3.0));
+      h += flat * (swell + ripple * amp * groom);
     }
 
     // Building footprints sit dead level, with sand banked against the walls.
@@ -285,20 +314,7 @@ export class Level {
 
   /** Worn footpaths, as distance to a handful of polylines. */
   pathWear(x, z) {
-    const paths = this._paths;
-    let w = 0;
-    for (let i = 0; i < paths.length; i++) {
-      const p = paths[i];
-      for (let k = 0; k < p.length - 1; k++) {
-        const ax = p[k][0], az = p[k][1], bx = p[k + 1][0], bz = p[k + 1][1];
-        const dx = bx - ax, dz = bz - az;
-        const t = clamp(((x - ax) * dx + (z - az) * dz) / (dx * dx + dz * dz), 0, 1);
-        const qx = x - (ax + dx * t), qz = z - (az + dz * t);
-        const dist = Math.sqrt(qx * qx + qz * qz);
-        if (dist < 1.5) w = Math.max(w, 1 - smoothstep(dist, 0.35, 1.5));
-      }
-    }
-    return w;
+    return 1 - smoothstep(polyDistance(x, z, this._paths), 0.35, 1.5);
   }
 
   /* ------------------------------------------------------------- ground -- */
@@ -738,9 +754,8 @@ export class Level {
     }
 
     // Sandbagged firing position on the parapet.
-    const bagGeo = new THREE.SphereGeometry(0.27, 10, 7);
-    bagGeo.scale(1.0, 0.6, 0.72);
-    const bags = new THREE.InstancedMesh(bagGeo, this.mat('burlap', [1.4, 1]), 22);
+    const bags = new THREE.InstancedMesh(this.bagGeometry(),
+      this.mat('burlap', SANDBAG_WEAVE, SANDBAG_TWEAK), 22);
     bags.castShadow = true; bags.receiveShadow = true;
     const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
     const p = new THREE.Vector3(), s = new THREE.Vector3();
@@ -751,7 +766,7 @@ export class Level {
         p.set((i / cnt - 0.5) * w * 0.55 + w * 0.1, y + 0.17 + row * 0.3, -d / 2 + 0.55);
         e.set(0, (this.rand() - 0.5) * 0.4, (this.rand() - 0.5) * 0.14);
         q.setFromEuler(e);
-        const sc = 0.95 + this.rand() * 0.12;
+        const sc = 0.90 + this.rand() * 0.12;
         s.set(sc, sc, sc);
         m4.compose(p, q, s);
         bags.setMatrixAt(n++, m4);
@@ -764,14 +779,36 @@ export class Level {
 
   /* ------------------------------------------------------ props: bagged -- */
 
-  /** Stacked sandbag emplacement. Bags are squashed spheres, jittered per row. */
+  /**
+   * One filled sack, shared by every emplacement on the map. A plain squashed
+   * sphere reads as a bean; the slump and the lumps are what make a row of
+   * them read as sand in hessian.
+   */
+  bagGeometry() {
+    if (this._bagGeo) return this._bagGeo;
+    const geo = new THREE.SphereGeometry(0.29, 14, 10);
+    geo.scale(1.0, 0.62, 0.74);
+    const p = geo.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+      const lump = perlin(x * 6.5 + 3.1, z * 6.5 + 5.7, 64, 64) * 0.034
+        + perlin(y * 12.0, x * 12.0, 64, 64) * 0.016;
+      // Weight settles to the bottom, so the crown slumps and the base spreads.
+      const settle = y > 0 ? -y * 0.14 : -y * 0.22;
+      p.setXYZ(i, x * (1 + lump * 1.5), y + settle + lump * 0.6, z * (1 + lump * 1.5));
+    }
+    geo.computeVertexNormals();
+    this._bagGeo = geo;
+    return geo;
+  }
+
+  /** Stacked sandbag emplacement. Bags are jittered and staggered per row. */
   sandbags(x, z, length, ry, rows = 3) {
     const g = new THREE.Group();
     g.position.set(x, this.groundHeight(x, z), z);
     g.rotation.y = ry;
-    const mat = this.mat('burlap', [1.4, 1]);
-    const bagGeo = new THREE.SphereGeometry(0.29, 12, 8);
-    bagGeo.scale(1.0, 0.62, 0.72);
+    const mat = this.mat('burlap', SANDBAG_WEAVE, SANDBAG_TWEAK);
+    const bagGeo = this.bagGeometry();
 
     const perRow = Math.max(2, Math.round(length / 0.52));
     const inst = new THREE.InstancedMesh(bagGeo, mat, perRow * rows + rows * 2);
@@ -1635,9 +1672,8 @@ export class Level {
       g.add(rung);
     }
     // Sandbagged parapet on the deck.
-    const bagGeo = new THREE.SphereGeometry(0.26, 10, 7);
-    bagGeo.scale(1, 0.6, 0.72);
-    const bags = new THREE.InstancedMesh(bagGeo, this.mat('burlap', [1.4, 1]), 16);
+    const bags = new THREE.InstancedMesh(this.bagGeometry(),
+      this.mat('burlap', SANDBAG_WEAVE, SANDBAG_TWEAK), 16);
     bags.castShadow = true; bags.receiveShadow = true;
     const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
     const p = new THREE.Vector3(), s = new THREE.Vector3();
@@ -1650,7 +1686,7 @@ export class Level {
           Math.sin(a) * t - Math.cos(a) * S * 0.7);
         e.set(0, this.rand() * TAU, (this.rand() - 0.5) * 0.12);
         q.setFromEuler(e);
-        const sc = 0.95 + this.rand() * 0.1;
+        const sc = 0.88 + this.rand() * 0.12;
         s.set(sc, sc, sc);
         m4.compose(p, q, s);
         bags.setMatrixAt(n++, m4);
@@ -1696,7 +1732,7 @@ export class Level {
       if (inside && this.rand() < 0.82) continue;                    // keep the yard clear
       // A metre-wide boulder inside the wire reads as a hole punched in the
       // courtyard, so anything that survives the cull in there stays small.
-      const sc = (0.09 + Math.pow(this.rand(), 2.4) * 0.9) * (inside ? 0.34 : 1);
+      const sc = (0.09 + Math.pow(this.rand(), 2.4) * 0.9) * (inside ? 0.24 : 1);
       p.set(x, this.groundHeight(x, z) + sc * 0.28, z);
       e.set(this.rand() * 0.5, this.rand() * TAU, this.rand() * 0.5);
       q.setFromEuler(e);
@@ -1790,7 +1826,9 @@ export class Level {
       const x = cx + (this.rand() - 0.5) * clump, z = cz + (this.rand() - 0.5) * clump;
       if (Math.abs(x) > 44 || Math.abs(z) > 38) continue;
       if (fbm(x / 90 + 0.5, z / 90 + 0.5, 3, 14) + 0.16 < this.rand() * 0.5) continue;
-      const sc = 0.016 + Math.pow(this.rand(), 3.4) * 0.24;
+      // Capped at fist size: a cobble any larger than this in the near field
+      // is a black shard against the low sun, not a stone.
+      const sc = 0.014 + Math.pow(this.rand(), 3.4) * 0.15;
       p.set(x, this.groundHeight(x, z) + sc * 0.26, z);
       e.set(this.rand() * 0.7, this.rand() * TAU, this.rand() * 0.7);
       q.setFromEuler(e);
@@ -1921,14 +1959,20 @@ export class Level {
       [[13, 5], [16, 9], [17, 12]],
     ];
 
+    // Vehicle routes in from the gate, forking to the block and the huts. The
+    // west leg runs almost straight at the hero camera, which is the leading
+    // line the whole composition hangs off. Declared before the ground so the
+    // terrain can grade its ripples out from under them.
+    this._tracks = [
+      [[0, 32], [0.4, 24], [-1.6, 16], [-2.6, 9], [-4.8, 3.4], [-9.4, 0.4],
+        [-14.6, -2.2], [-20, -4.6], [-26, -6.0]],
+      [[-3.4, 7.0], [1.5, 3.6], [7.0, -1.4], [11.5, -6.6], [15.0, -11.5]],
+    ];
+
     this.buildGround();
 
-    // Vehicle track in from the gate, forking to the block and the huts. The
-    // west leg runs almost straight at the hero camera, which is the leading
-    // line the whole composition hangs off.
-    this.track([[0, 32], [0.4, 24], [-1.6, 16], [-2.6, 9], [-4.8, 3.4], [-9.4, 0.4],
-      [-14.6, -2.2], [-20, -4.6], [-26, -6.0]], 3.4, 0.075);
-    this.track([[-3.4, 7.0], [1.5, 3.6], [7.0, -1.4], [11.5, -6.6], [15.0, -11.5]], 3.0, 0.065);
+    this.track(this._tracks[0], 3.4, 0.075);
+    this.track(this._tracks[1], 3.0, 0.065);
     this.hardstand(6.5, 1.5, 10.5);
 
     this.buildPerimeter();

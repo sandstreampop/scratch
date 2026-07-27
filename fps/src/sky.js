@@ -10,23 +10,113 @@ import { Sky } from 'three/addons/objects/Sky.js';
 
 /** 0547 hrs: sun just clear of the ridgeline, heavy dust in the air. */
 export const PRESET = {
-  elevation: 9.5,          // degrees above horizon
+  elevation: 8.6,          // degrees above horizon
   azimuth: 104,            // degrees, clockwise from north
-  turbidity: 4.6,          // dust load
-  rayleigh: 2.15,
-  mieCoefficient: 0.0032,
-  mieDirectionalG: 0.79,
-  exposure: 1.0,
-  sunColor: 0xffc389,      // warm dawn key
-  sunIntensity: 4.4,
-  skyColor: 0x8fb6dd,      // zenith bounce
-  groundColor: 0x6b5535,   // sand bounce
-  hemiIntensity: 0.55,
-  fogColor: 0xcfb392,
-  fogDensity: 0.0026,
-  skyLuminance: 1.35,        // scales the analytic IBL
-  environmentIntensity: 1.0,
+  turbidity: 3.1,          // dust load
+  rayleigh: 2.9,
+  mieCoefficient: 0.0048,
+  mieDirectionalG: 0.865,
+  exposure: 1.12,
+  // Preetham is scene-referred and lands the dawn dome around 0.6-0.8 linear,
+  // which the tone curve then flattens into a single pale wash across the top
+  // of the frame. Scaling it down puts the whole gradient back on the curve's
+  // steep section, where the eye can read it, and leaves the solar disc as the
+  // only thing in the frame that clips.
+  skyGain: 0.30,
+  // Ambient hue is the trap here. A saturated orange sun halo and a saturated
+  // blue zenith push red and blue from opposite sides and leave green behind,
+  // and every shadowed surface in the frame comes out magenta. Both ends of
+  // the ambient are deliberately pulled toward green.
+  sunColor: 0xffd2a4,      // warm dawn key
+  sunIntensity: 9.4,
+  skyColor: 0x86a9d2,      // zenith
+  groundColor: 0x7a6042,   // sand bounce
+  hemiIntensity: 0.30,
+  hazeColor: 0xacb8c2,     // aerial perspective, away from the sun
+  hazeSunColor: 0xffcb9c,  // ... and looking into it
+  fogDensity: 0.0092,
+  fogHeight: 15,           // metres; e-folding height of the dust layer
+  fillColor: 0xa6c2e6,     // cool sky fill on the shadow side
+  fillIntensity: 0.6,
+  skyLuminance: 0.62,      // scales the analytic IBL
+  environmentIntensity: 0.95,
 };
+
+/**
+ * Replaces three's flat exponential fog with aerial perspective.
+ *
+ * A single fog colour reads as grey gauze laid over the frame: it kills the
+ * near field as readily as the far one and carries no directional
+ * information. Real dawn haze does two things instead. It scatters the sun's
+ * light forward, so distance warms towards the sun and cools away from it.
+ * And it settles, so it is thick along the ground and thin overhead — which
+ * is what makes a ridgeline dissolve at its base while its crest stays sharp.
+ *
+ * Both need the fragment's world position, which the stock chunks do not
+ * carry. Reconstructing it from `mvPosition` and the (rigid) view matrix works
+ * in every shader that includes these chunks, including the ones that never
+ * define `transformed` or `worldPosition`.
+ *
+ * The sun vector and the forward-scatter tint are baked into the chunk source
+ * rather than passed as uniforms: uniforms would mean patching every entry in
+ * ShaderLib, and this preset's sun does not move.
+ */
+function installAerialPerspective(settings, sunDirection) {
+  const warm = new THREE.Color(settings.hazeSunColor).convertSRGBToLinear();
+  const f = (v) => v.toFixed(6);
+
+  THREE.ShaderChunk.fog_pars_vertex = /* glsl */`
+#ifdef USE_FOG
+  varying float vFogDepth;
+  varying vec3 vFogWorld;
+#endif`;
+
+  THREE.ShaderChunk.fog_vertex = /* glsl */`
+#ifdef USE_FOG
+  vFogDepth = - mvPosition.z;
+  vFogWorld = cameraPosition + ( mvPosition.xyz * mat3( viewMatrix ) );
+#endif`;
+
+  THREE.ShaderChunk.fog_pars_fragment = /* glsl */`
+#ifdef USE_FOG
+  uniform vec3 fogColor;
+  varying float vFogDepth;
+  varying vec3 vFogWorld;
+  #ifdef FOG_EXP2
+    uniform float fogDensity;
+  #else
+    uniform float fogNear;
+    uniform float fogFar;
+  #endif
+#endif`;
+
+  THREE.ShaderChunk.fog_fragment = /* glsl */`
+#ifdef USE_FOG
+  vec3 fogRay = vFogWorld - cameraPosition;
+  float fogDist = max( length( fogRay ), 1e-4 );
+
+  // Mean density along the ray through an atmosphere that thins with height.
+  const float invH = ${f(1 / settings.fogHeight)};
+  float e0 = exp( - max( cameraPosition.y, 0.0 ) * invH );
+  float e1 = exp( - max( vFogWorld.y, 0.0 ) * invH );
+  float dy = ( vFogWorld.y - cameraPosition.y ) * invH;
+  float column = abs( dy ) < 1e-3 ? e0 : ( e0 - e1 ) / dy;
+
+  #ifdef FOG_EXP2
+    float fogAmount = fogDensity * fogDist * column;
+    float fogFactor = 1.0 - exp( - fogAmount * fogAmount );
+  #else
+    float fogFactor = smoothstep( fogNear, fogFar, fogDist * column );
+  #endif
+
+  float sunAmount = max( dot( fogRay / fogDist,
+    vec3( ${f(sunDirection.x)}, ${f(sunDirection.y)}, ${f(sunDirection.z)} ) ), 0.0 );
+  vec3 haze = mix( fogColor, vec3( ${f(warm.r)}, ${f(warm.g)}, ${f(warm.b)} ),
+                   pow( sunAmount, 2.6 ) * 0.88 );
+
+  gl_FragColor.rgb = mix( gl_FragColor.rgb, haze, clamp( fogFactor, 0.0, 1.0 ) );
+#endif`;
+}
 
 export class Atmosphere {
   constructor(renderer, scene, options = {}) {
@@ -34,24 +124,37 @@ export class Atmosphere {
     this.scene = scene;
     this.renderer = renderer;
 
+    this.sunDirection = new THREE.Vector3();
+    this.sunWorld = new THREE.Vector3();
+    const phi = THREE.MathUtils.degToRad(90 - this.settings.elevation);
+    this.sunDirection.setFromSphericalCoords(1, phi, THREE.MathUtils.degToRad(this.settings.azimuth));
+
+    // Has to happen before the level, weapon or soldiers compile a material.
+    installAerialPerspective(this.settings, this.sunDirection);
+
     this.sky = new Sky();
+    this.sky.material.uniforms.skyGain = { value: this.settings.skyGain };
+    this.sky.material.fragmentShader = 'uniform float skyGain;\n'
+      + this.sky.material.fragmentShader;
     // Preetham's final `pow(texColor, ...)` returns NaN for any negative or
     // overflowing component. Guard the visible sky as well as the IBL source.
     this.sky.material.fragmentShader = this.sky.material.fragmentShader.replace(
       'gl_FragColor = vec4( retColor, 1.0 );',
-      `vec3 safeColor = retColor;
+      `vec3 safeColor = retColor * skyGain;
        safeColor = mix( vec3( 0.0 ), safeColor, vec3( equal( safeColor, safeColor ) ) );
        gl_FragColor = vec4( max( safeColor, vec3( 0.0 ) ), 1.0 );`,
     );
     this.sky.material.needsUpdate = true;
     // Must sit inside the camera far plane or it is clipped away entirely,
-    // taking both the visible sky and the PMREM capture with it.
-    this.sky.scale.setScalar(1000);
+    // taking both the visible sky and the PMREM capture with it. The box
+    // corners are the binding constraint, not its faces: 640 * sqrt(3) = 1108.
+    this.sky.scale.setScalar(640);
     this.sky.frustumCulled = false;
+    // The shaft pass looks the dome up by name so it can leave it out of the
+    // occlusion mask; without that the sky is the only thing in the mask and
+    // there is nothing to occlude.
+    this.sky.name = 'sky';
     scene.add(this.sky);
-
-    this.sunDirection = new THREE.Vector3();
-    this.sunWorld = new THREE.Vector3();
 
     this.sun = new THREE.DirectionalLight(this.settings.sunColor, this.settings.sunIntensity);
     this.sun.castShadow = true;
@@ -64,15 +167,18 @@ export class Atmosphere {
     );
     scene.add(this.hemi);
 
-    // Warm bounce from the sunlit sand back into shadowed faces. Sand is a
-    // strong diffuse reflector at grazing dawn angles and this is the single
-    // biggest thing separating a flat render from a shot film plate.
-    this.bounce = new THREE.DirectionalLight(0xffb877, 0.55);
+    // Open sky on the shadow side. A single warm key against nothing gives
+    // shadowed faces one flat value; a cool counter-fill is what separates
+    // them from each other and puts the blue into the shadows that reads as
+    // dawn rather than as underexposure.
+    this.bounce = new THREE.DirectionalLight(
+      this.settings.fillColor, this.settings.fillIntensity,
+    );
     this.bounce.castShadow = false;
     scene.add(this.bounce);
     scene.add(this.bounce.target);
 
-    scene.fog = new THREE.FogExp2(this.settings.fogColor, this.settings.fogDensity);
+    scene.fog = new THREE.FogExp2(this.settings.hazeColor, this.settings.fogDensity);
 
     this.pmrem = new THREE.PMREMGenerator(renderer);
     this.pmrem.compileEquirectangularShader();
@@ -84,18 +190,20 @@ export class Atmosphere {
   configureShadows(size) {
     const s = this.sun.shadow;
     s.mapSize.set(size, size);
-    s.camera.near = 0.5;
-    s.camera.far = 260;
-    s.camera.left = -62;
-    s.camera.right = 62;
-    s.camera.top = 62;
-    s.camera.bottom = -62;
+    s.camera.near = 1;
+    s.camera.far = 340;
+    // Tight enough that 2048 still buys ~4.5 cm texels, wide enough that the
+    // buildings ringing the courtyard stay inside it and keep casting.
+    s.camera.left = -48;
+    s.camera.right = 48;
+    s.camera.top = 48;
+    s.camera.bottom = -48;
     // Long dawn shadows graze the ground, so normal-bias does the heavy
     // lifting; a large constant bias would detach contact shadows entirely.
-    s.bias = -0.00016;
-    s.normalBias = 0.028;
+    s.bias = -0.00008;
+    s.normalBias = 0.038;
     s.blurSamples = 16;
-    s.radius = 2.4;
+    s.radius = 2.0;
     s.camera.updateProjectionMatrix();
   }
 
@@ -107,6 +215,7 @@ export class Atmosphere {
     u.rayleigh.value = s.rayleigh;
     u.mieCoefficient.value = s.mieCoefficient;
     u.mieDirectionalG.value = s.mieDirectionalG;
+    u.skyGain.value = s.skyGain;
 
     const phi = THREE.MathUtils.degToRad(90 - s.elevation);
     const theta = THREE.MathUtils.degToRad(s.azimuth);
@@ -119,8 +228,9 @@ export class Atmosphere {
     this.sun.color.set(s.sunColor);
     this.sun.intensity = s.sunIntensity;
 
-    // Bounce comes from the opposite side, low and warm.
-    this.bounce.position.set(-this.sunDirection.x * 200, 40, -this.sunDirection.z * 200);
+    this.bounce.color.set(s.fillColor);
+    this.bounce.intensity = s.fillIntensity;
+    this.bounce.position.set(-this.sunDirection.x * 200, 90, -this.sunDirection.z * 200);
     this.bounce.target.position.set(0, 0, 0);
 
     this.hemi.color.set(s.skyColor);
@@ -128,7 +238,7 @@ export class Atmosphere {
     this.hemi.intensity = s.hemiIntensity;
 
     if (this.scene.fog) {
-      this.scene.fog.color.set(s.fogColor);
+      this.scene.fog.color.set(s.hazeColor);
       this.scene.fog.density = s.fogDensity;
     }
 
@@ -156,11 +266,19 @@ export class Atmosphere {
     const height = width / 2;
     const data = new Float32Array(width * height * 4);
 
-    const zenith = new THREE.Color(this.settings.skyColor).convertSRGBToLinear();
-    const horizon = new THREE.Color(this.settings.fogColor).convertSRGBToLinear();
-    const ground = new THREE.Color(this.settings.groundColor).convertSRGBToLinear();
-    const glow = new THREE.Color(this.settings.sunColor).convertSRGBToLinear();
+    const lin = (hex) => new THREE.Color(hex).convertSRGBToLinear();
+    const zenith = lin(this.settings.skyColor);
+    const cool = lin(this.settings.hazeColor);
+    const warm = lin(this.settings.hazeSunColor);
+    const ground = lin(this.settings.groundColor);
+    const glow = lin(this.settings.sunColor);
     const sun = this.sunDirection;
+
+    // Sun azimuth, for the warm/cool split around the horizon. Ambient that
+    // is the same colour in every direction is the thing that makes a render
+    // look like a render; a real sky is orange on one side and blue on the
+    // other, and shadowed geometry picks that up.
+    const sunAz = Math.atan2(sun.z, sun.x);
 
     for (let y = 0; y < height; y++) {
       // three's equirectUv: v = asin(dir.y)/PI + 0.5, so row 0 looks straight down.
@@ -170,25 +288,34 @@ export class Atmosphere {
         const azimuth = ((x + 0.5) / width - 0.5) * Math.PI * 2;
         const dx = cy * Math.cos(azimuth), dz = cy * Math.sin(azimuth);
 
+        const toward = 0.5 + 0.5 * Math.cos(azimuth - sunAz);
+        const w = Math.pow(toward, 1.6);
+        const hz = [
+          cool.r + (warm.r - cool.r) * w,
+          cool.g + (warm.g - cool.g) * w,
+          cool.b + (warm.b - cool.b) * w,
+        ];
+
         let r, g, b;
         if (sy >= 0) {
           // Horizon haze grading into zenith blue. The exponent keeps the
           // warm band tight to the horizon the way real dawn haze sits.
           const t = Math.pow(sy, 0.42);
-          r = horizon.r + (zenith.r - horizon.r) * t;
-          g = horizon.g + (zenith.g - horizon.g) * t;
-          b = horizon.b + (zenith.b - horizon.b) * t;
+          r = hz[0] + (zenith.r - hz[0]) * t;
+          g = hz[1] + (zenith.g - hz[1]) * t;
+          b = hz[2] + (zenith.b - hz[2]) * t;
         } else {
-          // Below the horizon: sand bounce, falling off with depth.
+          // Below the horizon: sand bounce, falling off with depth. It keeps
+          // the azimuthal split, so undersides on the sun side stay warm.
           const t = Math.min(1, -sy * 2.2);
-          r = horizon.r * 0.55 + (ground.r - horizon.r * 0.55) * t;
-          g = horizon.g * 0.55 + (ground.g - horizon.g * 0.55) * t;
-          b = horizon.b * 0.55 + (ground.b - horizon.b * 0.55) * t;
+          r = hz[0] * 0.62 + (ground.r - hz[0] * 0.62) * t;
+          g = hz[1] * 0.62 + (ground.g - hz[1] * 0.62) * t;
+          b = hz[2] * 0.62 + (ground.b - hz[2] * 0.62) * t;
         }
 
         // Forward-scattered glow around the sun. Bounded by construction.
         const cosSun = Math.max(0, dx * sun.x + sy * sun.y + dz * sun.z);
-        const halo = Math.pow(cosSun, 6) * 2.6 + Math.pow(cosSun, 40) * 5.5;
+        const halo = Math.pow(cosSun, 5) * 1.5 + Math.pow(cosSun, 36) * 5.0;
         r += glow.r * halo;
         g += glow.g * halo;
         b += glow.b * halo;
@@ -245,12 +372,15 @@ export class Atmosphere {
     focus.x = Math.round(focus.x / texelWorld) * texelWorld;
     focus.z = Math.round(focus.z / texelWorld) * texelWorld;
 
-    this.sun.position.copy(focus).add(this.sunDirection.clone().multiplyScalar(180));
+    // The sun grazes the ground at this elevation, so the caster that matters
+    // can be a long way up-sun of anything visible. Standing off further than
+    // the frustum is deep keeps those casters in front of the near plane.
+    this.sun.position.copy(focus).add(this.sunDirection.clone().multiplyScalar(170));
     this.sun.target.position.copy(focus);
     this.sun.target.updateMatrixWorld();
 
     this.bounce.position.copy(focus).add(
-      new THREE.Vector3(-this.sunDirection.x * 120, 60, -this.sunDirection.z * 120),
+      new THREE.Vector3(-this.sunDirection.x * 120, 90, -this.sunDirection.z * 120),
     );
     this.bounce.target.position.copy(focus);
     this.bounce.target.updateMatrixWorld();
