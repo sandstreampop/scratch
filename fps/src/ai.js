@@ -353,7 +353,11 @@ export class Enemy {
     const distance = toPlayer.length();
     toPlayer.divideScalar(distance);
 
-    const sees = player.alive && this.canSee(player.camera.position, blockers);
+    // Re-tested on this agent's scheduled frame; cached otherwise.
+    if (this.losDue !== false || this._sawPlayer === undefined) {
+      this._sawPlayer = player.alive && this.canSee(player.camera.position, blockers);
+    }
+    const sees = this._sawPlayer;
     if (sees) {
       this.aware = Math.min(1, this.aware + dt * 3.2);
       this.lastKnown = player.camera.position.clone();
@@ -671,8 +675,24 @@ export class Director {
     }
   }
 
-  /** Everything a bullet or a line-of-sight test can be stopped by. */
-  get blockers() { return this.level.raycastables; }
+  /**
+   * Occluders for line-of-sight tests.
+   *
+   * Deliberately not the full raycast set: that includes the terrain mesh,
+   * whose 80k triangles are tested on every ray because its bounding sphere
+   * encloses the entire map. Sight lines inside the compound are blocked by
+   * structures, not by ground the players are standing on, so excluding it
+   * costs nothing visible and takes the director from tens of milliseconds a
+   * frame to a fraction of one.
+   */
+  get blockers() {
+    if (!this._blockers) {
+      this._blockers = this.level.raycastables.filter(
+        (o) => o.name !== 'ground' && o.name !== 'courtyard',
+      );
+    }
+    return this._blockers;
+  }
 
   alertAll(point, radius) {
     for (const e of this.enemies) {
@@ -683,6 +703,18 @@ export class Director {
 
   update(dt, player, now) {
     const blockers = this.blockers;
+
+    // Line of sight is the expensive part of an agent's think, and it does not
+    // need to be re-evaluated every frame. Each agent re-tests on its own slot
+    // in a rotating schedule and reuses the previous answer in between, which
+    // divides the raycast load by the cycle length without any perceptible
+    // change in how quickly they react.
+    this._losSlot = (this._losSlot ?? 0) + 1;
+    const cycle = 3;
+    for (let i = 0; i < this.enemies.length; i++) {
+      this.enemies[i].losDue = (i % cycle) === (this._losSlot % cycle);
+    }
+
     for (const e of this.enemies) e.update(dt, player, blockers, now);
 
     // Clean up long-dead bodies and top the roster back up.

@@ -2,7 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#07090b">
+<meta name="description" content="DUST VIPER — a procedurally generated first-person shooter running in the browser.">
 <title>DUST VIPER — Operation Kilo Outpost</title>
 <style>
   :root {
@@ -10,26 +15,46 @@
     --hud-dim: rgba(240, 244, 248, 0.55);
     --hud-amber: #ffb454;
     --hud-red: #ff3b30;
+    --safe-l: env(safe-area-inset-left, 0px);
+    --safe-r: env(safe-area-inset-right, 0px);
+    --safe-b: env(safe-area-inset-bottom, 0px);
+    --safe-t: env(safe-area-inset-top, 0px);
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
-  body { font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; user-select: none; cursor: default; }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #07090b;
+    /* Stop iOS rubber-banding, pull-to-refresh, double-tap zoom and the
+       long-press callout from fighting the game for touch input. */
+    overscroll-behavior: none;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+    position: fixed;
+    inset: 0;
+  }
+  body {
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    cursor: default;
+  }
   #game { position: fixed; inset: 0; }
-  canvas { display: block; }
+  canvas { display: block; touch-action: none; }
 
   #hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
   .hidden { display: none !important; }
 
-  /* Crosshair */
+  /* ---------------------------------------------------------- crosshair -- */
   #crosshair { position: absolute; left: 50%; top: 50%; width: 0; height: 0; }
   #crosshair .line { position: absolute; background: var(--hud-white); box-shadow: 0 0 2px rgba(0,0,0,0.9); }
-  #crosshair .t { width: 2px; height: 7px; left: -1px; }
-  #crosshair .b { width: 2px; height: 7px; left: -1px; }
-  #crosshair .l { width: 7px; height: 2px; top: -1px; }
-  #crosshair .r { width: 7px; height: 2px; top: -1px; }
+  #crosshair .t, #crosshair .b { width: 2px; height: 7px; left: -1px; }
+  #crosshair .l, #crosshair .r { width: 7px; height: 2px; top: -1px; }
   #crosshair .dot { position: absolute; width: 2px; height: 2px; left: -1px; top: -1px; background: var(--hud-white); }
 
-  /* Hitmarker */
   #hitmarker { position: absolute; left: 50%; top: 50%; width: 0; height: 0; opacity: 0; }
   #hitmarker .hm { position: absolute; width: 2px; height: 9px; background: var(--hud-white); box-shadow: 0 0 3px rgba(0,0,0,0.8); }
   #hitmarker.kill .hm { background: var(--hud-red); }
@@ -38,51 +63,139 @@
   #hitmarker .h3 { transform: translate(-7px,4px) rotate(-45deg); }
   #hitmarker .h4 { transform: translate(5px,4px) rotate(45deg); }
 
-  /* Ammo block */
-  #ammo { position: absolute; right: 42px; bottom: 34px; text-align: right; color: var(--hud-white); text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
+  /* --------------------------------------------------------------- hud -- */
+  #ammo {
+    position: absolute;
+    right: calc(42px + var(--safe-r)); bottom: calc(34px + var(--safe-b));
+    text-align: right; color: var(--hud-white); text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+  }
   #ammo .weapon { font-size: 13px; letter-spacing: 3px; color: var(--hud-dim); font-weight: 600; }
   #ammo .counts { font-variant-numeric: tabular-nums; }
   #ammo .mag { font-size: 42px; font-weight: 700; letter-spacing: 1px; }
   #ammo .reserve { font-size: 20px; color: var(--hud-dim); font-weight: 600; }
   #ammo .firemode { font-size: 11px; letter-spacing: 2px; color: var(--hud-dim); }
 
-  /* Compass */
-  #compass { position: absolute; top: 26px; left: 50%; transform: translateX(-50%); width: 460px; height: 34px; overflow: hidden;
-             -webkit-mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
-             mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent); }
+  #compass {
+    position: absolute; top: calc(26px + var(--safe-t)); left: 50%; transform: translateX(-50%);
+    width: 460px; max-width: 62vw; height: 34px; overflow: hidden;
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
+    mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
+  }
   #compass canvas { width: 100%; height: 100%; }
 
-  /* Kill feed */
-  #killfeed { position: absolute; top: 90px; right: 36px; text-align: right; font-size: 13px; font-weight: 600; letter-spacing: 0.5px; }
-  #killfeed .entry { color: var(--hud-white); text-shadow: 0 1px 2px rgba(0,0,0,0.9); margin-bottom: 5px; opacity: 0.95; }
+  #killfeed { position: absolute; top: calc(90px + var(--safe-t)); right: calc(36px + var(--safe-r)); text-align: right; font-size: 13px; font-weight: 600; }
+  #killfeed .entry { color: var(--hud-white); text-shadow: 0 1px 2px rgba(0,0,0,0.9); margin-bottom: 5px; }
   #killfeed .entry .you { color: var(--hud-amber); }
 
-  /* Score */
-  #score { position: absolute; left: 42px; bottom: 34px; color: var(--hud-white); text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
+  #score { position: absolute; left: calc(42px + var(--safe-l)); bottom: calc(34px + var(--safe-b)); color: var(--hud-white); text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
   #score .label { font-size: 11px; letter-spacing: 3px; color: var(--hud-dim); font-weight: 600; }
   #score .value { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
 
-  /* Damage vignette */
   #damage { position: absolute; inset: 0; opacity: 0;
             background: radial-gradient(ellipse at center, transparent 42%, rgba(160,10,5,0.55) 100%); }
 
-  /* Objective */
-  #objective { position: absolute; top: 78px; left: 50%; transform: translateX(-50%); color: var(--hud-white);
-               font-size: 12px; letter-spacing: 2px; font-weight: 600; text-shadow: 0 1px 3px rgba(0,0,0,0.9); opacity: 0.85; }
+  #objective { position: absolute; top: calc(78px + var(--safe-t)); left: 50%; transform: translateX(-50%);
+               color: var(--hud-white); font-size: 12px; letter-spacing: 2px; font-weight: 600;
+               text-shadow: 0 1px 3px rgba(0,0,0,0.9); opacity: 0.85; white-space: nowrap; }
 
-  /* Title card */
-  #title { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: flex-end; align-items: flex-start;
-           padding: 0 0 12vh 8vw; opacity: 0; transition: opacity 1.2s ease; background: none; }
+  #title { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: flex-end;
+           align-items: flex-start; padding: 0 0 12vh calc(8vw + var(--safe-l)); opacity: 0; transition: opacity 1.2s ease; }
   #title .op { font-size: 14px; letter-spacing: 8px; color: var(--hud-amber); font-weight: 700; }
   #title .name { font-size: 54px; letter-spacing: 4px; color: var(--hud-white); font-weight: 800; text-shadow: 0 2px 12px rgba(0,0,0,0.7); }
   #title .sub { font-size: 13px; letter-spacing: 3px; color: var(--hud-dim); font-weight: 600; margin-top: 6px; }
 
-  /* Start overlay */
-  #start { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; align-items: center; justify-content: center;
-           background: rgba(4, 6, 8, 0.82); color: var(--hud-white); cursor: pointer; }
-  #start h1 { font-size: 46px; letter-spacing: 10px; font-weight: 800; }
-  #start p { margin-top: 14px; font-size: 14px; letter-spacing: 2px; color: var(--hud-dim); }
-  #start .keys { margin-top: 26px; font-size: 12px; letter-spacing: 1px; color: var(--hud-dim); line-height: 1.9; text-align: center; }
+  /* ----------------------------------------------------- touch controls -- */
+  /* Shown only when the device is actually touch-driven; body.touch is set
+     from JS rather than a media query so a touchscreen laptop keeps mouse
+     and keyboard. */
+  #touch { position: fixed; inset: 0; z-index: 12; display: none; pointer-events: none; }
+  body.touch.playing #touch { display: block; }
+
+  #stick { position: absolute; width: 132px; height: 132px; margin: -66px 0 0 -66px;
+           border-radius: 50%; border: 2px solid rgba(240,244,248,0.22);
+           background: radial-gradient(circle, rgba(255,255,255,0.06), rgba(255,255,255,0.015));
+           display: none; pointer-events: none; }
+  #stick-knob { position: absolute; left: 50%; top: 50%; width: 54px; height: 54px;
+                margin: 0; border-radius: 50%; background: rgba(240,244,248,0.30);
+                border: 1px solid rgba(255,255,255,0.42);
+                transform: translate(-50%, -50%); }
+
+  .tbtn {
+    position: absolute; pointer-events: auto;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 50%; border: 1.5px solid rgba(240,244,248,0.30);
+    background: rgba(12,16,20,0.34);
+    color: var(--hud-white); font-weight: 700; letter-spacing: 1px;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+    backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px);
+    transition: background 90ms ease, transform 90ms ease;
+  }
+  .tbtn.active { background: rgba(255,180,84,0.42); border-color: var(--hud-amber); transform: scale(0.94); }
+
+  #btn-fire   { width: 88px; height: 88px; font-size: 13px;
+                right: calc(20px + var(--safe-r)); bottom: calc(18px + var(--safe-b));
+                background: rgba(40,14,10,0.40); border-color: rgba(255,120,90,0.45); }
+  #btn-ads    { width: 64px; height: 64px; font-size: 11px;
+                right: calc(120px + var(--safe-r)); bottom: calc(30px + var(--safe-b)); }
+  #btn-reload { width: 56px; height: 56px; font-size: 10px;
+                right: calc(28px + var(--safe-r)); bottom: calc(120px + var(--safe-b)); }
+  #btn-jump   { width: 56px; height: 56px; font-size: 10px;
+                right: calc(110px + var(--safe-r)); bottom: calc(106px + var(--safe-b)); }
+  #btn-crouch { width: 56px; height: 56px; font-size: 10px;
+                right: calc(196px + var(--safe-r)); bottom: calc(24px + var(--safe-b)); }
+
+  /* The button cluster owns the bottom-right corner on touch, so the ammo
+     readout moves above it rather than being sat on. */
+  body.touch #ammo {
+    right: calc(18px + var(--safe-r));
+    bottom: calc(186px + var(--safe-b));
+    text-align: right;
+  }
+  body.touch #ammo .mag { font-size: 30px; }
+  body.touch #ammo .reserve { font-size: 15px; }
+  body.touch #ammo .weapon { font-size: 10px; letter-spacing: 2px; }
+  body.touch #ammo .firemode { display: none; }
+  body.touch #score { bottom: calc(14px + var(--safe-b)); left: calc(18px + var(--safe-l)); }
+  body.touch #score .value { font-size: 22px; }
+  body.touch #score .label { font-size: 9px; }
+  body.touch #killfeed { top: calc(58px + var(--safe-t)); font-size: 11px; }
+  body.touch #objective { font-size: 10px; top: calc(62px + var(--safe-t)); }
+  body.touch #compass { width: 300px; top: calc(14px + var(--safe-t)); }
+
+  /* ---------------------------------------------------------- overlays -- */
+  #start {
+    position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    padding: var(--safe-t) var(--safe-r) var(--safe-b) var(--safe-l);
+    background: radial-gradient(ellipse at 50% 40%, rgba(24,20,16,0.86), rgba(4,6,8,0.94));
+    color: var(--hud-white); cursor: pointer;
+  }
+  #start h1 { font-size: clamp(30px, 7vw, 48px); letter-spacing: 10px; font-weight: 800; }
+  #start .tagline { margin-top: 6px; font-size: 11px; letter-spacing: 5px; color: var(--hud-amber); font-weight: 700; }
+  #start .cta { margin-top: 22px; font-size: 14px; letter-spacing: 3px; color: var(--hud-white);
+                border: 1px solid rgba(255,255,255,0.35); padding: 12px 30px; border-radius: 3px; }
+  #start .keys { margin-top: 22px; font-size: 11px; letter-spacing: 1px; color: var(--hud-dim); line-height: 1.9; }
+  body.touch #start .desktop-keys { display: none; }
+  body:not(.touch) #start .touch-keys { display: none; }
+
+  #loading {
+    position: fixed; inset: 0; z-index: 30; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: #07090b; color: var(--hud-white);
+  }
+  #loading .name { font-size: clamp(26px, 6vw, 40px); letter-spacing: 9px; font-weight: 800; }
+  #loading .bar { margin-top: 26px; width: min(320px, 62vw); height: 2px; background: rgba(255,255,255,0.14); }
+  #loading .fill { height: 100%; width: 0%; background: var(--hud-amber); transition: width 220ms ease; }
+  #loading .step { margin-top: 12px; font-size: 11px; letter-spacing: 3px; color: var(--hud-dim); min-height: 14px; }
+
+  #rotate {
+    position: fixed; inset: 0; z-index: 40; display: none;
+    flex-direction: column; align-items: center; justify-content: center;
+    background: #07090b; color: var(--hud-white); text-align: center; padding: 24px;
+  }
+  #rotate .glyph { font-size: 44px; margin-bottom: 16px; }
+  #rotate .msg { font-size: 13px; letter-spacing: 3px; color: var(--hud-dim); }
+  body.touch.portrait #rotate { display: flex; }
 </style>
 </head>
 <body>
@@ -100,7 +213,7 @@
   <div id="killfeed"></div>
   <div id="ammo">
     <div class="weapon">M4A1 · MK.2 CARBINE</div>
-    <div class="counts"><span class="mag">30</span> <span class="reserve">| 120</span></div>
+    <div class="counts"><span class="mag">30</span> <span class="reserve">| 180</span></div>
     <div class="firemode">AUTO</div>
   </div>
   <div id="score"><div class="label">ELIMINATIONS</div><div class="value">0</div></div>
@@ -108,11 +221,38 @@
   <div id="title"><div class="op">OPERATION</div><div class="name">DUST VIPER</div><div class="sub">KILO OUTPOST · 0547 HRS</div></div>
 </div>
 
-<div id="start">
+<div id="touch">
+  <div id="stick"><div id="stick-knob"></div></div>
+  <div id="btn-fire" class="tbtn">FIRE</div>
+  <div id="btn-ads" class="tbtn">AIM</div>
+  <div id="btn-reload" class="tbtn">RELOAD</div>
+  <div id="btn-jump" class="tbtn">JUMP</div>
+  <div id="btn-crouch" class="tbtn">CROUCH</div>
+</div>
+
+<div id="loading">
+  <div class="name">DUST VIPER</div>
+  <div class="bar"><div class="fill" id="loading-fill"></div></div>
+  <div class="step" id="loading-step">INITIALISING</div>
+</div>
+
+<div id="rotate">
+  <div class="glyph">⟳</div>
+  <div class="msg">ROTATE YOUR DEVICE TO LANDSCAPE</div>
+</div>
+
+<div id="start" class="hidden">
   <h1>DUST VIPER</h1>
-  <p>CLICK TO DEPLOY</p>
-  <div class="keys">WASD — MOVE &nbsp;·&nbsp; SHIFT — SPRINT &nbsp;·&nbsp; MOUSE — AIM<br>
-    LMB — FIRE &nbsp;·&nbsp; RMB — ADS &nbsp;·&nbsp; R — RELOAD &nbsp;·&nbsp; SPACE — JUMP &nbsp;·&nbsp; C — CROUCH</div>
+  <div class="tagline">OPERATION KILO OUTPOST</div>
+  <div class="cta" id="start-cta">TAP TO DEPLOY</div>
+  <div class="keys desktop-keys">
+    WASD — MOVE &nbsp;·&nbsp; SHIFT — SPRINT &nbsp;·&nbsp; MOUSE — AIM<br>
+    LMB — FIRE &nbsp;·&nbsp; RMB — ADS &nbsp;·&nbsp; R — RELOAD &nbsp;·&nbsp; SPACE — JUMP &nbsp;·&nbsp; C — CROUCH
+  </div>
+  <div class="keys touch-keys">
+    LEFT THUMB — MOVE (PUSH FULLY FORWARD TO SPRINT)<br>
+    RIGHT THUMB — DRAG TO AIM &nbsp;·&nbsp; BUTTONS — FIRE, AIM, RELOAD
+  </div>
 </div>
 
 <script type="importmap">

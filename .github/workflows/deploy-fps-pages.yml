@@ -1,0 +1,80 @@
+name: deploy-fps-pages
+
+on:
+  push:
+    branches: [ "main", "claude/aaa-fps-threejs-j24dtg" ]
+    paths:
+      - 'fps/**'
+      - '.github/workflows/deploy-fps-pages.yml'
+  workflow_dispatch:
+
+# Allow one deploy at a time; cancel superseded runs rather than queueing them.
+concurrency:
+  group: fps-pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install build dependencies
+        working-directory: fps
+        run: npm install --no-save esbuild playwright-core
+
+      - name: Build
+        working-directory: fps
+        run: node build.mjs
+
+      # The runner has network access, so this is the one place a real WebKit
+      # can be obtained. It is not iOS Safari, but it is the same engine family
+      # and it catches the JavaScriptCore and WebKit-WebGL differences that
+      # Chromium silently tolerates.
+      - name: Install WebKit for the Safari-engine smoke test
+        run: |
+          npm install --no-save playwright
+          npx playwright install --with-deps webkit
+
+      - name: Smoke test the built game (WebKit, iPhone viewport)
+        working-directory: fps
+        run: xvfb-run -a node tools/verify.mjs --dist --engine=webkit
+
+      - name: Smoke test the built game (Chromium, desktop)
+        working-directory: fps
+        run: xvfb-run -a node tools/verify.mjs --dist --engine=chromium --desktop
+
+      - name: Upload verification screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-screenshots
+          path: fps/shots/verify/
+          if-no-files-found: warn
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: fps/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

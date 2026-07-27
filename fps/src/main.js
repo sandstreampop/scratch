@@ -12,6 +12,8 @@ import { HUD } from './hud.js';
 import { Audio } from './audio.js';
 import { PostStack } from './post.js';
 import { setAnisotropy } from './textures.js';
+import { Input, isTouchDevice } from './input.js';
+import { Quality, platform } from './quality.js';
 
 const params = new URLSearchParams(location.search);
 const SHOT = params.get('shot');
@@ -55,16 +57,33 @@ class Game {
     this.elapsed = 0;
     this.score = 0;
     this.running = false;
+    this.ready = false;
+    this.quality = new Quality();
+  }
 
-    this.input = {
-      forward: false, back: false, left: false, right: false,
-      sprint: false, crouch: false, ads: false, fire: false,
+  /**
+   * Procedural generation takes seconds on a desktop and considerably longer
+   * on a phone, so the boot is staged and yields to the event loop between
+   * steps. Without that the browser paints nothing until the whole thing is
+   * done, and iOS shows a white screen for long enough to look like a crash.
+   */
+  async build(onProgress = () => {}) {
+    const step = async (label, fraction, fn) => {
+      onProgress(label, fraction);
+      // Two frames: one to paint the label, one to let the paint land before
+      // the main thread is blocked again.
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      fn();
     };
 
-    this.setupRenderer();
-    this.setupScene();
-    this.setupSystems();
-    this.setupInput();
+    await step('INITIALISING RENDERER', 0.05, () => this.setupRenderer());
+    await step('BUILDING ATMOSPHERE', 0.15, () => this.setupAtmosphere());
+    await step('GENERATING TERRAIN', 0.30, () => this.setupLevel());
+    await step('FORGING WEAPON', 0.62, () => this.setupWeapon());
+    await step('DEPLOYING HOSTILES', 0.76, () => this.setupSystems());
+    await step('COMPILING SHADERS', 0.88, () => this.setupPost());
+    await step('READY', 1.0, () => this.setupInput());
+    return this;
   }
 
   /* ------------------------------------------------------------ renderer -- */
@@ -76,7 +95,7 @@ class Game {
       stencil: false,
       depth: true,
     });
-    const dpr = SHOT ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = SHOT ? 1 : Math.min(window.devicePixelRatio || 1, this.quality.get('pixelRatio'));
     this.renderer.setPixelRatio(dpr);
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -86,41 +105,83 @@ class Game {
     this.renderer.info.autoReset = true;
     this.container.appendChild(this.renderer.domElement);
 
-    setAnisotropy(Math.min(16, this.renderer.capabilities.getMaxAnisotropy()));
+    setAnisotropy(Math.min(this.quality.get('anisotropy'),
+      this.renderer.capabilities.getMaxAnisotropy()));
+
+    // A phone on a low tier renders shadows at a quarter of the desktop
+    // resolution; below that they cost more than they contribute.
+    this.renderer.shadowMap.enabled = this.quality.get('shadowMapSize') > 0;
   }
 
-  setupScene() {
+  setupAtmosphere() {
     this.scene = new THREE.Scene();
+    // A narrower lens on a phone-sized viewport keeps the same amount of the
+    // world legible without the extreme edge stretching a 78-degree FOV gives
+    // on a 19.5:9 screen held at arm's length.
+    const fov = platform.mobile ? 68 : 78;
     this.camera = new THREE.PerspectiveCamera(
-      78, window.innerWidth / window.innerHeight, 0.10, 700,
+      fov, window.innerWidth / window.innerHeight, 0.10, 700,
     );
 
     window.__MARK?.('scene:init');
     this.atmosphere = new Atmosphere(this.renderer, this.scene);
+    this.atmosphere.configureShadows(this.quality.get('shadowMapSize') || 1024);
+    this.atmosphere.sun.shadow.radius = this.quality.get('shadowRadius');
+    if (this.scene.fog) this.scene.fog.density *= this.quality.get('fogDensityScale');
     window.__MARK?.('atmosphere');
+  }
 
+  setupLevel() {
     this.level = new Level().build();
     window.__MARK?.('level');
     this.scene.add(this.level.group);
   }
 
-  setupSystems() {
+  setupWeapon() {
     this.player = new Player(this.level, this.camera);
     this.weapon = new Weapon(this.renderer, this.camera, this.scene.environment);
     window.__MARK?.('weapon');
+  }
+
+  setupSystems() {
     this.vfx = new VFX(this.scene, this.camera, this.level);
     this.vfx.setPixelRatio(this.renderer.getPixelRatio());
     this.director = new Director(this.scene, this.level);
+    this.director.maxAlive = this.quality.get('maxEnemies');
     this.hud = new HUD();
     this.audio = new Audio();
-
     window.__MARK?.('vfx+ai+hud');
+  }
+
+  setupPost() {
     this.post = new PostStack(this.renderer, this.scene, this.camera, PRESET.exposure);
     this.viewmodelPass = this.post.setViewmodel(this.weapon.scene, this.weapon.camera);
+    this.applyQuality(this.quality.settings);
+    this.quality.onChange((s) => this.applyQuality(s));
     window.__MARK?.('post');
 
     this.wireCallbacks();
-    this.director.populate(6);
+    this.director.populate(Math.min(6, this.quality.get('maxEnemies')));
+  }
+
+  /** Reapplies tier settings; safe to call at any time, including mid-play. */
+  applyQuality(s) {
+    if (this.post) {
+      this.post.bloom.enabled = s.bloom;
+      this.post.shafts.enabled = s.shafts;
+      this.post.smaa.enabled = s.smaa;
+      this.post.setAmbientOcclusion(s.gtao);
+    }
+    if (this.renderer && !SHOT) {
+      this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, s.pixelRatio));
+      this.renderer.shadowMap.enabled = s.shadowMapSize > 0;
+      this.vfx?.setPixelRatio(this.renderer.getPixelRatio());
+      this.post?.setSize(window.innerWidth, window.innerHeight);
+    }
+    if (this.atmosphere && s.shadowMapSize > 0) {
+      this.atmosphere.sun.shadow.radius = s.shadowRadius;
+    }
+    if (this.director) this.director.maxAlive = s.maxEnemies;
   }
 
   wireCallbacks() {
@@ -155,67 +216,60 @@ class Game {
   /* --------------------------------------------------------------- input -- */
 
   setupInput() {
-    const keyMap = {
-      KeyW: 'forward', KeyS: 'back', KeyA: 'left', KeyD: 'right',
-      ShiftLeft: 'sprint', ShiftRight: 'sprint', KeyC: 'crouch', ControlLeft: 'crouch',
-    };
+    this.inputManager = new Input(this.renderer.domElement, this.player, {
+      onReload: () => this.tryReload(),
+    });
+    // The rest of the game reads a plain action-state object and never needs
+    // to know whether a thumb or a keyboard produced it.
+    this.input = this.inputManager.state;
 
-    window.addEventListener('keydown', (e) => {
-      if (keyMap[e.code]) { this.input[keyMap[e.code]] = true; e.preventDefault(); }
-      if (e.code === 'Space') { this.player.requestJump(this.elapsed); e.preventDefault(); }
-      if (e.code === 'KeyR') this.tryReload();
-    });
-    window.addEventListener('keyup', (e) => {
-      if (keyMap[e.code]) { this.input[keyMap[e.code]] = false; e.preventDefault(); }
-    });
-
-    window.addEventListener('mousedown', (e) => {
-      if (!this.pointerLocked) return;
-      if (e.button === 0) this.input.fire = true;
-      if (e.button === 2) this.input.ads = true;
-    });
-    window.addEventListener('mouseup', (e) => {
-      if (e.button === 0) this.input.fire = false;
-      if (e.button === 2) this.input.ads = false;
-    });
-    window.addEventListener('contextmenu', (e) => e.preventDefault());
-
-    window.addEventListener('mousemove', (e) => {
-      if (!this.pointerLocked) return;
-      this.player.look(e.movementX, e.movementY);
-    });
-
-    document.addEventListener('pointerlockchange', () => {
-      this.pointerLocked = document.pointerLockElement === this.renderer.domElement;
-      if (!this.pointerLocked) {
-        this.input.fire = false;
-        this.input.forward = this.input.back = this.input.left = this.input.right = false;
-        this.input.sprint = false;
-      }
-    });
-
-    const start = document.getElementById('start');
-    start.addEventListener('click', () => {
-      this.renderer.domElement.requestPointerLock();
-      start.style.display = 'none';
-      this.hud.show();
-      this.hud.playTitle();
-      this.audio.init();
-      this.audio.resume();
-      this.audio.startAmbience();
-    });
+    if (isTouchDevice) document.body.classList.add('touch');
 
     window.addEventListener('resize', () => this.onResize());
+    window.visualViewport?.addEventListener('resize', () => this.onResize());
+    window.addEventListener('orientationchange', () => {
+      // iOS reports stale dimensions if measured too early in the rotation.
+      setTimeout(() => this.onResize(), 250);
+    });
+  }
+
+  /** Called once the player has committed, from a real user gesture. */
+  beginPlay() {
+    if (this.running) return;
+    document.getElementById('start')?.classList.add('hidden');
+    document.body.classList.add('playing');
+    this.hud.show();
+    this.hud.playTitle();
+
+    this.inputManager.enabled = true;
+    this.inputManager.requestPointerLock();
+
+    // WebAudio starts suspended until a gesture on iOS, so this has to happen
+    // here rather than at construction.
+    this.audio.init();
+    this.audio.resume();
+    this.audio.startAmbience();
+
+    this.start();
   }
 
   onResize() {
-    const w = window.innerWidth, h = window.innerHeight;
+    // visualViewport tracks the area actually visible under iOS Safari's
+    // collapsing toolbars; innerWidth/innerHeight lag behind it during the
+    // transition and leave a strip of unpainted page.
+    const vv = window.visualViewport;
+    const w = Math.round(vv?.width ?? window.innerWidth);
+    const h = Math.round(vv?.height ?? window.innerHeight);
+    if (w < 2 || h < 2) return;
+
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.weapon.camera.aspect = w / h;
     this.weapon.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
     this.post.setSize(w, h);
+
+    document.body.classList.toggle('portrait', h > w);
   }
 
   /* -------------------------------------------------------------- combat -- */
@@ -394,6 +448,7 @@ class Game {
   step(dt) {
     this.elapsed += dt;
 
+    this.inputManager?.update();
     this.player.update(dt, this.input, this.elapsed);
 
     if (this.input.fire) this.playerShoot();
@@ -435,10 +490,11 @@ class Game {
   }
 
   loop = () => {
-    requestAnimationFrame(this.loop);
+    this._raf = requestAnimationFrame(this.loop);
     const dt = Math.min(this.clock.getDelta(), 1 / 20);
     this.step(dt);
     this.render(dt);
+    this.quality.sample(dt, this.elapsed);
   };
 
   start() {
@@ -453,7 +509,8 @@ class Game {
 async function runShotMode(game, preset) {
   const cfg = SHOT_PRESETS[preset] ?? SHOT_PRESETS.hero;
 
-  document.getElementById('start').style.display = 'none';
+  document.getElementById('start')?.classList.add('hidden');
+  document.getElementById('loading')?.classList.add('hidden');
   game.hud.show();
   game.audio.enabled = false;
   // Enemies are placed already engaging; without this they kill the player
@@ -516,6 +573,26 @@ async function runShotMode(game, preset) {
 
 /* ------------------------------------------------------------- entry ----- */
 
+function setProgress(label, fraction) {
+  const fill = document.getElementById('loading-fill');
+  const step = document.getElementById('loading-step');
+  if (fill) fill.style.width = `${Math.round(fraction * 100)}%`;
+  if (step) step.textContent = label;
+}
+
+function watchOrientation() {
+  const check = () => {
+    const vv = window.visualViewport;
+    const w = vv?.width ?? window.innerWidth;
+    const h = vv?.height ?? window.innerHeight;
+    document.body.classList.toggle('portrait', h > w);
+  };
+  check();
+  window.addEventListener('resize', check);
+  window.visualViewport?.addEventListener('resize', check);
+  window.addEventListener('orientationchange', () => setTimeout(check, 250));
+}
+
 async function main() {
   const t0 = performance.now();
   const mark = (label) => {
@@ -525,20 +602,48 @@ async function main() {
   };
   window.__MARK = mark;
 
+  if (isTouchDevice) document.body.classList.add('touch');
+  watchOrientation();
+
   const game = new Game();
-  mark('construct');
   window.__GAME = game;
+  await game.build(SHOT ? () => {} : setProgress);
+  mark('build');
+
+  document.getElementById('loading')?.classList.add('hidden');
+  game.ready = true;
 
   if (SHOT) {
     await runShotMode(game, SHOT);
-  } else {
-    game.start();
-    window.__SHOT_READY = true;
+    return;
   }
+
+  const startEl = document.getElementById('start');
+  startEl?.classList.remove('hidden');
+
+  // Both events are bound because iOS fires a synthetic click ~300 ms after
+  // touchend, and the audio context will only unlock inside the gesture that
+  // the user actually made.
+  const begin = (e) => {
+    e?.preventDefault();
+    startEl?.removeEventListener('touchend', begin);
+    startEl?.removeEventListener('click', begin);
+    game.beginPlay();
+  };
+  startEl?.addEventListener('touchend', begin, { passive: false });
+  startEl?.addEventListener('click', begin);
+
+  window.__SHOT_READY = true;
 }
 
 main().catch((err) => {
   console.error(err);
+  document.getElementById('loading')?.classList.add('hidden');
   const el = document.getElementById('start');
-  if (el) el.innerHTML = `<h1 style="font-size:22px">FAILED TO START</h1><pre style="max-width:80vw;white-space:pre-wrap;font-size:12px;color:#f88">${String(err.stack || err)}</pre>`;
+  if (el) {
+    el.classList.remove('hidden');
+    el.innerHTML = `<h1 style="font-size:22px">FAILED TO START</h1>`
+      + `<pre style="max-width:86vw;white-space:pre-wrap;font-size:11px;color:#f88;text-align:left">`
+      + `${String(err && err.stack || err)}</pre>`;
+  }
 });
