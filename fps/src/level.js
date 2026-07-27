@@ -377,7 +377,8 @@ export class Level {
    */
   track(points, width = 3.3, rut = 0.055) {
     const curve = new THREE.CatmullRomCurve3(points.map(([x, z]) => new THREE.Vector3(x, 0, z)));
-    const along = Math.max(24, Math.round(curve.getLength() / 0.9));
+    const length = curve.getLength();
+    const along = Math.max(24, Math.round(length / 0.9));
     const across = 18;
     const w = across + 1;
     const pos = new Float32Array((along + 1) * w * 3);
@@ -395,7 +396,7 @@ export class Level {
         const wob = perlin(s * 26, q * 2, 64, 64) * 0.16;
         const half = width * 0.5 * (1 + wob);
         const x = p.x + nx * q * half, z = p.z + nz * q * half;
-        const k = (i * w + j) * 1;
+        const k = i * w + j;
         // Two ruts, a crown between them, feathered edges.
         const rd = Math.exp(-Math.pow((Math.abs(q) - 0.52) * 6.5, 2)) * rut;
         const crown = Math.exp(-q * q * 9) * 0.022;
@@ -403,7 +404,7 @@ export class Level {
         const y = this.terrainHeight(x, z) + 0.014 - rd + crown - edge * 0.020
           + perlin(x * 1.7, z * 1.7, 64, 64) * 0.012;
         pos[k * 3] = x; pos[k * 3 + 1] = y; pos[k * 3 + 2] = z;
-        uv[k * 2] = q * width * 0.5 / 2.2; uv[k * 2 + 1] = s * curve.getLength() / 2.2;
+        uv[k * 2] = q * width * 0.5 / 2.2; uv[k * 2 + 1] = s * length / 2.2;
         const shade = (1 - edge * 0.45) * (0.86 + perlin(s * 18, q * 3, 64, 64) * 0.22);
         col[k * 3] = shade; col[k * 3 + 1] = shade * 0.99; col[k * 3 + 2] = shade * 0.98;
       }
@@ -461,7 +462,7 @@ export class Level {
         pos[k * 3 + 1] = this.terrainHeight(x, z) + 0.012 - smoothstep(rt, 0.8, 1.0) * 0.016;
         pos[k * 3 + 2] = z;
         uv[k * 2] = x / 2.6; uv[k * 2 + 1] = z / 2.6;
-        const shade = (1 - smoothstep(rt, 0.62, 1.0) * 0.5) * 1.0;
+        const shade = 1 - smoothstep(rt, 0.62, 1.0) * 0.5;
         col[k * 3] = shade; col[k * 3 + 1] = shade; col[k * 3 + 2] = shade;
       }
     }

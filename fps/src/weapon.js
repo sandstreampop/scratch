@@ -543,7 +543,7 @@ export class Weapon {
     });
     this.flashMaterials = [];
     for (let i = 0; i < 3; i++) {
-      const m = new THREE.Mesh(new THREE.PlaneGeometry(0.20, 0.20), flashMat.clone());
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(0.115, 0.115), flashMat.clone());
       m.rotation.z = (i / 3) * Math.PI;
       m.renderOrder = 30;
       this.flashSprites.add(m);
@@ -551,7 +551,7 @@ export class Weapon {
     }
     // Forward-facing cone so the flash has volume when seen off-axis.
     this.flashCone = new THREE.Mesh(
-      new THREE.ConeGeometry(0.035, 0.13, 12, 1, true),
+      new THREE.ConeGeometry(0.026, 0.10, 12, 1, true),
       new THREE.MeshBasicMaterial({
         color: 0xffd9a0, transparent: true, opacity: 0,
         blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false, side: THREE.DoubleSide,
@@ -638,12 +638,14 @@ export class Weapon {
       SPEC.recoilYaw * ramp * adsScale * yawSign * 42,
     );
 
-    // Viewmodel kick.
-    this._recoilVel.z += SPEC.recoilKick * ramp * adsScale * 46;
-    this._recoilVel.y += 0.006 * ramp * adsScale * 46;
-    this._recoilVel.x += yawSign * 0.0035 * ramp * adsScale * 46;
-    this._recoilRotVel.x -= 0.055 * ramp * adsScale * 42;
-    this._recoilRotVel.z += yawSign * 0.022 * ramp * adsScale * 42;
+    // Viewmodel kick. Kept to a few centimetres: the weapon is only 30 cm off
+    // the lens, so a kick sized for the camera reads as the gun lunging at the
+    // player rather than recoiling.
+    this._recoilVel.z += SPEC.recoilKick * ramp * adsScale * 24;
+    this._recoilVel.y += 0.004 * ramp * adsScale * 30;
+    this._recoilVel.x += yawSign * 0.0025 * ramp * adsScale * 30;
+    this._recoilRotVel.x -= 0.032 * ramp * adsScale * 42;
+    this._recoilRotVel.z += yawSign * 0.014 * ramp * adsScale * 42;
 
     this.spread = Math.min(SPEC.spreadMax, this.spread + SPEC.spreadPerShot);
     this._flash = 1;
@@ -806,12 +808,12 @@ export class Weapon {
     // --- muzzle flash decay -------------------------------------------------------
     this._flash = Math.max(0, this._flash - dt * 26);
     const f = this._flash;
-    this.flashLight.intensity = f * f * 22;
-    this.flashCone.material.opacity = f * 0.85;
-    this.flashCone.scale.setScalar(0.7 + (1 - f) * 0.9);
+    this.flashLight.intensity = f * f * 14;
+    this.flashCone.material.opacity = f * 0.60;
+    this.flashCone.scale.setScalar(0.7 + (1 - f) * 0.7);
     for (let i = 0; i < this.flashMaterials.length; i++) {
-      this.flashMaterials[i].opacity = f * (0.9 - i * 0.16);
-      this.flashSprites.children[i].scale.setScalar(0.55 + (1 - f) * 1.4 + i * 0.22);
+      this.flashMaterials[i].opacity = f * (0.62 - i * 0.13);
+      this.flashSprites.children[i].scale.setScalar(0.50 + (1 - f) * 0.85 + i * 0.16);
       this.flashSprites.children[i].rotation.z += dt * (i % 2 ? 9 : -9);
     }
     this.flashSprites.visible = f > 0.001;
