@@ -88,7 +88,40 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+  # Proves the artifact users actually load is playable, not merely that a
+  # local build was. Runs against the live URL after the deployment lands.
+  verify-live:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install test dependencies
+        working-directory: fps
+        run: |
+          npm install --no-save playwright
+          npx playwright install --with-deps webkit
+
+      - name: Playability check against the deployed site
+        working-directory: fps
+        run: |
+          xvfb-run -a node tools/verify.mjs \
+            --engine=webkit --url='${{ needs.deploy.outputs.page_url }}'
+
+      - name: Upload live screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-live-screenshots
+          path: fps/shots/verify/
+          if-no-files-found: warn

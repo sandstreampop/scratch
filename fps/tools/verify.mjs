@@ -21,13 +21,16 @@ const args = process.argv.slice(2);
 const useDist = args.includes('--dist');
 const desktop = args.includes('--desktop');
 const engineName = (args.find((a) => a.startsWith('--engine=')) || '--engine=chromium').split('=')[1];
+// --url points the same checks at an already-deployed site instead of a local
+// build, which is the only way to prove what users will actually load.
+const liveUrl = (args.find((a) => a.startsWith('--url=')) || '').split('=').slice(1).join('=');
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT = path.resolve(HERE, '..');
 const ROOT = useDist ? path.join(PROJECT, 'dist') : PROJECT;
 const SHOTS = path.join(PROJECT, 'shots', 'verify');
 
-if (!fs.existsSync(path.join(ROOT, 'index.html'))) {
+if (!liveUrl && !fs.existsSync(path.join(ROOT, 'index.html'))) {
   console.error(`verify: no index.html in ${ROOT}${useDist ? ' — run `node build.mjs` first' : ''}`);
   process.exit(1);
 }
@@ -52,8 +55,18 @@ const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
   fs.createReadStream(file).pipe(res);
 });
-await new Promise((r) => server.listen(0, '127.0.0.1', r));
-const port = server.address().port;
+let port = 0;
+if (liveUrl) server.close();
+else {
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  port = server.address().port;
+}
+
+// The deployed page needs the same two declarations the local harness makes:
+// CI browsers are software rasterisers regardless of where the page is served.
+const baseUrl = liveUrl
+  ? `${liveUrl}${liveUrl.includes('?') ? '&' : '?'}buffers=byte&quality=low`
+  : `http://127.0.0.1:${port}/index.html?buffers=byte&quality=low`;
 
 // iPhone 13 in landscape — the orientation the game asks for.
 const IPHONE = {
@@ -91,7 +104,7 @@ const errors = [];
 page.on('pageerror', (e) => errors.push(String(e).slice(0, 300)));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text().slice(0, 300)); });
 
-const label = `${engineName}-${desktop ? 'desktop' : 'iphone'}`;
+const label = `${engineName}-${desktop ? 'desktop' : 'iphone'}${liveUrl ? '-live' : ''}`;
 let exitCode = 0;
 
 try {
@@ -102,8 +115,7 @@ try {
   // rate, so the tier is pinned rather than left to auto-downgrade — which
   // needs sustained frames to make its decision, and would spend the whole run
   // getting there.
-  await page.goto(`http://127.0.0.1:${port}/index.html?buffers=byte&quality=low`,
-    { waitUntil: 'commit', timeout: 60000 });
+  await page.goto(baseUrl, { waitUntil: 'commit', timeout: 60000 });
 
   // Boot: procedural generation is synchronous and slow on a cold engine.
   // __GAME exists before generation finishes; `ready` is set once the staged
@@ -288,7 +300,7 @@ try {
 }
 
 await browser.close();
-server.close();
+if (!liveUrl) server.close();
 
 const failed = checks.filter((c) => !c.ok);
 console.log(`\n${label}: ${checks.length - failed.length}/${checks.length} checks passed`);

@@ -168,28 +168,28 @@ function buildCarbine() {
   // Roughness low enough that the receiver flanks pick up a grazing sheen. Run
   // it fully matte and the whole part collapses onto one value, which is what
   // makes a viewmodel read as a cut-out rather than as machined steel.
-  const phosphate = material('gunmetal', [3.2, 3.2], { aoMap: null, roughness: 0.62, metalness: 0.24 });
-  const barrelSteel = material('gunmetal', [5, 5], { aoMap: null, roughness: 0.52, metalness: 0.75 });
-  const furniture = material('polymer', [3, 3], { aoMap: null, roughness: 0.92 });
-  const gripPoly = material('polymer', [7, 7], { aoMap: null, roughness: 0.98 });
+  const phosphate = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+  const barrelSteel = new THREE.MeshBasicMaterial({ color: 0xff8000 });
+  const furniture = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+  const gripPoly = new THREE.MeshBasicMaterial({ color: 0x008040 });
   // An FDE magazine is the one value break a black rifle gets, and it is what
   // stops the lower right of frame being a single silhouette. The albedo map
   // is dropped so the tint is the base value rather than a multiply against
   // near-black polymer; normal and ORM stay, so the moulding still reads.
-  const magPoly = material('polymer', [1.6, 3], { aoMap: null, map: null, color: 0x9c8763, roughness: 0.80 });
+  const magPoly = new THREE.MeshBasicMaterial({ color: 0xff00ff });
   // Small hard parts sit a stop above the body, not below it. Authored darker
   // than the receiver they are holding, every pin, slot and control disappears
   // and the detail that is modelled might as well not exist. Tiled hard so the
   // sampler's polished-through wear lands as a highlight on a part this size
   // instead of averaging out — a flat swatch here reads as moulded plastic.
-  const small = material('gunmetal', [5, 5], { aoMap: null, roughness: 0.88, metalness: 0.26 });
-  const railMat = new THREE.MeshStandardMaterial({ color: 0x2e3136, roughness: 0.80, metalness: 0.25 });
+  const small = new THREE.MeshBasicMaterial({ color: 0x0000ff });
+  const railMat = new THREE.MeshBasicMaterial({ color: 0x00ffff });
   // Tiled tight on purpose: at low repeat the gunmetal sampler's polished-through
   // wear blobs are bigger than the optic itself and turn the whole tube chrome.
-  const opticBody = material('gunmetal', [5, 5], { aoMap: null, roughness: 0.74, metalness: 0.30 });
-  const worn = material('gunmetal', [8, 8], { aoMap: null, roughness: 0.72, metalness: 0.60 });
-  const rubber = new THREE.MeshStandardMaterial({ color: 0x2a2a2d, roughness: 0.90, metalness: 0.0 });
-  const bore = new THREE.MeshStandardMaterial({ color: 0x0a0a0b, roughness: 1.0, metalness: 0.3 });
+  const opticBody = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+  const worn = new THREE.MeshBasicMaterial({ color: 0x8000ff });
+  const rubber = new THREE.MeshBasicMaterial({ color: 0x804000 });
+  const bore = new THREE.MeshBasicMaterial({ color: 0xffffff });
 
   const part = (geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
     const m = new THREE.Mesh(geo, mat);
@@ -688,7 +688,7 @@ export class Weapon {
     // Cool sky on the shadow side. Kept low and to the side: raised overhead it
     // lights every top face at once and the receiver reads as light grey
     // plastic instead of phosphate.
-    this.fill = new THREE.DirectionalLight(0xa9c3e2, 1.25);
+    this.fill = new THREE.DirectionalLight(0xa9c3e2, 3.0);
     this.fill.position.set(-0.90, 0.42, 0.85);
     this.scene.add(this.fill);
 
@@ -733,6 +733,12 @@ export class Weapon {
     // Fill opposes the key in azimuth only; it is sky, so it never comes from
     // below and never picks up the sun's warmth.
     this.fill.position.set(-sun.x * 1.3 - 0.35, 0.55, 0.95);
+
+    // The rig lives in camera space but the environment is authored in world
+    // space, so without this the weapon reflects a fixed patch of sky that
+    // swings around it as the player turns — the shadow side can end up facing
+    // the sun's half of the dome while the lit side faces the dark half.
+    this.scene.environmentRotation.setFromQuaternion(worldCamera.quaternion);
   }
 
   /* --------------------------------------------------------------- fire -- */
@@ -983,9 +989,9 @@ function buildHands() {
   // the firing hand merges into the part it is holding and neither reads; the
   // knuckle pad and the cuff then have to sit either side of the glove so the
   // hand carries three values instead of one.
-  const glove = new THREE.MeshStandardMaterial({ color: 0x3d362d, roughness: 0.90, metalness: 0.0 });
-  const knuckle = new THREE.MeshStandardMaterial({ color: 0x211d19, roughness: 0.58, metalness: 0.0 });
-  const sleeve = material('canvas', [4, 4], { aoMap: null, roughness: 1.0, color: 0x9e9075 });
+  const glove = new THREE.MeshBasicMaterial({ color: 0x40ff80 });
+  const knuckle = new THREE.MeshBasicMaterial({ color: 0xff0080 });
+  const sleeve = new THREE.MeshBasicMaterial({ color: 0x8080ff });
 
   const piece = (parent, geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
     const m = new THREE.Mesh(geo, mat);
