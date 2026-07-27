@@ -58,6 +58,14 @@ jobs:
         working-directory: fps
         run: xvfb-run -a node tools/verify.mjs --dist --engine=chromium
 
+      # The black-scene defect depended on which WebGL extensions the device
+      # withholds, not on the device. Withholding them here reproduces the
+      # condition without an iPhone; with the old float-texture path this run
+      # comes back at half the scene brightness.
+      - name: Smoke test (iOS capability profile)
+        working-directory: fps
+        run: xvfb-run -a node tools/verify.mjs --dist --engine=webkit --emulate=ios
+
       # Keyboard and mouse coverage. Advisory: the desktop profile is heavier,
       # the runner has no GPU, and this consistently needs minutes there while
       # the same check finishes in seconds on a machine with one. A timeout

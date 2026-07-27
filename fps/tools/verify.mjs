@@ -24,6 +24,8 @@ const engineName = (args.find((a) => a.startsWith('--engine=')) || '--engine=chr
 // --url points the same checks at an already-deployed site instead of a local
 // build, which is the only way to prove what users will actually load.
 const liveUrl = (args.find((a) => a.startsWith('--url=')) || '').split('=').slice(1).join('=');
+// --emulate=ios withholds the WebGL extensions iOS Safari does not implement.
+const emulate = (args.find((a) => a.startsWith('--emulate=')) || '').split('=')[1] || '';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT = path.resolve(HERE, '..');
@@ -104,11 +106,42 @@ const browser = await engine.launch(launchOptions);
 const context = await browser.newContext(desktop ? DESKTOP : { ...IPHONE, isMobile: engineName !== 'firefox' });
 const page = await context.newPage();
 
+// Reproduce iOS Safari's capability profile.
+//
+// The black-scene bug depended entirely on which extensions the device
+// withholds, so testing it needs those absences, not an iPhone. iOS notably
+// lacks OES_texture_float_linear — filtering a float texture there yields an
+// incomplete texture that samples black. EXT_color_buffer_float is withheld
+// too, which is stricter than any current iOS but proves the fallbacks hold at
+// the pessimistic end. OES_texture_half_float_linear stays, because iOS has
+// it, and pretending otherwise would test a device that does not exist.
+if (emulate === 'ios') {
+  await page.addInitScript(() => {
+    const withheld = new Set([
+      'OES_texture_float_linear',
+      'EXT_color_buffer_float',
+      'EXT_float_blend',
+    ]);
+    for (const Ctx of [self.WebGLRenderingContext, self.WebGL2RenderingContext]) {
+      if (!Ctx) continue;
+      const getExtension = Ctx.prototype.getExtension;
+      Ctx.prototype.getExtension = function (name) {
+        return withheld.has(name) ? null : getExtension.call(this, name);
+      };
+      const supported = Ctx.prototype.getSupportedExtensions;
+      Ctx.prototype.getSupportedExtensions = function () {
+        return (supported.call(this) || []).filter((n) => !withheld.has(n));
+      };
+    }
+  });
+}
+
 const errors = [];
 page.on('pageerror', (e) => errors.push(String(e).slice(0, 300)));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text().slice(0, 300)); });
 
-const label = `${engineName}-${desktop ? 'desktop' : 'iphone'}${liveUrl ? '-live' : ''}`;
+const label = `${engineName}-${desktop ? 'desktop' : 'iphone'}`
+  + `${emulate ? `-${emulate}` : ''}${liveUrl ? '-live' : ''}`;
 let exitCode = 0;
 
 try {
@@ -198,7 +231,12 @@ try {
     }
     return { colours: seen.size, meanLuma: +(sum / (d.length / 4)).toFixed(1) };
   });
-  check('renders real content', variety.colours > 24 && variety.meanLuma > 8,
+  // Thresholds set from a measured good frame (~620 colours, luma ~88) against
+  // a measured bad one. The original iOS defect left a frame at 126 colours and
+  // luma 45 — visibly wrong, but comfortably past a "not black" check, which is
+  // why the first version of this assertion would not have caught it. A
+  // regression that halves scene brightness has to fail here.
+  check('renders real content', variety.colours > 300 && variety.meanLuma > 60,
     `${variety.colours} distinct colours, mean luma ${variety.meanLuma}`);
 
   const before = await page.evaluate(() => {
