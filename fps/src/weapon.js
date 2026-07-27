@@ -520,6 +520,11 @@ function buildCarbine() {
   reticle.renderOrder = 40;
   optic.add(reticle);
 
+  const PROBE = [T_ctrl, T_nomap, T_noao, T_nonrm, T_plain];
+  for (let i = 0; i < PROBE.length; i++) {
+    part(rbox(0.048, 0.048, 0.008, 0.001), PROBE[i], -0.115 + i * 0.058, 0.150, -0.300);
+  }
+
   // ---- anchors -------------------------------------------------------------
   const muzzleAnchor = new THREE.Object3D();
   muzzleAnchor.position.set(0, 0, -BORE_TO_MUZZLE);
