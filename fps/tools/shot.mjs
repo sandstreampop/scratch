@@ -58,7 +58,7 @@ async function main() {
     page.on('requestfailed', (r) => errors.push(`REQFAIL ${r.url()} ${r.failure()?.errorText}`));
     const t0 = Date.now();
     try {
-      await page.goto(`http://127.0.0.1:${port}/index.html?shot=${preset}`, { timeout: 60000 });
+      await page.goto(`http://127.0.0.1:${port}/index.html?shot=${preset}&buffers=byte`, { timeout: 60000 });
       await page.waitForFunction('window.__SHOT_READY === true', null, { timeout: 240000, polling: 500 });
       const out = path.join(SHOTS_DIR, `${preset}.png`);
       if (!smoke) await page.screenshot({ path: out });

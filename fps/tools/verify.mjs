@@ -96,7 +96,10 @@ let exitCode = 0;
 
 try {
   const t0 = Date.now();
-  await page.goto(`http://127.0.0.1:${port}/index.html`, { waitUntil: 'commit', timeout: 60000 });
+  // Headless engines here are software rasterisers, which render half-float
+  // targets black; see the note in src/post.js.
+  await page.goto(`http://127.0.0.1:${port}/index.html?buffers=byte`,
+    { waitUntil: 'commit', timeout: 60000 });
 
   // Boot: procedural generation is synchronous and slow on a cold engine.
   // __GAME exists before generation finishes; `ready` is set once the staged

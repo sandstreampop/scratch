@@ -247,11 +247,18 @@ export class PostStack {
     const dpr = renderer.getPixelRatio();
     const w = Math.floor(size.x * dpr), h = Math.floor(size.y * dpr);
 
-    // Software GL (SwiftShader, used by the headless capture harness) renders
-    // black into half-float colour targets. Fall back to 8-bit there; on real
-    // hardware the HDR buffer is kept so bloom and the tone map get true
-    // scene-referred values to work with.
-    const bufferType = PostStack.probeHalfFloat(renderer) ? THREE.HalfFloatType : THREE.UnsignedByteType;
+    // Half-float buffers everywhere they work, which is every real GPU
+    // including every iOS device.
+    //
+    // They do NOT work on a software rasteriser: SwiftShader renders a real
+    // multi-pass scene black into one, while still clearing, single-quad
+    // drawing and reading back correctly, so no feature probe detects it — and
+    // WebKit masks its renderer string, so sniffing fails too. Rather than
+    // guess, the headless harnesses declare it: ?buffers=byte. Nothing a
+    // player runs takes that path.
+    const forceByte = new URLSearchParams(location.search).get('buffers') === 'byte';
+    const bufferType = (!forceByte && renderer.capabilities.isWebGL2)
+      ? THREE.HalfFloatType : THREE.UnsignedByteType;
     this.bufferType = bufferType;
     this.composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(w, h, {
       type: bufferType,
@@ -298,38 +305,6 @@ export class PostStack {
     this.composer.addPass(this.smaa);
 
     this._sunNDC = new THREE.Vector3();
-  }
-
-  /**
-   * Decides whether half-float colour targets are usable.
-   *
-   * This is a capability question in name only: every GPU worth shipping to
-   * supports them, including every iOS device. The one environment that does
-   * not is a software rasteriser — SwiftShader renders black into a half-float
-   * target once a real multi-pass scene is involved, though it will happily
-   * clear one, draw a single quad into one, and read either back. A functional
-   * probe therefore reports success and the whole frame comes out empty, so
-   * the renderer is identified directly instead.
-   *
-   * Cost of being wrong is asymmetric: a needless 8-bit buffer costs some
-   * highlight range, while a wrong half-float buffer costs the entire image.
-   */
-  static probeHalfFloat(renderer) {
-    if (PostStack._halfFloatOK !== undefined) return PostStack._halfFloatOK;
-
-    let software = false;
-    try {
-      const gl = renderer.getContext();
-      const info = gl.getExtension('WEBGL_debug_renderer_info');
-      const name = info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : '';
-      software = /swiftshader|llvmpipe|software|basic render|mesa offscreen/i.test(name);
-      if (software) console.info(`post: software renderer (${name}), using 8-bit buffers`);
-    } catch (e) {
-      // A blocked debug-renderer extension is not evidence either way.
-    }
-
-    PostStack._halfFloatOK = !software && renderer.capabilities.isWebGL2;
-    return PostStack._halfFloatOK;
   }
 
   /**
