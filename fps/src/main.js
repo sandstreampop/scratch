@@ -46,6 +46,23 @@ const SHOT_PRESETS = {
     warmup: 150,
     action: 'idle',
   },
+  // Every preset above looks within about fifteen degrees of the sun, so all
+  // four are the same composition — a backlit silhouette — captured from four
+  // positions. It is the hardest case and worth keeping, but a rim light hides
+  // albedo, normal and roughness completely, and those are most of the work.
+  // These two turn around and across so lit surfaces can be judged at all.
+  sunlit: {
+    position: [-8.0, 0, 5.0], yaw: 2.106, pitch: -0.030, ads: 0,
+    enemies: [[-19.0, 3.0, 0.6], [-23.5, -6.5, 0.9]],
+    warmup: 150,
+    action: 'idle',
+  },
+  cross: {
+    position: [-4.0, 0, 2.0], yaw: 0.536, pitch: -0.035, ads: 0,
+    enemies: [[3.0, -15.0, 1.2], [-6.0, -19.0, 1.0]],
+    warmup: 150,
+    action: 'idle',
+  },
 };
 
 /* ------------------------------------------------------------- runtime --- */
@@ -574,7 +591,11 @@ async function runShotMode(game, preset) {
     if (cfg.action === 'firing' && i > cfg.warmup - 26) {
       // Hold the trigger over the last stretch so the captured frame has a
       // live muzzle flash, smoke, tracers and casings in it.
-      game.weapon.lastShot = -99;
+      // Holding the trigger is all this should do. Resetting lastShot first —
+      // which it used to — defeats the weapon's own rate limiter and fires a
+      // round every single frame, roughly ten times the real cadence. Two
+      // dozen smoke puffs then stack into one white cloud that swallows the
+      // frame, which is not a capture of the game firing.
       game.playerShoot();
     }
     game.step(dt);

@@ -11,7 +11,7 @@ import { chromium } from 'playwright-core';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SHOTS_DIR = path.join(ROOT, 'shots');
-const PRESETS = ['hero', 'combat', 'ads', 'detail'];
+const PRESETS = ['hero', 'combat', 'ads', 'detail', 'sunlit', 'cross'];
 
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
@@ -36,7 +36,16 @@ function serve() {
 async function main() {
   const args = process.argv.slice(2);
   const smoke = args.includes('smoke');
-  const presets = smoke ? ['hero'] : (args.length ? args : PRESETS);
+  // These captures are the evidence a look gets judged on, so they have to be
+  // of the configuration players actually run. Forcing 8-bit composite buffers
+  // — which this did unconditionally — clips every value above 1.0 linear
+  // before the tone curve can roll it off, so the sky blows to flat white and
+  // the highlight shaping being reviewed is thrown away before capture.
+  // post.js measures its own output and degrades on its own now; --byte pins
+  // the old path when the two need comparing.
+  const byte = args.includes('--byte');
+  const named = args.filter((a) => a !== 'smoke' && !a.startsWith('--'));
+  const presets = smoke ? ['hero'] : (named.length ? named : PRESETS);
   fs.mkdirSync(SHOTS_DIR, { recursive: true });
 
   const server = await serve();
@@ -58,7 +67,8 @@ async function main() {
     page.on('requestfailed', (r) => errors.push(`REQFAIL ${r.url()} ${r.failure()?.errorText}`));
     const t0 = Date.now();
     try {
-      await page.goto(`http://127.0.0.1:${port}/index.html?shot=${preset}&buffers=byte`, { timeout: 60000 });
+      const q = `shot=${preset}${byte ? '&buffers=byte' : ''}`;
+      await page.goto(`http://127.0.0.1:${port}/index.html?${q}`, { timeout: 60000 });
       await page.waitForFunction('window.__SHOT_READY === true', null, { timeout: 240000, polling: 500 });
       const out = path.join(SHOTS_DIR, `${preset}.png`);
       if (!smoke) await page.screenshot({ path: out });
