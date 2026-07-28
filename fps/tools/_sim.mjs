@@ -127,6 +127,44 @@ const DRIVER = () => {
     };
   };
 
+  // Distance to the first piece of world geometry along a ray, or `maxDist` if
+  // nothing is in the way. Uses the game's own raycastables list, so "the lane
+  // is clear" means clear to the same geometry a bullet is resolved against.
+  window.__SIM.rayWorld = (from, dir, maxDist = 220) => {
+    const THREE = window.__THREE;
+    const o = new THREE.Vector3(from[0], from[1], from[2]);
+    const d = new THREE.Vector3(dir[0], dir[1], dir[2]).normalize();
+    const ray = new THREE.Raycaster(o, d, 0.1, maxDist);
+    const hits = ray.intersectObjects(window.__GAME.level.raycastables, false);
+    return hits.length ? hits[0].distance : maxDist;
+  };
+
+  /** Aims the player at an enemy's chest and reports whether the shot can land. */
+  window.__SIM.aimAt = (enemyIndex = 0) => {
+    const g = window.__GAME;
+    const THREE = window.__THREE;
+    const e = g.director.enemies[enemyIndex];
+    if (!e) return { error: 'no such enemy' };
+    const aim = e.chestPosition(new THREE.Vector3());
+    const eye = g.camera.position;
+    const dx = aim.x - eye.x, dy = aim.y - eye.y, dz = aim.z - eye.z;
+    g.player.yaw = Math.atan2(-dx, -dz);
+    g.player.pitch = Math.atan2(dy, Math.hypot(dx, dz));
+    g.step(1 / 240);
+    const dir = g.player.aimDirection(new THREE.Vector3());
+    const enemyHit = g.director.raycast(g.camera.position, dir, 260);
+    const worldDist = window.__SIM.rayWorld(
+      [g.camera.position.x, g.camera.position.y, g.camera.position.z], [dir.x, dir.y, dir.z], 260);
+    return {
+      distance: aim.distanceTo(eye),
+      zone: enemyHit ? enemyHit.zone : null,
+      enemyDist: enemyHit ? enemyHit.distance : null,
+      worldDist,
+      // The only thing a caller should branch on: can this shot reach the body?
+      clear: !!enemyHit && enemyHit.distance < worldDist,
+    };
+  };
+
   window.__SIM.drive = ({ ticks, dt, inputBody, sampleBody, sampleEvery = 1 }) => {
     const input = inputBody ? new Function('t', 'i', 'g', 'sim', inputBody) : null;
     const sample = sampleBody ? new Function('t', 'i', 'g', 'sim', sampleBody) : null;
@@ -246,8 +284,11 @@ export async function openSim({
     } = {}) {
       return page.evaluate((cfg) => {
         const g = window.__GAME;
-        const THREE = g.THREE ?? window.__THREE;
         g.audio.enabled = cfg.audio;
+        // The AudioContext is built in init(), which the game only calls from a
+        // user gesture. Without this every audio timestamp comes back null and
+        // the latency suite silently measures nothing.
+        if (cfg.audio) { g.audio.init(); g.audio.resume?.(); }
         document.getElementById('start')?.classList.add('hidden');
         document.getElementById('loading')?.classList.add('hidden');
 
@@ -294,8 +335,15 @@ export async function openSim({
           enemy.facing = e.facing ?? 0;
           enemy.targetFacing = enemy.facing;
           if (e.engage) { enemy.state = 'engage'; enemy._aimBlend = 1; enemy.lastKnown = g.camera.position.clone(); }
-          if (e.inert) { enemy.update = () => {}; }
+          // A target dummy must still run update(): that is what refreshes the
+          // soldier's world matrices, and director.raycast intersects the actual
+          // meshes. Stubbing update() out — the obvious way to write "inert" —
+          // leaves every bone at the origin, so the raycast finds nothing and
+          // the whole TTK section reports misses on a shot that was dead centre.
+          // Silencing shoot() gets the intended behaviour without that.
+          if (e.inert) { enemy.shoot = () => {}; }
           if (e.health !== undefined) enemy.health = e.health;
+          enemy.group.updateMatrixWorld(true);
           spawned.push({ id: enemy.id, x: enemy.position.x, y: enemy.position.y, z: enemy.position.z });
         }
 
@@ -346,6 +394,23 @@ export async function openSim({
       }
       return rows;
     },
+
+    /** Picks a heading from `from` with the most unobstructed distance. */
+    async clearLane(from = [0, null, 0], need = 130) {
+      return page.evaluate((cfg) => {
+        const g = window.__GAME;
+        const y = (cfg.from[1] === null ? g.level.groundHeight(cfg.from[0], cfg.from[2]) : cfg.from[1]) + 1.6;
+        let best = { deg: 0, clear: -1 };
+        for (let deg = 0; deg < 360; deg += 2) {
+          const a = deg * Math.PI / 180;
+          const d = window.__SIM.rayWorld([cfg.from[0], y, cfg.from[2]], [Math.sin(a), 0, Math.cos(a)], cfg.need + 20);
+          if (d > best.clear) best = { deg, clear: d };
+        }
+        return best;
+      }, { from, need });
+    },
+
+    async aimAt(enemyIndex = 0) { return page.evaluate((i) => window.__SIM.aimAt(i), enemyIndex); },
 
     async events() { return page.evaluate(() => window.__SIM.events.slice()); },
     async clearEvents() { return page.evaluate(() => { window.__SIM.events.length = 0; }); },

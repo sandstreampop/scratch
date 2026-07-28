@@ -710,6 +710,13 @@ async function main() {
   // The harness measures cadence against this rather than hard-coding it, so
   // retuning the weapon retunes the test with it.
   window.__SPEC_RPM = SPEC.rpm;
+  // The gameplay harness needs to ask real geometric questions — is this firing
+  // lane clear, where does this ray land — and the answers have to come from
+  // the same Raycaster and the same raycastables list that resolveBullet uses.
+  // Reimplementing that on the harness side would produce a second, subtly
+  // different world to measure against, which is how a suite ends up green
+  // about a game nobody is playing.
+  window.__THREE = THREE;
   await game.build(SHOT ? () => {} : setProgress);
   mark('build');
 
