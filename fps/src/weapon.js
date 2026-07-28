@@ -26,7 +26,7 @@ const TAU = Math.PI * 2;
 const KEY_BIAS = new THREE.Vector3(-0.42, 0.34, 0.27);
 
 /**
- * Builds viewmodel materials off one shared texture pair per surface.
+ * Builds viewmodel materials off one shared texture set per surface.
  *
  * `material()` clones all three maps per call, which is right for the world —
  * every wall wants its own tiling — and wrong here: a dozen clones of the same
@@ -35,24 +35,133 @@ const KEY_BIAS = new THREE.Vector3(-0.42, 0.34, 0.27);
  * material used as a scene override renders correctly. One clone per surface,
  * one map in each slot, and the receiver lights.
  *
- * The tangent-space normal map goes for a separate reason. With no tangent
- * attribute three derives the frame from screen-space derivatives, and at
- * 0.3 m from the lens those are ~1e-4, so the determinant lands under the
- * guard in patch.js and the frame collapses. Albedo and roughness carry the
- * surface detail instead, and metalness rides as a scalar — gunmetal's metal
- * channel is a constant 1 and polymer's a constant 0, so the map buys nothing.
+ * The tangent-space normal map used to be left out of that set, and the reason
+ * on record was a real one: with no tangent attribute three builds the frame
+ * out of screen-space derivatives, and on a prop 0.3 m from the lens those are
+ * small enough that the determinant lands on the guard in patch.js and the
+ * frame collapses. But that is an argument for handing the shader a frame, not
+ * for shading the hero prop off albedo alone. Every other surface in the game
+ * carries a normal map; without one the receiver, the handguard and the optic
+ * body all resolve to the same smooth shell and the weapon reads as one moulded
+ * grey part. bindTangents() below supplies the attribute, which takes the
+ * derivative path out of the shader entirely — see getTangentFrame's guard in
+ * normalmap_pars_fragment, which is compiled out once USE_TANGENT is defined.
+ *
+ * Metalness still rides as a scalar rather than off the ORM's blue channel:
+ * gunmetal's metal channel is a constant 1 and polymer's a constant 0, so the
+ * map would only cost a sampler.
+ *
+ * `repeat` and `strength` are one decision, not two, and binding the normal map
+ * is what forced it. The old tiling put 3.4 tiles of a 512-pixel map across the
+ * receiver's 0.202 m flank, which is 0.12 mm a texel along the part and 0.023 mm
+ * across it — twenty-five texels to the pixel at hip framing. Albedo survives
+ * that because its useful content is the tile-scale wear, but a normal map's
+ * content is the 44-cell pitting and the 64-cycle speck, and both average
+ * straight out of the mip chain: bound at that density the maps changed the
+ * rendered receiver by a mean of 1.3/255 and its local contrast not at all.
+ * Tiling at roughly a 130 mm tile puts the pitting at five screen pixels, which
+ * is the size at which it reads as a surface rather than as noise.
+ *
+ * `strength` is a second knob and not a consequence of the first. Retiling does
+ * not change what the map shades — a normal map stores directions, so spreading
+ * it wider leaves every perturbation exactly as steep on screen. What it does
+ * change is the surface being described: the same 20-degree texel now spans
+ * 2.3 times the metal, so the material it depicts is 2.3 times flatter than
+ * NORMAL_STRENGTH in textures.js authored. `strength` is what keeps the
+ * depicted gradient honest, and it is capped rather than exact because polymer
+ * will not take the full 2.14 — under the raking sun of the `detail` pose its
+ * 72-cell stipple goes to hard black pits and the handguard reads as pumice.
+ * Held near gunmetal's effective gradient it reads as mould skin, which is what
+ * it is.
+ *
+ * There is no repeat that is right for every part, because a box's UVs are
+ * [0,1] per face however big the face is: these values are set for the parts
+ * that carry the frame — receiver, handguard, stock, optic body — and the
+ * centimetre-scale hardware hanging off them ends up oversampled, which costs
+ * detail nobody can resolve rather than producing an artefact.
  */
-function vmSurface(name, repeat) {
+function vmSurface(name, repeat, strength) {
   const src = maps(name);
   const map = src.map.clone();
+  const normal = src.normalMap.clone();
   const rough = src.ormMap.clone();
-  for (const t of [map, rough]) {
+  for (const t of [map, normal, rough]) {
     t.needsUpdate = true;
     t.wrapS = t.wrapT = THREE.RepeatWrapping;
     t.repeat.set(repeat[0], repeat[1]);
   }
+  // A fresh Vector2 per material: three's setValues() assigns vector-valued
+  // properties by reference, so one shared instance would let a later override
+  // of normalScale on any single part silently retune the whole surface.
   return (overrides) => new THREE.MeshStandardMaterial({
-    map, roughnessMap: rough, roughness: 1, metalness: 0, dithering: true, ...overrides,
+    map, normalMap: normal, roughnessMap: rough,
+    normalScale: new THREE.Vector2(strength, strength),
+    roughness: 1, metalness: 0, dithering: true, ...overrides,
+  });
+}
+
+/**
+ * Gives one geometry the tangent attribute a tangent-space normal map needs.
+ *
+ * three only defines USE_TANGENT when the geometry carries a `tangent` vec4,
+ * and computeTangents() only runs over an index buffer. Two of the primitives
+ * this model is built from arrive without one — RoundedBoxGeometry discards its
+ * index after displacing the corners, and ExtrudeGeometry never has one — so
+ * they are lent a sequential index for the duration of the call and stripped of
+ * it again afterwards. Welding them with mergeVertices() would work too, and is
+ * worse: it averages the tangent across the box's UV seams, which is precisely
+ * where the frame is supposed to break.
+ *
+ * The zero-tangent sweep at the end is not padding. computeTangents leaves a
+ * vertex at zero when every triangle touching it has a degenerate UV triangle,
+ * which is what happens at the two poles of a sphere — and the brass deflector
+ * on the ejection port is a sphere. GLSL normalize() of a zero vector is NaN,
+ * the NaN travels down the varying, and although the backstop in patch.js keeps
+ * it out of the frame the triangle fan around each pole loses its normal map
+ * without saying so. Any direction perpendicular to the vertex normal is as
+ * correct as any other where the UV has no direction of its own.
+ */
+function withTangents(geometry) {
+  if (geometry.hasAttribute('tangent')) return geometry;
+
+  const wasIndexed = geometry.index !== null;
+  if (!wasIndexed) {
+    const count = geometry.attributes.position.count;
+    const seq = count > 65535 ? new Uint32Array(count) : new Uint16Array(count);
+    for (let i = 0; i < count; i++) seq[i] = i;
+    geometry.setIndex(new THREE.BufferAttribute(seq, 1));
+  }
+  geometry.computeTangents();
+  if (!wasIndexed) geometry.setIndex(null);
+  if (!geometry.hasAttribute('tangent')) return geometry;   // missing normal or uv
+
+  const tan = geometry.attributes.tangent;
+  const nrm = geometry.attributes.normal;
+  const n = new THREE.Vector3(), t = new THREE.Vector3();
+  for (let i = 0; i < tan.count; i++) {
+    if (tan.getX(i) !== 0 || tan.getY(i) !== 0 || tan.getZ(i) !== 0) continue;
+    n.fromBufferAttribute(nrm, i);
+    t.set(Math.abs(n.x) > 0.9 ? 0 : 1, Math.abs(n.x) > 0.9 ? 1 : 0, 0).cross(n).normalize();
+    tan.setXYZW(i, t.x, t.y, t.z, 1);
+  }
+  return geometry;
+}
+
+/**
+ * Walks an assembled rig and gives every geometry drawn with a normal-mapped
+ * material its tangent frame.
+ *
+ * Done here rather than at each of the hundred-odd construction sites so that
+ * the next part somebody adds to this file cannot quietly ship with a
+ * derivative-derived frame. Geometries shared between parts — the M-LOK slot,
+ * the rail tooth — are visited repeatedly and processed once, because
+ * withTangents() short-circuits on the attribute it already wrote.
+ */
+function bindTangents(root) {
+  root.traverse((o) => {
+    if (!o.isMesh || !o.geometry) return;
+    const mats = Array.isArray(o.material) ? o.material : [o.material];
+    if (mats.some((m) => m && m.normalMap)) withTangents(o.geometry);
   });
 }
 
@@ -191,6 +300,15 @@ function railToothGeometry() {
   s.closePath();
   const g = new THREE.ExtrudeGeometry(s, { depth: 0.0050, bevelEnabled: false, curveSegments: 1 });
   g.translate(0, 0, -0.0025);
+  // The extruder writes UVs in metres, so a 21 mm tooth spans 0.021 of the map
+  // and every tooth on the deck comes out the one flat colour it happens to
+  // land on. Scaling to the same 0.2 m reference the receiver flats work out
+  // to puts the whole rail at one texel density — the alternative, leaving the
+  // teeth on a plain colour, is what made the deck read as a plastic comb
+  // sitting on a steel receiver.
+  const uv = g.attributes.uv;
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * 5, uv.getY(i) * 5);
+  uv.needsUpdate = true;
   return g;
 }
 
@@ -205,8 +323,8 @@ function buildCarbine() {
   // Roughness low enough that the receiver flanks pick up a grazing sheen. Run
   // it fully matte and the whole part collapses onto one value, which is what
   // makes a viewmodel read as a cut-out rather than as machined steel.
-  const steel = vmSurface('gunmetal', [3.4, 3.4]);
-  const poly = vmSurface('polymer', [3, 3]);
+  const steel = vmSurface('gunmetal', [1.5, 1.5], 1.9);
+  const poly = vmSurface('polymer', [1.4, 1.4], 1.25);
 
   const phosphate = steel({ color: 0x70757d, roughness: 0.62, metalness: 0.24 });
   const barrelSteel = steel({ color: 0x787d84, roughness: 0.52, metalness: 0.68 });
@@ -215,16 +333,34 @@ function buildCarbine() {
   // An FDE magazine is the one value break a black rifle gets, and it is what
   // stops the lower right of frame being a single silhouette. The albedo map is
   // dropped so the tint is the base value rather than a multiply against
-  // near-black polymer; the roughness map stays, so the moulding still reads.
-  const magPoly = poly({ map: null, color: 0x8e8272, roughness: 0.80 });
+  // near-black polymer; roughness and normal stay, so the moulding still reads.
+  //
+  // It needs its own tiling to do that. A mag segment is 25 to 41 mm across, so
+  // on the handguard's 1.4 the mould stipple works out at a third of a
+  // millimetre — a quarter of a pixel — and the largest untextured block in the
+  // frame would have stayed exactly as smooth as it was before any of this.
+  const magPoly = vmSurface('polymer', [0.35, 0.35], 1.25)(
+    { map: null, color: 0x8e8272, roughness: 0.80 });
   // Small hard parts sit a stop above the body, not below it. Authored darker
   // than the receiver they are bolted to, every pin, slot and control
   // disappears and the detail that is modelled might as well not exist.
   const small = steel({ color: 0x9ea3aa, roughness: 0.80, metalness: 0.34 });
-  const railMat = new THREE.MeshStandardMaterial({ color: 0x31343a, roughness: 0.80, metalness: 0.25 });
+  // The rail teeth and the rubber below were plain colours carrying no maps at
+  // all, on a prop that is in every frame the game renders. Both tints had to
+  // be re-derived rather than carried over: a colour override multiplies the
+  // sampler's albedo, gunmetal is already dark, and the teeth's original
+  // 0x31343a against it lands near 0.003 linear, which is a hole rather than a
+  // rail. These reproduce what the flat colours measured — 0.031 linear for the
+  // teeth, 0.023 for the rubber — once the multiply is taken into account.
+  const railMat = steel({ color: 0x969aa2, roughness: 0.82, metalness: 0.26 });
   const opticBody = steel({ color: 0x6d7279, roughness: 0.70, metalness: 0.32 });
   const worn = steel({ color: 0xacb1b8, roughness: 0.44, metalness: 0.72 });
-  const rubber = new THREE.MeshStandardMaterial({ color: 0x2a2a2d, roughness: 0.90, metalness: 0.0 });
+  // Moulded rubber runs off the polymer sampler rather than the `rubber` one:
+  // that sampler is authored as a tyre carcass, with crown, sidewall and bead
+  // bands keyed to v and moulded lettering in a ring, all of which would land
+  // as stripes across a 47 mm recoil pad. Polymer's stipple at this tiling is
+  // a half-millimetre mould skin, which is what a pad actually has.
+  const rubber = poly({ color: 0xa0a0a2, roughness: 0.96 });
   const bore = new THREE.MeshStandardMaterial({ color: 0x0a0a0b, roughness: 1.0, metalness: 0.3 });
 
   const part = (geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
@@ -474,31 +610,63 @@ function buildCarbine() {
   add(ocyl(0.0140, 0.0140, 0.0840), boreWall, 0, 0, 0, Math.PI / 2);
   add(ocyl(0.0164, 0.0150, 0.0120), anodised, 0, 0, -0.0290, Math.PI / 2);
   add(ocyl(0.0150, 0.0168, 0.0130), anodised, 0, 0, 0.0295, Math.PI / 2);
-  // Turrets: a stepped base, a capped stem and knurling. A plain post in body
-  // colour is worse than nothing — it reads as a casting flaw on the tube.
+  // Turrets: a stem off the tube wall, a stepped pedestal and a knurled cap. A
+  // plain post in body colour is worse than nothing — it reads as a casting
+  // flaw on the tube.
+  //
+  // Every number in this block and the next is a radius from the optical axis,
+  // and the tube's outer wall at 0.0150 is the floor for all of them. It was
+  // not: the pedestals sat at 0.0124 and the stems began at 0.0107, both well
+  // inside the 0.0140 bore liner, so the elevation and windage turrets hung
+  // into the sight picture as two black lobes and took 36% of the aperture with
+  // them. That is exactly the rule the comment above the mount stack states,
+  // and this block was the only thing in the optic breaking it. Placing each
+  // part at an absolute station with its span written beside it, rather than
+  // scaling it off the turret centre the way `* 0.72` and `* 1.34` did, is what
+  // makes the constraint checkable by reading the numbers.
   for (const up of [true, false]) {
     const trz = up ? 0 : Math.PI / 2;
-    const tx = up ? 0 : 0.0172, ty = up ? 0.0172 : 0;
-    add(cyl(0.0082, 0.0090, 0.0042, 18), small, tx * 0.72, ty * 0.72, -0.0120, 0, 0, trz);
-    add(cyl(0.0064, 0.0068, 0.0130, 18), small, tx, ty, -0.0120, 0, 0, trz);
-    add(cyl(0.0072, 0.0072, 0.0038, 18), worn, tx * 1.34, ty * 1.34, -0.0120, 0, 0, trz);
-    for (let i = 0; i < 8; i++) {
-      const a = (i / 8) * TAU, rk = 0.0068;
+    const ux = up ? 0 : 1, uy = up ? 1 : 0;
+    // Radial placement along this turret's own axis: +Y for elevation, +X for
+    // windage. The stem is drawn untapered because rotating the cylinder onto
+    // +X flips which end its `radiusTop` refers to, and half a millimetre of
+    // draft is not worth two sets of numbers that read the same and are not.
+    const post = (geo, mat, r) => add(geo, mat, ux * r, uy * r, -0.0120, 0, 0, trz);
+    post(cyl(0.0068, 0.0068, 0.0110, 18), small, 0.0205);   // stem,     0.0150 -> 0.0260
+    post(cyl(0.0090, 0.0090, 0.0040, 18), small, 0.0240);   // pedestal, 0.0220 -> 0.0260
+    post(cyl(0.0074, 0.0074, 0.0030, 18), worn, 0.0275);    // cap,      0.0260 -> 0.0290
+    for (let i = 0; i < 8; i++) {                           // knurling, on the cap's rim
+      const a = (i / 8) * TAU, rk = 0.0074;
       add(rbox(0.0012, 0.0012, 0.0036, 0.0004), bore,
-        up ? Math.sin(a) * rk : tx * 1.34,
-        up ? ty * 1.34 : Math.sin(a) * rk,
+        ux * 0.0275 + uy * Math.sin(a) * rk,
+        uy * 0.0275 + ux * Math.sin(a) * rk,
         -0.0120 + Math.cos(a) * rk);
     }
   }
-  add(cyl(0.0092, 0.0092, 0.0062, 22), small, -0.0172, 0, 0.0060, 0, 0, Math.PI / 2);  // battery cap
-  add(cyl(0.0074, 0.0074, 0.0046, 22), worn, -0.0212, 0, 0.0060, 0, 0, Math.PI / 2);
-  add(rbox(0.0020, 0.0090, 0.0090, 0.0006), bore, -0.0236, 0, 0.0060);                 // coin slot
-  add(cyl(0.0058, 0.0062, 0.0074, 16), small, -0.0152, 0, 0.0230, 0, 0, Math.PI / 2);  // brightness dial
-  add(cyl(0.0064, 0.0064, 0.0026, 16), worn, -0.0196, 0, 0.0230, 0, 0, Math.PI / 2);
+  // Battery cap and brightness dial, both on the left flank, both on the same
+  // rule. The cap's inner face used to sit at 0.0141 and the dial's at 0.0115,
+  // which put the dial through the liner and into the eyebox. Both now start at
+  // 0.0212 — not the 0.0150 the turrets get, because the riser rings reach
+  // 0.0200 at this station and a dial that starts inside that grows out of a
+  // ring instead of out of the tube.
+  //
+  // `bossZ` bridges 0.0150 -> 0.0212 so the hardware is not left floating six
+  // millimetres off the body. It is deliberately narrower than the part it
+  // carries: a boss as wide as the cap meets the tube's curve with a 1.6 mm
+  // crescent of daylight under its rim, and that gap reads worse than the
+  // standoff it was hiding.
+  const bossZ = (z, r) => add(cyl(r, r, 0.0062, 16), small, -0.0181, 0, z, 0, 0, Math.PI / 2);
+  bossZ(0.0060, 0.0076);
+  add(cyl(0.0092, 0.0092, 0.0034, 22), small, -0.0229, 0, 0.0060, 0, 0, Math.PI / 2);   // 0.0212 -> 0.0246
+  add(cyl(0.0074, 0.0074, 0.0030, 22), worn, -0.0261, 0, 0.0060, 0, 0, Math.PI / 2);    // 0.0246 -> 0.0276
+  add(rbox(0.0020, 0.0090, 0.0090, 0.0006), bore, -0.0281, 0, 0.0060);                  // coin slot
+  bossZ(0.0230, 0.0042);
+  add(cyl(0.0062, 0.0062, 0.0044, 16), small, -0.0234, 0, 0.0230, 0, 0, Math.PI / 2);   // 0.0212 -> 0.0256
+  add(cyl(0.0064, 0.0064, 0.0026, 16), worn, -0.0269, 0, 0.0230, 0, 0, Math.PI / 2);    // 0.0256 -> 0.0282
   for (let i = 0; i < 10; i++) {                                             // detent ridges
     const a = (i / 10) * TAU;
     add(rbox(0.0026, 0.0011, 0.0011, 0.0004), bore,
-      -0.0196, Math.sin(a) * 0.0060, 0.0230 + Math.cos(a) * 0.0060);
+      -0.0269, Math.sin(a) * 0.0060, 0.0230 + Math.cos(a) * 0.0060);
   }
 
   // Glass. Real transmission is no use here: the viewmodel scene is empty, so
@@ -701,6 +869,14 @@ export class Weapon {
 
     this.onShot = null;
     this.onReloadEvent = null;
+
+    // Last thing the constructor does to the tree, and it has to be: the hands
+    // and the muzzle-flash quads are parented after buildCarbine() returns, and
+    // a mesh that reaches its first draw without a tangent attribute silently
+    // falls back to the derivative frame this whole arrangement exists to
+    // avoid. three re-checks the attribute against the material every frame, so
+    // running late is only wasteful, not wrong — running never is wrong.
+    bindTangents(this.scene);
   }
 
   setupLighting() {
@@ -1045,7 +1221,7 @@ function buildHands() {
   // hand carries three values instead of one.
   const glove = new THREE.MeshStandardMaterial({ color: 0x3d362d, roughness: 0.90, metalness: 0.0 });
   const knuckle = new THREE.MeshStandardMaterial({ color: 0x211d19, roughness: 0.58, metalness: 0.0 });
-  const sleeve = vmSurface('canvas', [3.5, 3.5])({ roughness: 1.0, color: 0x7c7361 });
+  const sleeve = vmSurface('canvas', [2.0, 2.0], 1.3)({ roughness: 1.0, color: 0x7c7361 });
 
   const piece = (parent, geo, mat, x, y, z, rx = 0, ry = 0, rz = 0) => {
     const m = new THREE.Mesh(geo, mat);

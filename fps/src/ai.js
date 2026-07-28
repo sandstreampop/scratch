@@ -7,6 +7,7 @@
 
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { material } from './textures.js';
 
 const TAU = Math.PI * 2;
 const _v = new THREE.Vector3();
@@ -40,20 +41,143 @@ const CONFIG = {
 
 /* ------------------------------------------------------------- the model -- */
 
+/**
+ * Soldier surfaces.
+ *
+ * These were ten flat MeshStandardMaterials with no albedo, normal or ORM map
+ * on any of them, and four independent blind reviewers each landed on the same
+ * word for the result: mannequin. The soldier is the one object in the frame
+ * the player is supposed to be looking at, so it was also the worst place in
+ * the level to be spending nothing on surface.
+ *
+ * Every woven part below is `canvas` and not `burlap`, which is the opposite
+ * of what the weave scale argues for — burlap's hessian is far coarser and so
+ * survives the mip chain much better at the distance these are fought at.
+ * burlap is disqualified by its macro entry in textures.js. That pass keys off
+ * world position: its tone lobes off world XZ and its dust film off world Y.
+ * Both are exactly right on a wall that never moves and wrong on a body that
+ * covers four metres between bursts, where the film slides up and down the
+ * shins and the tone pumps as he crosses the compound. canvas, polymer and
+ * gunmetal are the three samplers with no macro entry at all, which happens to
+ * be precisely the set a moving object wants. Tried burlap on the fatigues
+ * first and the swim is obvious the moment an enemy repositions.
+ *
+ * `repeat` here is texel density and nothing else. Box UVs run 0..1 across a
+ * face whatever that face measures, so one repeat over a 0.4 m torso and the
+ * same repeat over a 0.09 m cuff are a factor of four apart in thread size —
+ * which is how a soldier ends up wearing four different fabrics. The numbers
+ * are chosen to land every canvas tile near 10-13 cm of body. That puts the
+ * weave itself around a millimetre, where it is honest but gone by fifteen
+ * metres, and — the part that actually matters — puts the sampler's fold,
+ * bleach and stain octaves at three to five centimetres, which is the finest
+ * scale still resolving at the ten to thirty metres where these are read.
+ *
+ * The colour constants are multipliers against the sampler's own albedo, not
+ * the colour anyone sees, so they look nothing like the material they produce.
+ * Each was solved backwards from a target rendered albedo measured against the
+ * sand's, because the sharpest note the panel returned was not about surface
+ * at all: the soldiers were beige figures standing on beige sand and were
+ * effectively invisible. The old fatigue was 0x6b6247 — the sand's own hue at
+ * three quarters of its value, which is camouflage doing its job. Sand sits at
+ * 0.25 linear luminance and strongly orange; the figure now runs cool grey-
+ * green at 2% to 20% of that, and the ladder inside it — fatigues lightest,
+ * then pouches, helmet, carrier, webbing, boots near black — gives the
+ * silhouette internal structure instead of the single mass it read as before.
+ *
+ * How far down that ladder had to go was settled by measurement, and the first
+ * pass got it badly wrong. The fatigues went in at 40% of sand, a perfectly
+ * defensible faded-cotton albedo, and the captured soldier came back at 156
+ * sRGB against sand at 152 — no separation at all, and no visible weave
+ * either. The cause is lighting geometry rather than albedo. The sun in these
+ * captures is a few degrees above the horizon, so it rakes flat ground at a
+ * grazing angle and strikes a standing figure square on, and the figure
+ * therefore collects several times the ground's irradiance. That puts every
+ * vertical sunlit surface on the shoulder of the tone curve — the limewashed
+ * walls clip outright at 251 — and the measured slope up there is only about
+ * thirty sRGB levels per e-fold of albedo. Halving the albedo buys twenty
+ * levels, and the texture authored into the figure only begins to survive once
+ * he is off the shoulder entirely. So the ladder sits at the dark end of what
+ * these materials really occupy, which is also just more accurate: a plate
+ * carrier and a pair of boots are far darker than desert sand, and of the ten
+ * surfaces only the uniform's value was ever arguable.
+ *
+ * Hue was expected to do more of the work than it does. A 5000 K sun multiplies
+ * whatever is under it, so a cool albedo under this light lands much warmer
+ * than it reads on the swatch: the fatigues are authored at a blue-to-red ratio
+ * of 1.0 and photograph at 0.60 against the sand's 0.48. That is a real
+ * separation and it is worth having, but value is doing most of the lifting
+ * and pushing the cloth green enough to win on hue alone would turn the
+ * garrison into toy soldiers.
+ */
 const MATS = {};
 function mats() {
   if (MATS.built) return MATS;
   MATS.built = true;
-  MATS.fatigue = new THREE.MeshStandardMaterial({ color: 0x6b6247, roughness: 0.93, metalness: 0.0 });
-  MATS.fatigueDark = new THREE.MeshStandardMaterial({ color: 0x574f39, roughness: 0.94, metalness: 0.0 });
-  MATS.carrier = new THREE.MeshStandardMaterial({ color: 0x3f4436, roughness: 0.86, metalness: 0.03 });
-  MATS.pouch = new THREE.MeshStandardMaterial({ color: 0x4a4a38, roughness: 0.90, metalness: 0.0 });
-  MATS.helmet = new THREE.MeshStandardMaterial({ color: 0x4c503f, roughness: 0.68, metalness: 0.05 });
-  MATS.skin = new THREE.MeshStandardMaterial({ color: 0x9a7150, roughness: 0.70, metalness: 0.0 });
-  MATS.boot = new THREE.MeshStandardMaterial({ color: 0x2a231c, roughness: 0.88, metalness: 0.0 });
-  MATS.glove = new THREE.MeshStandardMaterial({ color: 0x33302a, roughness: 0.90, metalness: 0.0 });
-  MATS.gun = new THREE.MeshStandardMaterial({ color: 0x14151a, roughness: 0.52, metalness: 0.85 });
-  MATS.strap = new THREE.MeshStandardMaterial({ color: 0x2e2f26, roughness: 0.92, metalness: 0.0 });
+  // Faded cotton field uniform. The largest area on the figure and the one
+  // carrying the hue separation, so it is the lightest thing he is wearing.
+  MATS.fatigue = material('canvas', 3.0, { color: 0x697d90, roughness: 1.0, normalScale: 1.15 });
+  // Cuffs and the balaclava: same cloth, but they are 8-14 cm parts, and at
+  // the fatigues' repeat the weave on them would be a quarter the size.
+  MATS.fatigueDark = material('canvas', 1.2, { color: 0x576678, roughness: 1.0, normalScale: 1.05 });
+  // Coated nylon plate carrier — a laminated, slightly sheeny surface, so the
+  // normal is pulled back and the roughness with it. Darkest large area on the
+  // body, which is what gives the torso its block at range.
+  MATS.carrier = material('canvas', 3.4, { color: 0x414b5d, roughness: 0.84, normalScale: 0.6 });
+  // Cordura pouches. Deliberately a denser weave than the carrier they are
+  // sewn to: reading as separate objects on the chest is worth more here than
+  // strict physical consistency, and at 20 m the density break is most of what
+  // says there is more than one thing there.
+  MATS.pouch = material('canvas', 1.3, { color: 0x525e70, roughness: 0.92, normalScale: 0.95 });
+  MATS.strap = material('canvas', 1.6, { color: 0x373f51, roughness: 0.90, normalScale: 0.85 });
+  // Composite shell. Roughness pulled down so the dome takes a broad sky
+  // highlight — at range that highlight is the head, and it is the only thing
+  // separating helmet from hair-line silhouette when the figure is backlit.
+  MATS.helmet = material('polymer', 2.0, { color: 0x98aaaf, roughness: 0.85, normalScale: 0.7 });
+  // Moulded knee pads. These were the same cloth as the cuffs; making them a
+  // hard surface is the one material break available on an otherwise uniform
+  // leg, and legs are half the standing silhouette.
+  MATS.pad = material('polymer', 1.6, { color: 0x828c93, roughness: 1.0, normalScale: 1.1 });
+  // Skin has no sampler and is not worth one: between helmet, balaclava and
+  // eye-pro what is left is a band across the eyes and a sliver of neck. The
+  // roughness was 0.70, which is a dry matte dielectric; a face has a thin
+  // sebum layer over it and holds a soft highlight, so it comes down.
+  MATS.skin = new THREE.MeshStandardMaterial({ color: 0x9a7150, roughness: 0.62, metalness: 0.0 });
+  MATS.boot = material('polymer', 1.5, { color: 0x626469, roughness: 1.25, normalScale: 1.2 });
+  MATS.glove = material('polymer', 1.0, { color: 0x7a8087, roughness: 1.15, normalScale: 1.0 });
+  // The AI rifle is the same M4 the player is holding, so it is given the
+  // viewmodel's phosphate verbatim — same sampler, same tint, same roughness,
+  // same metalness — rather than a second interpretation of the same weapon.
+  // Left untinted at first, on the reasoning that gunmetal already carries
+  // iron's F0 and multiplying a metal down is what turns a receiver into a
+  // black cut-out. That is true indoors and wrong here: a bare F0 near 0.11 at
+  // metalness 1, pointed at a low sun sitting behind the camera, is a mirror
+  // aimed back at the lens, and the captured rifle came out a pale tan stick
+  // lighter than the sand. Dropping metalness to 0.24 puts most of the surface
+  // back on the diffuse term, where the dark tint can hold it down.
+  MATS.gun = material('gunmetal', 2.4, { color: 0x70757d, roughness: 0.62, metalness: 0.24 });
+  // Eye-pro. Was 0x14161c at metalness 0.5, which is a physical impossibility
+  // — a tinted lens is a dielectric — and it was also being allocated fresh
+  // inside buildSoldier, so every enemy that ever spawned left another
+  // MeshStandardMaterial and another compiled program behind it. polymer's
+  // scuff streaks are right for a lens that has lived in a pocket, but its
+  // moulding stipple is not, so the normal is scaled almost flat.
+  //
+  // Roughness is the interesting number. Authored as glass — 0.16 against the
+  // map, so 0.06 to 0.12 — with envMapIntensity lifted to 1.6, and it did
+  // exactly what the note above build() in textures.js says a near-zero
+  // roughness texel does. The soldier faces the player and the sun in this
+  // preset sits behind the camera, which is the one geometry that puts the
+  // specular lobe straight back down the lens; a GGX highlight that narrow
+  // carries a radiance in the thousands, and the bloom pass smeared it into a
+  // white halo that swallowed the whole figure. The captured soldier was
+  // brighter than the limewashed wall behind him.
+  //
+  // 0.42 lands the lens between 0.17 and 0.31, which still reads wet against
+  // matte cloth and still catches the sky, without a lobe tight enough to
+  // resolve the sun as a point source.
+  MATS.visor = material('polymer', 1.0, {
+    color: 0x495365, roughness: 0.42, normalScale: 0.12,
+  });
   return MATS;
 }
 
@@ -121,9 +245,7 @@ function buildSoldier() {
   // Balaclava / lower face.
   mk(head, rb(0.135, 0.075, 0.145, 0.035), M.fatigueDark, 0, -0.020, 0.012, 'head');
   // Eye-pro.
-  const goggles = mk(head, rb(0.145, 0.038, 0.030, 0.012),
-    new THREE.MeshStandardMaterial({ color: 0x14161c, roughness: 0.20, metalness: 0.5 }),
-    0, 0.040, 0.078, 'head');
+  const goggles = mk(head, rb(0.145, 0.038, 0.030, 0.012), M.visor, 0, 0.040, 0.078, 'head');
 
   // ---- arms ----------------------------------------------------------------
   const makeArm = (side) => {
@@ -161,7 +283,7 @@ function buildSoldier() {
     knee.position.y = -0.315;
     thigh.add(knee);
     mk(knee, rb(0.112, 0.300, 0.120, 0.044), M.fatigue, 0, -0.155, 0, 'limb');
-    mk(knee, rb(0.120, 0.090, 0.130, 0.030), M.fatigueDark, 0, -0.030, 0.012, 'limb');  // knee pad
+    mk(knee, rb(0.120, 0.090, 0.130, 0.030), M.pad, 0, -0.030, 0.012, 'limb');  // knee pad
     const foot = new THREE.Group();
     foot.position.y = -0.310;
     knee.add(foot);

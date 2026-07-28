@@ -581,9 +581,14 @@ export class Level {
       ));
     }
     const geo = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), coils * 20, 0.018, 5, false);
-    const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
-      color: 0x6d6a66, roughness: 0.52, metalness: 0.9,
-    }));
+    // A tube's u runs along the path and its v around an eleven-centimetre
+    // circumference, so the repeat has to be this lopsided for the texels to
+    // come out anywhere near square: one tile every couple of metres of wire,
+    // which is about one coil loop, and one tile around. Detail is not the
+    // point at 3.6 cm diameter — what the rust sampler buys is that some loops
+    // catch bare metal and some sit in oxide, so the run stops being a single
+    // grey ribbon ruled along the top of the wall.
+    const mesh = new THREE.Mesh(geo, this.mat('rust', [64, 1]));
     mesh.castShadow = true;
     this.group.add(mesh);
   }
@@ -710,10 +715,18 @@ export class Level {
     tank.castShadow = true; tank.receiveShadow = true;
     g.add(tank);
 
-    // Satellite dish.
+    // Satellite dish. Galvanised sheet is what `corrugated` authors, and it is
+    // the only sampler in the set whose albedo lands near the off-white a dish
+    // actually is. `painted` is the obvious pick for pressed sheet and cannot
+    // work here: its albedo is dark olive drab and `color` multiplies, so
+    // reaching pale grey needs a factor near nine, which takes the chipped
+    // steel in the same map to pure white. The sphere's u wraps exactly once,
+    // laying the sampler's eighteen corrugations out as radial ribs, which is
+    // how a pressed dish is actually stiffened; the normal is pulled back
+    // because at full strength those ribs read as folds in foil.
     const dish = new THREE.Mesh(
       new THREE.SphereGeometry(0.46, 24, 14, 0, TAU, 0, Math.PI * 0.34),
-      new THREE.MeshStandardMaterial({ color: 0xcfc9bd, roughness: 0.62, metalness: 0.1, side: THREE.DoubleSide }),
+      this.mat('corrugated', 1, { side: THREE.DoubleSide, normalScale: 0.45 }),
     );
     dish.position.set(-w * 0.3, y + 0.5, d * 0.22);
     dish.rotation.set(Math.PI * 0.62, 0, 0.5);
@@ -1039,7 +1052,14 @@ export class Level {
    */
   pallet(x, z, ry, lean = 0) {
     const g = new THREE.Group();
-    g.position.set(x, this.groundHeight(x, z) + Math.abs(Math.sin(lean)) * 0.57, z);
+    g.position.set(x, 0, z);
+    // YXZ, so the tip happens about the pallet's own long edge after the yaw
+    // rather than about the world x axis before it. Under the default XYZ the
+    // two rotations fight: at any yaw that is not a multiple of a right angle
+    // the board ends up pivoting about a diagonal, one corner in the sand and
+    // the opposite corner in the air, which is not a way a pallet can come to
+    // rest against anything.
+    g.rotation.order = 'YXZ';
     g.rotation.set(lean, ry, 0);
     const mat = this.mat('wood', [1.2, 0.8]);
     for (const bz of [-0.5, 0, 0.5]) {
@@ -1054,6 +1074,17 @@ export class Level {
       slat.castShadow = true; slat.receiveShadow = true;
       g.add(slat);
     }
+    // The lift has to come off the rotated bounding box. The old
+    // sin(lean) * 0.57 was the half depth of an unyawed pallet, which is only
+    // the right answer at ry = 0: with the yaw in play the 1.2 m length swings
+    // into the tipping plane as well, and the pair leaning by the sandbags was
+    // buried 23 cm below grade — the bottom third of both boards simply gone.
+    // Measuring instead of predicting also survives anyone changing the slat
+    // layout later. The extra centimetre keeps the lowest corner from
+    // z-fighting the sand it is resting on.
+    g.updateWorldMatrix(true, true);
+    const box = new THREE.Box3().setFromObject(g);
+    g.position.y = this.groundHeight(x, z) - box.min.y + 0.01;
     this.seal(g, { collide: false });
     return g;
   }
@@ -1135,8 +1166,16 @@ export class Level {
     const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.62, 16), wood);
     hub.castShadow = true; hub.receiveShadow = true;
     g.add(hub);
+    // The coil is rubber-sheathed cable, so it takes the tyre sampler. A
+    // cylinder's v runs along its own axis, and this one lies on its side, so
+    // the sampler's circumferential crown and sidewall bands fall across the
+    // width of the coil — the direction the windings stack — while the tread
+    // rows wrap the drum every three or four centimetres. One tile across
+    // rather than one tile per winding: sixteen would have made the v texel
+    // density eight times the u density, and the mip chain then throws away
+    // the tread that is the whole reason for choosing this sampler.
     const coil = new THREE.Mesh(new THREE.CylinderGeometry(0.44, 0.44, 0.50, 20),
-      new THREE.MeshStandardMaterial({ color: 0x241f1c, roughness: 0.86, metalness: 0.12 }));
+      this.mat('rubber', [3, 1]));
     coil.castShadow = true; coil.receiveShadow = true;
     g.add(coil);
     this.seal(g);
@@ -1265,6 +1304,13 @@ export class Level {
       leg.castShadow = true; leg.receiveShadow = true;
       g.add(leg);
     }
+    // Ring bracing. rotation.z lays the cylinder over onto the x axis and
+    // rotation.y then has to swing it a further quarter turn past the radial
+    // direction for it to run along the side of the square it spans. Without
+    // that extra Math.PI/2 every bar pointed at the tower's own axis instead,
+    // so each ring came out as four spikes crossing the middle and standing a
+    // metre proud of the legs — plainly visible against the sky in cross.png,
+    // and the same mistake the watchtower bracing was making.
     for (let lvl = 1; lvl <= 3; lvl++) {
       const t = lvl / 4;
       const r = lerp(S, T, t) * 2;
@@ -1272,7 +1318,7 @@ export class Level {
         const a = (side / 4) * TAU;
         const bar = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, r * 1.02, 5), steel);
         bar.position.set(Math.cos(a) * r * 0.5, t * h, Math.sin(a) * r * 0.5);
-        bar.rotation.set(0, -a, Math.PI / 2);
+        bar.rotation.set(0, -a + Math.PI / 2, Math.PI / 2);
         bar.castShadow = true;
         g.add(bar);
       }
@@ -1364,7 +1410,13 @@ export class Level {
       whip.castShadow = true;
       g.add(whip);
     }
-    const guyMat = new THREE.MeshStandardMaterial({ color: 0x2a2724, roughness: 0.8, metalness: 0.35 });
+    // Guy ropes are steel wire rope, and gunmetal is the only fully metallic
+    // dark sampler here: its F0 sits at 0.11 linear, dark enough to hold the
+    // silhouette against a dawn sky but still reflective, so each guy picks up
+    // a moving glint along its length instead of being a dead charcoal line.
+    // Rust would have been wrong — a tensioned guy sheds scale rather than
+    // holding the orange plates that sampler paints.
+    const guyMat = this.mat('gunmetal', [8, 1]);
     for (let i = 0; i < 3; i++) {
       const a = (i / 3) * TAU + 1.2;
       const anchor = new THREE.Vector3(Math.cos(a) * h * 0.40, 0, Math.sin(a) * h * 0.40);
@@ -1418,8 +1470,17 @@ export class Level {
       this.group.add(brace);
 
       for (const s of [-1, 1]) {
+        // Glazed porcelain, and nothing in the sampler set is glazed. Concrete
+        // is the closest in value and grain; the colour factor cools it to the
+        // blue-grey a fired insulator is, and the roughness multiplier — which
+        // scales the ORM's green channel rather than replacing it — takes the
+        // whole map down to a half-gloss without flattening its variation.
+        // Building this material inside the loop was also making one material
+        // per insulator: ten of the sixty-three unmapped entries were these.
         const ins = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.06, 0.13, 8),
-          new THREE.MeshStandardMaterial({ color: 0x7d8c8f, roughness: 0.35, metalness: 0.05 }));
+          this.mat('concrete', 1, {
+            color: new THREE.Color(0.86, 1.08, 1.14), roughness: 0.5,
+          }));
         ins.position.set(x, y0 + height - 0.37, z + s * 0.78);
         ins.castShadow = true;
         this.group.add(ins);
@@ -1435,7 +1496,13 @@ export class Level {
 
     // Cables thick enough to survive the shadow map — a hairline wire simply
     // falls through the texels and casts nothing.
-    const wireMat = new THREE.MeshStandardMaterial({ color: 0x191715, roughness: 0.82, metalness: 0.35 });
+    //
+    // Bare stranded conductor, so gunmetal again, at roughly one tile per two
+    // metres of span. It is a real change of read: these cross the top of the
+    // detail framing against open sky, and a flat 0x191715 tube gave them the
+    // same value from end to end where a metal picks the sky up on its upper
+    // quarter and goes dark underneath, which is what tells the eye it is round.
+    const wireMat = this.mat('gunmetal', [10, 1]);
     for (let i = 0; i < tops.length - 1; i++) {
       for (let w = 0; w < 2; w++) {
         const a = tops[i][w], b = tops[i + 1][w];
@@ -1465,9 +1532,12 @@ export class Level {
       p.y -= Math.sin(k * Math.PI) * sag;
       pts.push(p);
     }
+    // A service drop is sheathed, not bare, so it takes the rubber sampler
+    // rather than the gunmetal the catenaries above it use — matt where they
+    // are bright, which is the whole reason to run a spur at all.
     const mesh = new THREE.Mesh(
       new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 20, radius, 4, false),
-      new THREE.MeshStandardMaterial({ color: 0x201d1a, roughness: 0.85, metalness: 0.3 }),
+      this.mat('rubber', [12, 1]),
     );
     mesh.castShadow = true;
     this.group.add(mesh);
@@ -1482,9 +1552,13 @@ export class Level {
     const bays = Math.max(1, Math.round(len / 2.6));
     const bay = len / bays;
     const steel = this.mat('rust', [1, 2]);
-    const meshMat = new THREE.MeshStandardMaterial({
-      color: 0x6e6b64, roughness: 0.6, metalness: 0.75, side: THREE.DoubleSide,
-    });
+    // The fabric gets the same sampler as the posts it hangs on, so a bay does
+    // not read as two different metals bolted together. The bars are 4 cm
+    // boxes and every face carries a full 0..1 uv, so the across-the-bar texel
+    // density is fixed however the repeat is set; three tiles up the height is
+    // the compromise that keeps the along-the-bar density in the same range as
+    // the rest of the fence.
+    const meshMat = this.mat('rust', [1, 3], { side: THREE.DoubleSide });
 
     const g = new THREE.Group();
     g.position.set(x0, 0, z0);
@@ -1561,7 +1635,17 @@ export class Level {
       this.raycastables.push(post);
       tops.push(new THREE.Vector3(x, y0 + h, z));
     }
-    const wireMat = new THREE.MeshStandardMaterial({ color: 0x4a423a, roughness: 0.75, metalness: 0.6 });
+    // Two strands per bay at a shade under two metres, so one tile per strand
+    // puts these at the same texel size as the pickets carrying them.
+    //
+    // Rust straight out of the box was too hot here. These run diagonally
+    // across the near foreground of the detail framing lit from behind, the
+    // tubes have four radial segments so a single flat facet faces the sun for
+    // the whole length of a bay, and at the sampler's own 0.4 roughness on
+    // bare steel that facet returned one clipped white line per strand. Both
+    // multipliers only scale what the ORM already holds, so the oxide stays
+    // exactly as authored and only the bare metal comes off the boil.
+    const wireMat = this.mat('rust', [2, 1], { roughness: 1.25, metalness: 0.7 });
     for (let i = 0; i < n; i++) {
       for (const drop of [0.10, 0.44]) {
         const a = tops[i].clone(), b = tops[i + 1].clone();
@@ -1582,7 +1666,11 @@ export class Level {
 
   /** Bent reinforcement bar clawing out of a broken section. */
   rebar(x, y, z, ry, n) {
-    const mat = new THREE.MeshStandardMaterial({ color: 0x50372a, roughness: 0.88, metalness: 0.55 });
+    // Reinforcement bar left open to the weather is the most literal use the
+    // rust sampler has anywhere in the level. Two tiles along the bar puts a
+    // tile roughly every half metre, which is the density the barrels and the
+    // awning legs already run at.
+    const mat = this.mat('rust', [2, 1]);
     const parts = [];
     for (let i = 0; i < n; i++) {
       const len = 0.5 + this.rand() * 1.1;
@@ -1598,6 +1686,14 @@ export class Level {
       }
       const geo = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 8, 0.014, 4, false);
       geo.translate((this.rand() - 0.5) * 0.42, 0, (this.rand() - 0.5) * 0.34);
+      // Every tube carries the same 0..1 uv, so without this the whole claw
+      // samples the identical stretch of the rust map and nine bars share one
+      // pattern of scale and bare metal — which is precisely how a merged lump
+      // reads rather than nine separate bars. The maps wrap, so sliding each
+      // bar's uv by a random amount costs nothing and decorrelates them.
+      const uv = geo.attributes.uv;
+      const du = this.rand(), dv = this.rand();
+      for (let k = 0; k < uv.count; k++) uv.setXY(k, uv.getX(k) + du, uv.getY(k) + dv);
       parts.push(geo);
     }
     const mesh = new THREE.Mesh(mergeGeometries(parts), mat);
@@ -1630,15 +1726,28 @@ export class Level {
       leg.castShadow = true; leg.receiveShadow = true;
       g.add(leg);
     }
-    // Cross bracing.
+    // Ring bracing between the legs. The position is the midpoint of one side
+    // of the square the four legs cut at this height, and w is that side's
+    // full length — the legs batter from 0.62 S at the foot to 0.32 S at the
+    // deck, so the span closes as the ring climbs.
+    //
+    // The orientation was wrong and had to be a quarter turn further round.
+    // rotation.z tips the cylinder's axis onto x; rotation.y = -a then leaves
+    // that axis pointing at the tower's centre, so all twelve bars came out as
+    // radial spikes that met nothing and stood a metre proud of the legs. The
+    // extra Math.PI/2 turns each one to run along its side, where it belongs.
+    // Length is now the span exactly. The old w * 1.05 put each end five
+    // centimetres past the leg's centre line, which is about the leg's own
+    // radius, so once the bars were turned the right way the caps would have
+    // sat right on the surface of the tube they are supposed to die into.
     for (let lvl = 1; lvl <= 3; lvl++) {
       const y = (lvl / 4) * H;
       const w = S * (0.62 - 0.3 * (y / H)) * 2;
       for (let side = 0; side < 4; side++) {
         const a = (side / 4) * TAU;
-        const brace = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, w * 1.05, 6), steel);
+        const brace = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, w, 6), steel);
         brace.position.set(Math.cos(a) * w * 0.5, y, Math.sin(a) * w * 0.5);
-        brace.rotation.set(0, -a, Math.PI / 2);
+        brace.rotation.set(0, -a + Math.PI / 2, Math.PI / 2);
         brace.castShadow = true;
         g.add(brace);
       }
@@ -1656,15 +1765,29 @@ export class Level {
       rail.castShadow = true; rail.receiveShadow = true;
       g.add(rail);
     }
-    const roof = new THREE.Mesh(new RoundedBoxGeometry(S * 1.85, 0.09, S * 1.85, 2, 0.02),
+    const ROOF_Y = H + 2.05, ROOF_T = 0.09, ROOF_TILT = 0.05;
+    const roof = new THREE.Mesh(new RoundedBoxGeometry(S * 1.85, ROOF_T, S * 1.85, 2, 0.02),
       this.mat('corrugated', [3, 3]));
-    roof.position.y = H + 2.05;
-    roof.rotation.z = 0.05;
+    roof.position.y = ROOF_Y;
+    roof.rotation.z = ROOF_TILT;
     roof.castShadow = true; roof.receiveShadow = true;
     g.add(roof);
+    // Each post has to reach the sheet it is holding up. The tilt is only 0.05
+    // radians, but that is fourteen centimetres of rise across the 2.9 m
+    // between the posts, so one uniform 2.0 m length left the pair on the high
+    // side two and a half centimetres short — and at a sun this low a gap that
+    // size is a bright slot of sky under the eave — while the pair on the low
+    // side ran a hand's width up through the roof. Solving the tilted slab's
+    // underside at each post's x and burying the top two centimetres in it
+    // closes both ends of that.
     for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
-      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 2.0, 6), steel);
-      post.position.set(sx * S * 0.68, H + 1.05, sz * S * 0.68);
+      const px = sx * S * 0.68;
+      const foot = H + 0.05;
+      const under = ROOF_Y + (px - ROOF_T * 0.5 * Math.sin(ROOF_TILT)) * Math.tan(ROOF_TILT)
+        - ROOF_T * 0.5 * Math.cos(ROOF_TILT);
+      const len = under - foot + 0.02;
+      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, len, 6), steel);
+      post.position.set(px, foot + len / 2, sz * S * 0.68);
       post.castShadow = true;
       g.add(post);
     }
@@ -1779,9 +1902,23 @@ export class Level {
       bushGeos.push(mergeGeometries(parts));
     }
 
-    const scrubMat = new THREE.MeshStandardMaterial({
-      color: 0x8a7a4c, roughness: 0.92, metalness: 0,
-      side: THREE.DoubleSide, flatShading: false,
+    // There is no vegetation sampler, and burlap is the closest thing to one:
+    // it is authored as sun-rotted plant fibre, which is what dead scrub is.
+    // Its eighteen threads per tile land at about two centimetres on a blade
+    // this size — coarse enough to read as fibre up close and to mip away
+    // cleanly at range. Canvas is the other cloth sampler and its ninety-six
+    // threads would fall to four millimetres here, under a pixel at any
+    // distance these are seen from. Every blade shares one 0..1 uv so the map
+    // cannot vary bush to bush; what does the varying is the world-space macro
+    // pass, which burlap is enrolled in and the old flat material was not.
+    // The colour factor carries the original olive-yellow over the sampler's
+    // browner hessian, and the normal is held right down because full-strength
+    // weave relief on a four-millimetre blade is just shading noise.
+    const scrubMat = this.mat('burlap', 1, {
+      color: new THREE.Color(1.20, 1.15, 0.82),
+      side: THREE.DoubleSide,
+      normalScale: 0.4,
+      aoMapIntensity: 0.6,
     });
     for (const geo of bushGeos) {
       const M = 90;
@@ -1888,6 +2025,14 @@ export class Level {
       geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
       geo.setIndex(new THREE.BufferAttribute(idx, 1));
       geo.computeVertexNormals();
+      // These three stay flat-coloured on purpose, and they are the only
+      // unmapped materials left in the level. The bands carry no uv attribute
+      // at all, so a map would sample one texel over the whole ridge; and even
+      // with uvs authored, the nearest band starts 155 m out and every tile of
+      // any sampler here would be well under a pixel, mip to its own average
+      // and shift the tone the aerial perspective was balanced against. What
+      // separates these from the sand is the crest silhouette and the haze,
+      // neither of which a texture contributes to at this distance.
       const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
         color: b.tone, roughness: 1.0, metalness: 0, side: THREE.DoubleSide,
       }));
@@ -2102,9 +2247,26 @@ export class Level {
     this.pallet(-10.4, 6.9, 0.9);
     this.pallet(-10.0, 6.6, 1.4, 0.05);
     this.pallet(4.2, 8.4, 0.3);
-    this.pallet(4.6, 8.1, -0.4, 0.9);
-    this.pallet(-8.9, -0.5, 1.02, 1.24);
-    this.pallet(-8.6, -1.0, 1.12, 1.30);
+    // Twenty-five degrees, down from fifty-one, and squared up with the pallet
+    // lying beside it instead of crossing it at 0.4 radians — at half a metre
+    // apart the two were passing through each other slat for slat, which is
+    // the first thing the eye finds in the sunlit framing's near foreground.
+    // The yaw now matches, and the foot is set a quarter of a metre out from
+    // the flat pallet's near edge, which at this angle is exactly where the
+    // underside meets that edge: the board is carried on it and cantilevers
+    // over the deck, so nothing here is holding itself up.
+    this.pallet(4.29, 8.71, 0.30, 0.44);
+    // These two used to stand at seventy-odd degrees a metre and a half clear
+    // of anything, leaning on air. They are now against the sandbag line at
+    // (-8.4, -2.6): yaw matched to the wall's 0.62 so the tip axis runs
+    // parallel to it, lean set so the raised edge lands at the 1.0 m crown of a
+    // three-row stack, and the centres 0.49 m out from the wall's axis, which
+    // puts that edge seven centimetres inside the bags. The overlap is
+    // deliberate — the bags are jittered and individually scaled, so a contact
+    // authored flush shows daylight under half of them. Spaced 1.4 m apart
+    // along the wall so the two 1.2 m boards no longer pass through each other.
+    this.pallet(-9.75, -1.04, 0.60, 1.10);
+    this.pallet(-8.59, -1.84, 0.65, 1.06);
     this.cableDrum(-7.2, 8.6, 0.4);
     this.cableDrum(14.8, 4.2, 1.2);
 
