@@ -18,7 +18,12 @@ const TAU = Math.PI * 2;
 // Rig-space pull applied to the sun-tracked key: over the camera's left
 // shoulder and above, which is the only quadrant that lights the flank of a
 // right-hand-carried weapon.
-const KEY_BIAS = new THREE.Vector3(-0.95, 0.78, 0.62);
+// Short on purpose. Against a unit sun vector this is the pull, so the key
+// mostly follows the world sun and is only nudged toward the flank the lens
+// sees. At its old length of 1.377, with the sun blended in at weight 0.40,
+// the key could swing 16.9 degrees off this axis over a full 360 degrees of
+// player heading — a fixed studio light with a rounding error of sun in it.
+const KEY_BIAS = new THREE.Vector3(-0.42, 0.34, 0.27);
 
 /**
  * Builds viewmodel materials off one shared texture pair per surface.
@@ -566,16 +571,20 @@ function buildCarbine() {
 /* ------------------------------------------------------------- viewmodel -- */
 
 export class Weapon {
-  constructor(renderer, worldCamera, environment) {
+  constructor(renderer, worldCamera, environment, environmentIntensity = 0.13) {
     this.renderer = renderer;
     this.worldCamera = worldCamera;
 
     this.scene = new THREE.Scene();
     this.scene.environment = environment;
-    // The shadow side of a black rifle has nothing but sky to work with, so
-    // this carries most of the value there. Pushed past ~1.3 the small
-    // anodised parts start mirroring the dawn and read as bare aluminium.
-    this.scene.environmentIntensity = 0.80;
+    // Taken from the world, not invented here. This was the literal 0.80 while
+    // the world computed PRESET.environmentIntensity * envPeak and arrived at
+    // 0.128 — the same PMREM texture lit 6.2 times harder on the weapon than
+    // on everything the weapon is standing in front of. The two numbers were
+    // in different units, which is a bug rather than a look. The small bias
+    // that remains is deliberate: the hero prop may sit slightly proud of the
+    // world, it may not live in a different exposure.
+    this.scene.environmentIntensity = environmentIntensity * 1.25;
 
     // Viewmodel FOV is deliberately decoupled from the world camera. The world
     // runs very wide for peripheral awareness; putting a 0.84 m object through
@@ -701,7 +710,7 @@ export class Weapon {
     // sun 8 degrees above the horizon backlights the carbine from most player
     // headings, and an honest key would silhouette the hero prop on half the
     // compass. Direction tracks the sun; placement is pulled toward the lens.
-    this.key = new THREE.DirectionalLight(0xffdcbb, 4.20);
+    this.key = new THREE.DirectionalLight(0xffdcbb, 9.50);
     this.key.position.set(0.6, 1.0, 0.35);
     this.key.castShadow = true;
     this.key.shadow.mapSize.set(1024, 1024);
@@ -719,28 +728,28 @@ export class Weapon {
     // Cool sky on the shadow side. Kept low and to the side: raised overhead it
     // lights every top face at once and the receiver reads as light grey
     // plastic instead of phosphate.
-    this.fill = new THREE.DirectionalLight(0x9fbde0, 2.90);
+    this.fill = new THREE.DirectionalLight(0x9fbde0, 0.34);
     this.fill.position.set(0.85, 0.75, 0.90);
     this.scene.add(this.fill);
 
     // Rim rides past the sun and high, so the top rail and the optic tube keep
     // a hot edge that no amount of key can give a flat-topped receiver.
-    this.rim = new THREE.DirectionalLight(0xffc9a2, 0.45);
+    this.rim = new THREE.DirectionalLight(0xffc9a2, 0.30);
     this.rim.position.set(-0.25, 0.95, -1.0);
     this.scene.add(this.rim);
 
     // Sand bounce. At this hour the ground is the brightest surface in frame
     // and the undersides of the magazine, handguard and support glove see
     // essentially nothing else; without it they sit on the grade's black floor.
-    this.bounce = new THREE.DirectionalLight(0xffc890, 0.66);
+    this.bounce = new THREE.DirectionalLight(0xffc890, 0.22);
     this.bounce.position.set(0.15, -1.0, 0.30);
     this.scene.add(this.bounce);
 
     // Sky-over-sand ambient plus a flat floor. A black rifle sits around 0.06
     // albedo; without this much indirect the shadow side lands under the tone
     // curve's toe and the whole lower half of the weapon crushes to zero.
-    this.scene.add(new THREE.HemisphereLight(0x9cc0e6, 0xb08a58, 0.44));
-    this.scene.add(new THREE.AmbientLight(0xdfe4ee, 0.23));
+    this.scene.add(new THREE.HemisphereLight(0x9cc0e6, 0xb08a58, 0.18));
+    this.scene.add(new THREE.AmbientLight(0xdfe4ee, 0.06));
   }
 
   /** Aligns the viewmodel rig with the world sun as the player turns. */
@@ -753,7 +762,13 @@ export class Weapon {
     // that flank in shade on most headings and the hero prop goes to
     // silhouette. Sun weight is low enough to stay believable and high enough
     // that turning into the light visibly changes the weapon.
-    this.key.position.copy(sun).multiplyScalar(0.40).add(KEY_BIAS).normalize().multiplyScalar(2);
+    // Sun at full weight, bias as a nudge. A neutral sphere in this scene used
+    // to hold the same luma to within 0.00 stops across every player heading
+    // while the identical sphere in the world swung 4.4 — the weapon was lit
+    // by a studio, not by the sunrise it was standing in. Some bias is right
+    // and every shipped shooter carries it, but it biases the world's light
+    // rather than replacing it.
+    this.key.position.copy(sun).add(KEY_BIAS).normalize().multiplyScalar(2);
     this.key.target.position.set(0, -0.05, -0.2);
     this.key.target.updateMatrixWorld();
 

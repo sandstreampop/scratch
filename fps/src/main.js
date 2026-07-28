@@ -175,7 +175,8 @@ class Game {
 
   setupWeapon() {
     this.player = new Player(this.level, this.camera);
-    this.weapon = new Weapon(this.renderer, this.camera, this.scene.environment);
+    this.weapon = new Weapon(this.renderer, this.camera,
+      this.scene.environment, this.scene.environmentIntensity);
     window.__MARK?.('weapon');
   }
 
