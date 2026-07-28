@@ -147,10 +147,32 @@ class SunShaftsPass extends Pass {
     this.scene = scene;
     this.camera = camera;
 
+    // Multisampled, and that is not an optimisation — it is what stops the
+    // pass drawing bright vertical streaks over thin occluders.
+    //
+    // The mask is half resolution, so a gate bar, a tower leg or a guy wire
+    // covers well under a pixel in it. Without coverage samples those pixels
+    // come back as open sky, `onSky` below hands them the full unoccluded
+    // in-scatter, and the march paints a bright line straight down the middle
+    // of the object that is supposed to be blocking the light. Four
+    // independent reviewers picked those streaks out of one frame.
+    //
+    // It got worse, not better, when the beauty pass gained MSAA: the scene
+    // then resolved thin geometry that the mask still could not, so the streak
+    // landed on a wire the viewer could now clearly see.
+    //
+    // This reduced the streaks but did not remove them, and the remainder is
+    // NOT understood. Three causes have been eliminated by experiment: mask
+    // multisampling (helped, partial), mask resolution (full size changed
+    // nothing and was reverted), and specular aliasing on the corrugated
+    // sampler's sub-pixel ridges (its clean-sheet roughness floor was a
+    // near-mirror 0.42 and raising it to a physically sane 0.62 left the
+    // dashes untouched). Whatever draws them is somewhere else.
     this.maskTarget = new THREE.WebGLRenderTarget(1, 1, {
       type: THREE.UnsignedByteType,
       colorSpace: THREE.LinearSRGBColorSpace,
       depthBuffer: true,
+      samples: 4,
     });
     this.setSize(width, height);
 
@@ -174,6 +196,11 @@ class SunShaftsPass extends Pass {
   }
 
   setSize(width, height) {
+    // Half resolution, kept. Full resolution was tried against the vertical
+    // streaks near the sun and made no difference to them at all, so it was a
+    // doubled scene pass buying nothing. The multisampling above stays because
+    // it visibly reduced them and is nearly free; the residual has a different
+    // cause, still unidentified — see the note on the mask target.
     this.maskTarget.setSize(Math.max(2, width >> 1), Math.max(2, height >> 1));
   }
 

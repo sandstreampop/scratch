@@ -696,7 +696,18 @@ const SAMPLERS = {
     c.r = lerp(c.r, 0.428, rust * 0.82); c.g = lerp(c.g, 0.296, rust * 0.82); c.b = lerp(c.b, 0.216, rust * 0.82);
 
     c.metal = clamp(1 - rust * 0.92 - chalk * 0.20, 0, 1);
-    c.rough = clamp(lerp(0.42, 0.94, rust) + chalk * 0.26 - spangle * 0.06 + grit * 0.05, 0, 1);
+    // The clean-sheet floor was 0.42, which is a near-mirror, and this sampler
+    // carries the strongest normal map in the set (2.6) over corrugation whose
+    // ridges go sub-pixel at any distance. A grazing dawn sun on that
+    // combination aliases: the specular lobe lands on one ridge and misses the
+    // next, and a solid gate comes out wearing a row of bright vertical dashes
+    // that four reviewers each read as a rendering bug. It is not a shafts
+    // artefact — multisampling the occlusion mask and then rendering it at full
+    // resolution both failed to touch it.
+    //
+    // Weathered galvanised sheet is not polished metal in any case. Zinc
+    // oxidises to a dull grey skin within a season, and 0.62 is where it sits.
+    c.rough = clamp(lerp(0.62, 0.94, rust) + chalk * 0.26 - spangle * 0.06 + grit * 0.05, 0, 1);
     c.ao = 1 - rust * 0.16 - smoothstep(0.2, 0.0, Math.abs(wave)) * 0.10;
   },
 };
