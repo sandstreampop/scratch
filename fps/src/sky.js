@@ -27,7 +27,7 @@ export const PRESET = {
   // so anything above 1.0 linear is gone before the tone curve can roll it
   // off; holding the scene down is the only way to keep highlight headroom for
   // the tone map to shape. Exposure and the light intensities move together.
-  exposure: 2.55,
+  exposure: 3.70,
   skyGain: 0.130,
   // Preetham's disc is the true 0.53 deg sun, which is six pixels at this
   // field of view — too small to survive antialiasing, let alone read as the

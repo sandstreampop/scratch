@@ -243,6 +243,25 @@ function build(size, sampler, normalStrength, aniso) {
 // smaller than a tile; the large scale is the macro pass's job, and it works
 // in world space where repetition cannot reach it.
 
+// Diffuse albedo across these samplers is a ladder, and it has to stay one.
+//
+// Every material here was authored between 0.30 and 0.77 peak — a two-to-one
+// spread — while the real ladder from limewash to tyre rubber spans about
+// twenty to one. Twelve blind reviewers across three panels each reported that
+// steel, wood, cloth, concrete and rubber all answer the light identically,
+// and this was the mechanism: albedo carried almost no information about what
+// a surface was made of, so nothing but the normal map distinguished them, and
+// the normal map mips away.
+//
+// Roughly where real materials sit, for anyone retuning one of these:
+//   limewash plaster 0.60-0.70   dry sand 0.35-0.45   galvanised sheet 0.35-0.50
+//   concrete 0.25-0.40           hessian 0.30-0.40    weathered timber 0.25-0.35
+//   olive-drab canvas 0.12-0.20  polymer furniture 0.05-0.12
+//   phosphated steel 0.05-0.08   tyre rubber 0.03-0.05
+//
+// Raising one because it "looks too dark" is almost always the wrong fix; the
+// exposure and the key-to-fill ratio are the levers for that, and a surface
+// brighter than its real counterpart clips before the tone curve can shape it.
 const SAMPLERS = {
   /** Fine desert sand: wind ripples, scattered grit, occasional pebble. */
   sand(u, v, c, s) {
@@ -498,7 +517,7 @@ const SAMPLERS = {
 
     c.h = 0.08 + thread * 0.50 + fray * 0.15 + slack * 0.27;
 
-    const l = 0.482 + thread * 0.098 + fray * 0.052;
+    const l = 0.336 + thread * 0.068 + fray * 0.036;
     c.r = l * 1.020; c.g = l * 0.908; c.b = l * 0.702;
     c.r = lerp(c.r, c.r * 1.13, sun * 0.6); c.g = lerp(c.g, c.g * 1.11, sun * 0.6); c.b = lerp(c.b, c.b * 1.08, sun * 0.6);
     c.r = lerp(c.r, 0.372, dirty * 0.40); c.g = lerp(c.g, 0.322, dirty * 0.40); c.b = lerp(c.b, 0.252, dirty * 0.40);
@@ -586,7 +605,7 @@ const SAMPLERS = {
     c.h = 0.62 + ring * 0.13 + grain * 0.13 - split * 0.32 - gap * 0.85 - knot * 0.20;
 
     // Boards come from different batches; a uniform tone reads as extrusion.
-    const l = 0.412 + ring * 0.072 + grain * 0.058 + (shade - 0.5) * 0.075;
+    const l = 0.282 + ring * 0.050 + grain * 0.040 + (shade - 0.5) * 0.052;
     c.r = l * 1.055; c.g = l * 0.942; c.b = l * 0.792;
     // Silvered, UV-bleached surface on the exposed face.
     const grey = smoothstep(0.28, 0.84, fbm(u, v, 4, 2) * 0.5 + 0.5);
@@ -615,7 +634,7 @@ const SAMPLERS = {
 
     c.h = 0.48 + weave * 0.16 + slub * 0.10 + fold * 0.26;
 
-    const l = 0.462 + weave * 0.042 + slub * 0.030 + fold * 0.052;
+    const l = 0.196 + weave * 0.020 + slub * 0.014 + fold * 0.024;
     c.r = l * 1.065; c.g = l * 1.000; c.b = l * 0.800;
     c.r = lerp(c.r, c.r * 1.18, bleach * 0.6); c.g = lerp(c.g, c.g * 1.16, bleach * 0.6); c.b = lerp(c.b, c.b * 1.13, bleach * 0.6);
     c.r = lerp(c.r, 0.318, stain * 0.6); c.g = lerp(c.g, 0.286, stain * 0.6); c.b = lerp(c.b, 0.238, stain * 0.6);
@@ -643,7 +662,7 @@ const SAMPLERS = {
     // Manganese phosphate is a dark conversion coat over steel, so it is
     // still a metal: authored near black it reflects nothing and the rifle
     // becomes a silhouette. F0 around 0.11 linear keeps it dark but alive.
-    const l = 0.324 + speck * 0.050 + grain * 0.026;
+    const l = 0.086 + speck * 0.016 + grain * 0.009;
     c.r = l * 0.990; c.g = l * 1.000; c.b = l * 1.038;
     // Steel polished through at the handling points.
     c.r = lerp(c.r, 0.702, wear * 0.85); c.g = lerp(c.g, 0.710, wear * 0.85); c.b = lerp(c.b, 0.722, wear * 0.85);
@@ -665,7 +684,7 @@ const SAMPLERS = {
 
     c.h = 0.56 + stipple * 0.32 + mould * 0.10;
 
-    const l = 0.248 + mould * 0.030 + stipple * 0.024;
+    const l = 0.104 + mould * 0.014 + stipple * 0.011;
     c.r = l * 1.055; c.g = l * 1.000; c.b = l * 0.946;
     c.r += scuff * 0.055; c.g += scuff * 0.050; c.b += scuff * 0.044;
 
@@ -697,7 +716,7 @@ const SAMPLERS = {
     // its coating, and a mirror-bright roof aimed at a dawn sun clips to a
     // white slab in an eight-bit post buffer.
     const chalk = smoothstep(0.35, 0.78, fbm(u + 0.6, v + 0.2, 4, 6) * 0.5 + 0.5);
-    const l = 0.588 + zinc * 0.072 + spangle * 0.048 + grit * 0.022 + chalk * 0.040;
+    const l = 0.412 + zinc * 0.052 + spangle * 0.034 + grit * 0.016 + chalk * 0.029;
     c.r = l * 0.982; c.g = l * 1.000; c.b = l * 1.028;
     c.r = lerp(c.r, 0.428, rust * 0.82); c.g = lerp(c.g, 0.296, rust * 0.82); c.b = lerp(c.b, 0.216, rust * 0.82);
 
