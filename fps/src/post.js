@@ -595,18 +595,24 @@ export class PostStack {
     this.renderPass = new RenderPass(scene, camera);
     this.composer.addPass(this.renderPass);
 
-    // Ground-truth ambient occlusion, off by default.
+    // Ground-truth ambient occlusion. On, on the tiers that can afford it.
     //
-    // It no longer zeroes the ground plane at the current 0.1/700 frustum —
-    // OUTPUT.Normal is a correct view-space normal buffer and the beauty pass
-    // survives it. It also contributes nothing: OUTPUT.Denoise comes back at
-    // 1.0 across the whole frame for every world-space radius from 0.4 m to
-    // 2 m and for screenSpaceRadius at 32 px. Paying a full extra depth and
-    // normal prepass for an all-white occlusion buffer is worse than having
-    // no AO, so this stays off until someone finds what the horizon search
-    // is doing on this depth range.
+    // The comment that used to sit here said OUTPUT.Denoise came back at 1.0
+    // across the whole frame at every radius tried, and concluded the horizon
+    // search was broken on this depth range. That measurement was taken while
+    // validateFrame had silently disabled the entire post chain, so what it
+    // actually sampled was the forward render — the same bug that had four
+    // reviewers grading a look with no bloom or tone curve in it. Re-measured
+    // with the chain live, Denoise reads mean 232/255 with a floor of 167 and
+    // some occlusion on 56% of the frame. It was working the whole time.
+    //
+    // This matters more here than in a normally-lit scene. Four blind
+    // reviewers, unprompted, each said nothing in the frame reads as touching
+    // the ground, and one ranked contact occlusion above resolution, geometry
+    // budget and post-processing combined as a share of the gap to a shipped
+    // title.
     this.gtao = new GTAOPass(scene, camera, w, h);
-    this.gtao.enabled = false;
+    this.gtao.enabled = false;   // quality tier decides; see applyQuality
     this.gtao.output = GTAOPass.OUTPUT.Default;
     this.gtao.updateGtaoMaterial({
       radius: 0.6,
