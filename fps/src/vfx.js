@@ -889,7 +889,15 @@ export class VFX {
     // Without this the gun and the ground stay in shadow while a bright decal
     // floats beside them; the bounce is what sells the frame as a gunshot.
     _v.copy(position).addScaledVector(direction, 0.20);
-    this._muzzleFlash.pulse(_v, 0xffb474, 90, 0.075);
+    // 90 was set against a 3.0 sun with the post chain silently disabled, so
+    // nothing bloomed and nothing clipped. Against a 13.0 sun with bloom live
+    // it washed out a third of the frame every time an enemy fired, which in
+    // this scene is more or less continuously. With decay 2 the contribution
+    // at three metres goes as I/9, and sunlit ground sits near 2.0 at this
+    // grazing sun angle, so 20 puts the flash on the same footing as daylight
+    // at conversational range and lets it fall away instead of flattening
+    // everything inside five metres.
+    this._muzzleFlash.pulse(_v, 0xffb474, 20, 0.075);
   }
 
   /** Dust kicked up by a footfall. */
