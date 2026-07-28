@@ -544,9 +544,22 @@ export class PostStack {
     this.bufferType = bufferType;
     this.postDisabled = false;
     this._validated = false;
+    // Multisampling on the target RenderPass draws into. Razor wire, guy wires
+    // and ladder rungs are sub-pixel at this distance, and with no coverage
+    // samples the rasteriser simply misses them on roughly one scanline in
+    // five — the perimeter wire came out as a dashed line. No post-process
+    // antialiasing can repair that, because SMAA and FXAA reconstruct edges
+    // from neighbouring pixels and there is nothing in the neighbours to
+    // reconstruct from: the geometry was never sampled at all.
+    //
+    // WebGL1 has no multisampled renderbuffers, so this has to be gated. three
+    // ignores `samples` on a WebGL1 context rather than failing, but being
+    // explicit keeps the intent legible and costs nothing.
+    const msaa = renderer.capabilities.isWebGL2 ? 4 : 0;
+    this.msaaSamples = msaa;
     this.composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(w, h, {
       type: bufferType,
-      samples: 0,
+      samples: msaa,
       colorSpace: THREE.LinearSRGBColorSpace,
     }));
     this.composer.setPixelRatio(dpr);
