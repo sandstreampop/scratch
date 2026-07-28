@@ -426,32 +426,150 @@ export async function openSim({
 
 /* ----------------------------------------------------------- assertions -- */
 
-export function makeReporter(label) {
+/**
+ * The reporter, rewritten to make the ways a suite lies structurally impossible
+ * rather than merely discouraged.
+ *
+ * The first generation of suites was audited by a critic per suite, and four of
+ * five came back as decoration. Every defect was something the old three-method
+ * reporter permitted:
+ *
+ *   - 23 of 53 movement checks were `check(name, true, …)`: green by
+ *     construction. Raising walkSpeed by 32% left the failure set byte-identical.
+ *   - Expectations were read from the constant under test, so both sides of the
+ *     comparison moved together and nothing constrained any speed at all.
+ *   - Every suite wrote its own fuzzy target lookup, matching camelCase against
+ *     targets.mjs's snake_case keys. Two of twenty resolved in movement, zero of
+ *     ten in ai — and each miss printed "no sourced target yet", which was a
+ *     false claim about the research rather than a bug report about the lookup.
+ *   - `Number(null)` is 0, so a threshold that was never crossed printed as
+ *     "measured 0.0000 ms" and passed.
+ *   - An airtime in milliseconds was compared against a target in seconds and
+ *     reported as "off by 81233%", which is a test that a 0.6 ms jump passes.
+ *
+ * So: there is no way to pass a target value by hand (`against` takes a
+ * domain and a key and throws if the key is absent, which also fixes units and
+ * tolerance at the source), no way to record an unverified quantity as a
+ * passing check (`measure` prints but never counts as a pass), and no way for a
+ * missing measurement to read as zero (non-finite input throws).
+ */
+export function makeReporter(label, { targets = null } = {}) {
   const rows = [];
-  let failed = 0;
+  const fmt = (v, unit = '') => {
+    if (v === null || v === undefined) return 'none';
+    const a = Math.abs(v);
+    const s = a >= 1000 ? v.toFixed(0) : a >= 100 ? v.toFixed(1)
+      : v.toFixed(5).replace(/0+$/, '').replace(/\.$/, '');
+    return `${s}${unit}`;
+  };
+  const finite = (name, v, what) => {
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new Error(
+        `${what}("${name}") got ${JSON.stringify(v)}, which is not a finite number. `
+        + 'A measurement that did not happen must not be reported as one — assert that it '
+        + 'happened with report.reached() first, then measure it.',
+      );
+    }
+  };
+
   const report = {
     rows,
-    /** `detail` is mandatory: a pass with no number in it cannot be audited. */
+    get targets() { return targets; },
+
+    /**
+     * A structural invariant: something that must hold regardless of any
+     * reference value (a body never inside geometry, one sound per round, a
+     * monotonic curve). `ok` must be a real boolean and `detail` must carry a
+     * number, because a PASS with no number in it cannot be audited.
+     */
     check(name, ok, detail) {
-      if (!detail) throw new Error(`check("${name}") has no detail — a bare PASS is not a measurement`);
-      rows.push({ name, ok: !!ok, detail });
-      if (!ok) failed++;
+      if (typeof ok !== 'boolean') {
+        throw new Error(`check("${name}") was given ${typeof ok} for ok — pass a comparison, not a value`);
+      }
+      if (!detail || !/\d/.test(String(detail))) {
+        throw new Error(`check("${name}") has no number in its detail — that is not a measurement`);
+      }
+      rows.push({ kind: 'check', name, ok, detail });
       console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}  — ${detail}`);
-    },
-    /** Compares against a sourced target and prints the gap either way. */
-    against(name, measured, target, tol, unit = '') {
-      const lo = tol.min ?? (tol.pct != null ? target * (1 - tol.pct) : target - tol.abs);
-      const hi = tol.max ?? (tol.pct != null ? target * (1 + tol.pct) : target + tol.abs);
-      const ok = measured >= lo && measured <= hi;
-      const f = (v) => (Math.abs(v) >= 100 ? v.toFixed(1) : v.toFixed(4).replace(/0+$/, '').replace(/\.$/, ''));
-      report.check(name, ok,
-        `measured ${f(measured)}${unit}, target ${f(target)}${unit} `
-        + `[${f(lo)}..${f(hi)}]${target ? `, off by ${((measured / target - 1) * 100).toFixed(1)}%` : ''}`);
       return ok;
     },
+
+    /**
+     * Asserts a measurement against a sourced target, by key.
+     *
+     * The target, its unit and its tolerance all come from targets.mjs. A
+     * caller cannot supply them, so a suite cannot invent a tolerance, cannot
+     * drift out of sync with the research, and cannot compare milliseconds
+     * against seconds. An unknown key throws rather than degrading into a
+     * cheerful "no target yet".
+     */
+    against(name, measured, domain, key) {
+      if (!targets) throw new Error(`against("${name}") needs targets.mjs — the runner passes it in`);
+      const entry = targets.TARGETS?.[domain]?.[key];
+      if (!entry) {
+        throw new Error(
+          `against("${name}") references ${domain}.${key}, which is not in targets.mjs. `
+          + `Known keys in "${domain}": ${Object.keys(targets.TARGETS?.[domain] ?? {}).join(', ') || '(no such domain)'}`,
+        );
+      }
+      if (entry.tol === null || entry.tol === undefined) {
+        throw new Error(
+          `against("${name}") references ${domain}.${key}, which is qualitative (tol: null). `
+          + 'Assert the behaviour it describes with check() and quote the note.',
+        );
+      }
+      finite(name, measured, 'against');
+      const t = entry.value;
+      const tol = entry.tol;
+      const lo = tol.min ?? (tol.pct != null ? t * (1 - tol.pct) : t - tol.abs);
+      const hi = tol.max ?? (tol.pct != null ? t * (1 + tol.pct) : t + tol.abs);
+      const ok = measured >= lo && measured <= hi;
+      const unit = entry.unit ? ` ${entry.unit}` : '';
+      const off = (t !== 0 && t !== null) ? `, off by ${((measured / t - 1) * 100).toFixed(1)}%` : '';
+      rows.push({
+        kind: 'check', name, ok, target: `${domain}.${key}`,
+        detail: `measured ${fmt(measured)}${unit}, target ${fmt(t)}${unit} `
+          + `[${fmt(lo)}..${fmt(hi)}]${off}  <${domain}.${key}>`,
+      });
+      console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}  — ${rows[rows.length - 1].detail}`);
+      return ok;
+    },
+
+    /**
+     * Records a quantity with no sourced target.
+     *
+     * Printed, kept, and counted separately — never as a passing check. This
+     * exists so that "we measured it but nobody publishes a reference value" has
+     * an honest home, instead of being laundered into `check(name, true, …)` and
+     * inflating a pass rate.
+     */
+    measure(name, value, unit = '', note = '') {
+      finite(name, value, 'measure');
+      const detail = `${fmt(value, unit ? ` ${unit}` : '')}${note ? `  (${note})` : ''}`;
+      rows.push({ kind: 'measure', name, ok: null, detail });
+      console.log(`MEAS  ${name}  — ${detail}`);
+      return value;
+    },
+
+    /**
+     * Asserts that a measurement happened at all.
+     *
+     * The guard in front of measure()/against() for anything derived from "find
+     * the first sample where X" — that returns null when X never happened, and
+     * null must fail loudly rather than arrive downstream as zero.
+     */
+    reached(name, value, detail) {
+      const ok = typeof value === 'number' && Number.isFinite(value);
+      return report.check(name, ok,
+        detail ?? (ok ? `reached at ${fmt(value)}` : 'never reached in the window measured (0 samples qualified)'));
+    },
+
     finish() {
-      const total = rows.length;
-      console.log(`\n${label}: ${total - failed}/${total} checks passed`);
+      const checks = rows.filter((r) => r.kind === 'check');
+      const measures = rows.filter((r) => r.kind === 'measure');
+      const failed = checks.filter((r) => !r.ok).length;
+      console.log(`\n${label}: ${checks.length - failed}/${checks.length} checks passed`
+        + `${measures.length ? `, ${measures.length} measurements without a sourced target` : ''}`);
       return failed === 0;
     },
   };
