@@ -31,6 +31,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # Needed for the branch push at the end: without a checkout there is no
+      # git directory on the runner at all, and the push step dies with
+      # "fatal: not in a git directory" after the fetch has already succeeded.
+      - uses: actions/checkout@v4
+
       - name: Pull official screenshots
         env:
           APPIDS: ${{ inputs.appids }}
