@@ -162,12 +162,19 @@ class SunShaftsPass extends Pass {
     // landed on a wire the viewer could now clearly see.
     //
     // This reduced the streaks but did not remove them, and the remainder is
-    // NOT understood. Three causes have been eliminated by experiment: mask
-    // multisampling (helped, partial), mask resolution (full size changed
-    // nothing and was reverted), and specular aliasing on the corrugated
-    // sampler's sub-pixel ridges (its clean-sheet roughness floor was a
-    // near-mirror 0.42 and raising it to a physically sane 0.62 left the
-    // dashes untouched). Whatever draws them is somewhere else.
+    // NOT understood. Four causes have been eliminated by experiment:
+    //   - mask multisampling: helped, partially. Kept.
+    //   - mask resolution: full size changed nothing at all. Reverted.
+    //   - specular aliasing on corrugated sheet: its clean-sheet roughness
+    //     floor was a near-mirror 0.42; a physically sane 0.62 left the dashes
+    //     untouched. Kept anyway, since 0.42 was wrong on its own terms.
+    //   - this pass itself: with uIntensity forced to zero the bright bars
+    //     under the awning in the `cross` preset are unchanged, so whatever
+    //     draws them is upstream of the shafts entirely.
+    // The awning bars specifically are bare steel at metalness 0.96 on 7 cm
+    // members, so a mirror highlight covers the whole width of the bar; that
+    // is the most likely remaining lead and it is a material question, not a
+    // post-processing one.
     this.maskTarget = new THREE.WebGLRenderTarget(1, 1, {
       type: THREE.UnsignedByteType,
       colorSpace: THREE.LinearSRGBColorSpace,

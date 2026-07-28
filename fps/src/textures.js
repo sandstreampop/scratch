@@ -458,7 +458,17 @@ const SAMPLERS = {
 
     // Oxide is a dielectric; only the bare steel stays metallic.
     c.metal = clamp(bare * 0.96, 0, 1);
-    c.rough = clamp(lerp(0.96, 0.38, bare) - polish * 0.16 + scab * 0.04 - grain * 0.05, 0, 1);
+    // The bare-steel end of this ran to 0.38 and the polish term took it to
+    // 0.22, which is a mirror at metalness 0.96. On the awning rafters — 7 cm
+    // bars under a grazing sun — the specular lobe covered the whole width of
+    // the bar and they rendered as glowing white rods under a structure that
+    // should have been shading them. All four blind reviewers called those bars
+    // a rendering bug rather than a lighting choice.
+    //
+    // Structural steel that has stood in a desert is not polished. 0.52 with a
+    // gentler polish term floors it near 0.42, which still reads as metal
+    // without turning every thin member into a light source.
+    c.rough = clamp(lerp(0.96, 0.52, bare) - polish * 0.10 + scab * 0.04 - grain * 0.05, 0, 1);
     c.ao = 1 - pit * 0.34 - scab * 0.24;
   },
 
