@@ -42,11 +42,23 @@
 //   "No penetration" and "I measured nothing" are the same reading otherwise,
 //   and last session the second one was reported as the first.
 //
+// Sourced targets come from targets.mjs and nowhere else. Every assertion
+// against a Call of Duty figure names the key it used, the verdict comes from
+// that file's own inside() so the tolerance maths is not reimplemented here, and
+// the last check in the suite prints the whole manifest — key, value, tolerance,
+// confidence and URL — together with the two thresholds this suite owns that are
+// NOT sourced. A reviewer looking for an invented CoD number should be able to
+// find every candidate in that one line.
+//
 // What the game does today, for the reader of a red line: it is pure hitscan.
 // resolveBullet() is one Raycaster call, so travel time is exactly zero at
 // every range, drop is exactly zero, and a 4 cm collider stops 100% of the
-// round. Those three checks are red by construction and are supposed to be —
-// they are the specification of the projectile system that does not exist yet.
+// round. Those checks are red by construction and are supposed to be — they are
+// the specification of the projectile system that does not exist yet. Each of
+// them has been confirmed to go green: the suite was run against a page-level
+// projectile shim (750 m/s, the game's own gravity, a thickness gate with a flat
+// damage penalty) and all 22 ballistics-domain rows flipped, while the damage
+// rows the shim does not touch stayed red.
 
 const DEG = 180 / Math.PI;
 
@@ -58,12 +70,13 @@ const DEG = 180 / Math.PI;
 const DT = 1 / 240;
 const DT_TRAVEL = 1 / 480;
 
-// A physical envelope for small-arms muzzle velocity, used to decide whether a
-// measured travel time corresponds to a bullet at all. This is NOT a Call of
-// Duty figure and is not presented as one: 200 m/s is slower than a service
-// pistol and 1500 m/s is faster than any rifle cartridge, so a projectile
-// implementation anywhere in that band passes and hitscan (implied velocity
-// infinite) fails. Where CoD's own projectile speeds belong is targets.mjs.
+// FALLBACK ONLY. When targets.mjs is present the travel-time band comes from
+// ballistics.ar_muzzle_velocity_design_band (590..850 m/s, sourced across MW2
+// 2022 / MW3 / BO6) and this constant is not used. It exists so a checkout
+// without the research file still discriminates a projectile from hitscan: 200
+// m/s is slower than a service pistol and 1500 m/s faster than any rifle
+// cartridge, so it is a physics envelope and NOT a Call of Duty figure. The
+// detail string says which of the two produced the verdict, every time.
 const V_PLAUSIBLE = { min: 200, max: 1500 };
 
 export const NAME = 'ballistics';
@@ -75,26 +88,15 @@ export const NAME = 'ballistics';
 // file does not own that schema. What it must never do is substitute a number
 // of its own on a miss: a missing target reports as a measurement with the
 // coverage gap named, so the absence is visible instead of papered over.
-let TARGETS = null;
-try { ({ TARGETS } = await import('./targets.mjs')); } catch { /* not written yet */ }
+let TARGETS = null, inside = null, describe = null, missing = null;
+try { ({ TARGETS, inside, describe, missing } = await import('./targets.mjs')); } catch { /* not written yet */ }
 
-function targetFor(paths) {
+/** The target node behind a 'domain.key' reference, or null if the file lacks it. */
+const targetFor = (ref) => {
   if (!TARGETS) return null;
-  for (const p of [].concat(paths)) {
-    let node = TARGETS;
-    for (const k of p.split('.')) { if (node == null) break; node = node[k]; }
-    if (node == null) continue;
-    if (typeof node === 'number') return { value: node, tol: { pct: 0.15 }, source: `targets.mjs:${p}` };
-    const value = node.value ?? node.target ?? node.median ?? null;
-    if (typeof value !== 'number') continue;
-    const tol = node.tol
-      ?? (node.pct != null ? { pct: node.pct } : null)
-      ?? (node.min != null || node.max != null ? { min: node.min, max: node.max } : null)
-      ?? { pct: 0.15 };
-    return { value, tol, unit: node.unit ?? '', source: node.source ?? `targets.mjs:${p}` };
-  }
-  return null;
-}
+  const [domain, key] = ref.split('.');
+  return TARGETS[domain]?.[key] ?? null;
+};
 
 /* ------------------------------------------------------------ plumbing -- */
 
@@ -127,8 +129,21 @@ const IN = (over = {}) => `return ${JSON.stringify({ ...BASE_INPUT, ...over })};
  * shadowing them is a SyntaxError inside the page, which surfaces as a suite
  * that throws rather than a check that fails.
  */
-function aimBody({ mark = 'chest', compensate = true, fire = true } = {}) {
+function aimBody({ mark = 'chest', compensate = true, fire = true, fireWhile = null, elevate = 0 } = {}) {
   const marker = mark === 'head' ? 'eyePosition' : 'chestPosition';
+  // `elevate` is holdover, in radians, added to the pitch that points at the
+  // mark. Under hitscan it is always 0 and changes nothing. It exists because a
+  // projectile build's rounds arrive below the point of aim, and a sweep that
+  // aimed dead at the chest at 200 m then measured the *ground* — the shim run
+  // that proved this file can go green reported 1 body hit in 6 at 200 m purely
+  // because nothing was holding over.
+  const hold = elevate ? ` + (${elevate})` : '';
+  // `fireWhile` is an expression evaluated in the page each tick, used where a
+  // section needs a counted burst followed by silence rather than a held
+  // trigger. Counted off ammo, which is the only reliable round counter.
+  const patch = fireWhile
+    ? `Object.assign(${JSON.stringify({ ...BASE_INPUT, ads: true })}, { fire: !!(${fireWhile}) })`
+    : JSON.stringify({ ...BASE_INPUT, fire, ads: true });
   return `
     const pl = g.player, en = g.director.enemies[0];
     if (en && en.alive) {
@@ -137,10 +152,10 @@ function aimBody({ mark = 'chest', compensate = true, fire = true } = {}) {
       const eye = g.camera.position;
       const ax = at.x - eye.x, ay = at.y - eye.y, az = at.z - eye.z;
       pl.yaw = Math.atan2(-ax, -az);
-      pl.pitch = Math.atan2(ay, Math.hypot(ax, az));
+      pl.pitch = Math.atan2(ay, Math.hypot(ax, az))${hold};
       ${compensate ? 'pl.recoilPitch = 0; pl.recoilYaw = 0; pl._recoilPitchVel = 0; pl._recoilYawVel = 0;' : ''}
     }
-    return ${JSON.stringify({ ...BASE_INPUT, fire, ads: true })};
+    return ${patch};
   `;
 }
 
@@ -178,6 +193,51 @@ const ms = (v) => (Number.isFinite(v) ? `${(v * 1000).toFixed(1)} ms` : String(v
 /* --------------------------------------------------------------- suite -- */
 
 export default async function run(sim, report) {
+  /* ---- sourced assertions ---------------------------------------------- */
+  //
+  // Every target used here is cited by its targets.mjs key and collected into a
+  // manifest printed at the end of the suite, so a reader can check that the
+  // number a red line is failing against came from the research file and not
+  // from this test's imagination — the single failure mode this project has
+  // already been burned by.
+  //
+  // The verdict comes from targets.mjs's own inside(), because that file owns
+  // the tolerance semantics and a second implementation of them here would
+  // eventually disagree with it. report.against does the printing for numeric
+  // targets so the gap is shown in the reporter's standard form; band-only
+  // targets (value deliberately null, tol as min..max) cannot go through
+  // report.against and get their band printed explicitly instead.
+  const USED = [];
+  function against(name, ref, measured, unit = '') {
+    const t = targetFor(ref);
+    if (!t) {
+      report.check(name, true,
+        `measured ${Number.isFinite(measured) ? f4(measured) : String(measured)}${unit} — targets.mjs `
+        + `has no ${ref}, so this quantity has no sourced target yet`);
+      return false;
+    }
+    USED.push(describe(...ref.split('.')));
+    const numeric = typeof t.value === 'number' && Number.isFinite(t.value);
+    if (numeric && t.tol) {
+      return report.against(`${name} [${ref}]`, measured, t.value, t.tol, unit);
+    }
+    const v = inside(...ref.split('.'), measured);
+    if (t.tol && typeof t.tol.min === 'number') {
+      report.check(`${name} [${ref}]`, v.ok,
+        `measured ${Number.isFinite(measured) ? f4(measured) : String(measured)}${unit} against the sourced `
+        + `band ${t.tol.min}..${t.tol.max}${unit} — the target's own value is deliberately null `
+        + `(${t.confidence}), so the band is the whole claim`);
+      return v.ok;
+    }
+    // Qualitative target: no machine tolerance. Asserting it numerically would
+    // be inventing a threshold, so the reference is recorded and the behaviour
+    // is asserted by whichever check cites it.
+    report.check(`${name} [${ref}]`, true,
+      `no machine-usable tolerance on ${ref} (${t.confidence}) — recorded as context: `
+      + `${String(t.value).slice(0, 110)}`);
+    return true;
+  }
+
   // SPEC is read out of the running page rather than imported here, so it is
   // the object the game is using — and so the deadness probes can mutate it and
   // watch whether the behaviour follows.
@@ -200,6 +260,16 @@ export default async function run(sim, report) {
   const gravity = await sim.eval(async () => {
     try { return (await import('/src/player.js')).TUNING.gravity; } catch { return null; }
   });
+  // Asserted rather than assumed: if this came back null, every drop-implied
+  // velocity below would silently report "infinite" and read as "no drop" on a
+  // game that had drop. That is the exact shape of the failure this project has
+  // already been burned by, so it gets a line of its own.
+  report.check('the gravity used to interpret drop was read from the game', gravity != null,
+    gravity != null
+      ? `TUNING.gravity = ${gravity} m/s^2 (twice standard gravity, so a drop-implied velocity computed `
+        + 'with 9.81 would be out by a factor of sqrt(2))'
+      : 'could not read TUNING.gravity from /src/player.js — a drop measured below could not be turned '
+        + 'into a velocity, and would report as "no drop"');
 
   /* ---- page-side probes ------------------------------------------------- */
   //
@@ -386,10 +456,16 @@ export default async function run(sim, report) {
           travel.push({ R, ok: false, why: `lane blocked or zone ${aim.zone} (clear=${aim.clear})` });
           continue;
         }
-        // Six rounds, aim forced, so a dropped round or a stray zone does not
-        // leave the range with no sample at all.
+        // Seven rounds, then the trigger comes up and the trace keeps running
+        // for another second. The trailing time is what makes this measurement
+        // able to see a slow bullet: at the bottom of the plausible band a
+        // 150 m round is 0.75 s in the air, so a burst that ended when the
+        // firing did would report the last rounds as misses and the whole range
+        // as unpaired. Seven rather than one so a single stray zone does not
+        // leave the range with no sample.
         const rows = await sim.drive({
-          seconds: 0.5, dt: DT_TRAVEL, input: aimBody({}), sample: SAMPLE_ENEMY,
+          seconds: 1.4, dt: DT_TRAVEL, sample: SAMPLE_ENEMY,
+          input: aimBody({ fireWhile: 'g.weapon.ammo > 23' }),
         });
         const shots = await gunshotTimes();
         const dmg = await damageEvents();
@@ -398,12 +474,16 @@ export default async function run(sim, report) {
         // number of ammo decrements, the muzzle instant is not the muzzle
         // instant and every delay below is measured between the wrong two
         // events. This is the check that lets the 0.0 ms result be believed.
-        const paired = shots.length === fired;
+        const paired = shots.length === fired && dmg.length >= fired;
+        // Paired by index, not by "the first damage event after this shot".
+        // Rounds leave at one velocity down one line, so impacts arrive in
+        // firing order — but with a projectile in flight, round 2's muzzle
+        // instant precedes round 1's impact, and a nearest-event search hands
+        // round 2 round 1's arrival and reports a third of the true delay. That
+        // is the one pairing error hitscan cannot expose, because with hitscan
+        // both events share a tick and any pairing looks right.
         const delays = [];
-        for (const s of shots) {
-          const hit = dmg.find((d) => d.t >= s - 1e-9);
-          if (hit) delays.push(hit.t - s);
-        }
+        for (let k = 0; k < Math.min(shots.length, dmg.length); k++) delays.push(dmg[k].t - shots[k]);
         travel.push({
           R, ok: true, paired, fired, shots: shots.length, hits: dmg.length,
           delay: median(delays), delays,
@@ -414,21 +494,31 @@ export default async function run(sim, report) {
 
       const good = travel.filter((x) => x.ok);
       report.check('the travel-time probe paired every round with a muzzle event',
-        good.length === 4 && good.every((x) => x.paired && x.hits >= x.fired),
+        good.length === 4 && good.every((x) => x.paired),
         good.map((x) => `${x.R} m: ${x.fired} rounds, ${x.shots} muzzle events, ${x.hits} damage events`)
           .join('; ') || 'no range produced a clear shot');
 
+      // The pass band for a per-range travel time is the sourced AR muzzle
+      // velocity design band (590..850 m/s across MW2 2022 / MW3 / BO6) when
+      // targets.mjs is present. V_PLAUSIBLE is only the fallback for a checkout
+      // without that file, and it is a physics envelope rather than a CoD
+      // figure — which is why the detail says which of the two it used.
+      const band = targetFor('ballistics.ar_muzzle_velocity_design_band');
+      const lo = band?.tol?.min ?? V_PLAUSIBLE.min;
+      const hi = band?.tol?.max ?? V_PLAUSIBLE.max;
+      const bandNote = band
+        ? `the sourced AR design band ${lo}..${hi} m/s (ballistics.ar_muzzle_velocity_design_band)`
+        : `${lo}..${hi} m/s (a physical envelope for small arms — targets.mjs absent, so NOT a sourced `
+          + 'CoD figure)';
+
       for (const x of good) {
         const v = x.R / x.delay;   // Infinity when the delay is exactly zero
-        const tgt = targetFor([`ballistics.travelTime.${x.R}m`, `ballistics.travelTime_${x.R}`]);
-        const ok = x.delay > 0.5 * DT_TRAVEL && v >= V_PLAUSIBLE.min && v <= V_PLAUSIBLE.max;
+        const ok = x.delay > 0.5 * DT_TRAVEL && v >= lo && v <= hi;
         report.check(`round travel time at ${x.R} m`, ok,
           `${ms(x.delay)} between the round leaving the gun and the damage landing `
           + `(${x.delays.length} rounds, one tick is ${ms(DT_TRAVEL)}), implied velocity `
           + `${Number.isFinite(v) ? `${f2(v)} m/s` : 'infinite — the round arrives on the tick it was fired'}; `
-          + `a plausible bullet is ${V_PLAUSIBLE.min}..${V_PLAUSIBLE.max} m/s (a physical envelope for `
-          + 'small arms, not a sourced CoD figure)'
-          + (tgt ? `; sourced target ${f3(tgt.value)} s from ${tgt.source}` : '; no sourced target yet'));
+          + `a bullet lands in ${bandNote}`);
       }
 
       // The second half of the same statement: a projectile has *one* muzzle
@@ -451,6 +541,36 @@ export default async function run(sim, report) {
         `max drift from the spawn point ${f4(Math.max(0, ...good.map((x) => x.drift)))} m over `
         + `${good.length} ranges — a target that walked `
         + 'would put its own motion inside the delay');
+
+      /* ---- against the research ---------------------------------------- */
+      //
+      // The bullet model itself is a sourced boolean: every CoD from MW2019
+      // onward resolves rifle fire as a simulated projectile with travel time,
+      // not a raycast. Measured as 1 if any range showed a nonzero delay.
+      const isProjectile = good.length > 0 && good.every((x) => x.delay > 0.5 * DT_TRAVEL) ? 1 : 0;
+      against('the bullet is a projectile rather than hitscan',
+        'ballistics.bullet_model_is_projectile_not_hitscan', isProjectile, ' (1 = projectile)');
+      // One velocity for the weapon, from all four ranges pooled.
+      const vAll = median(good.map((x) => x.R / x.delay));
+      against('muzzle velocity', 'ballistics.ar_muzzle_velocity_design_band', vAll, ' m/s');
+      against('muzzle velocity against the MW3 MCW figure',
+        'ballistics.ar_muzzle_velocity_mcw_mw3_2023', vAll, ' m/s');
+
+      // The sourced rule that makes travel time a design decision rather than a
+      // detail: Warzone servers tick at 20 Hz, so a round is effectively
+      // instant out to velocity/20 metres and needs leading past it. Reported
+      // rather than asserted — the divisor is the sourced quantity, the radius
+      // it implies for THIS weapon is arithmetic on our own velocity.
+      const divisor = targetFor('ballistics.instant_hit_range_formula_divisor');
+      const percept = targetFor('ballistics.perceptible_travel_time_threshold');
+      if (divisor) USED.push(describe('ballistics', 'instant_hit_range_formula_divisor'));
+      if (percept) USED.push(describe('ballistics', 'perceptible_travel_time_threshold'));
+      report.check('the range past which a round stops being effectively instant', true,
+        `measured ${Number.isFinite(vAll) ? `${f2(vAll / (divisor?.value ?? 20))} m` : 'unbounded — every '
+          + 'range is instant, because travel time is 0 at every range'}`
+        + (divisor ? `, from velocity / ${divisor.value} Hz server tick` : '')
+        + (percept ? `; sourced perceptibility onset ${percept.value} +/-${percept.tol.abs} m` : '')
+        + ' — measured, no per-weapon sourced target for this derived radius');
     }
 
     /* ============================================== 2. bullet drop ===== */
@@ -472,6 +592,9 @@ export default async function run(sim, report) {
     // standard error of the mean down to about 5 mm, which is a quarter of the
     // threshold; both numbers are printed so the reader can check that for
     // themselves rather than take it on trust.
+    // Drop curvature k, in m per m^2, measured in this section and used by the
+    // falloff sweep below to hold over. Zero under hitscan.
+    let dropK = 0;
     const drop = [];
     {
       await zeroSpread();
@@ -535,7 +658,6 @@ export default async function run(sim, report) {
       for (const d of drop) {
         const floor = dropFloor(d.R);
         const real = -d.dy > floor;
-        const tgt = targetFor([`ballistics.drop.${d.R}m`, `ballistics.bulletDrop.${d.R}`]);
         report.check(`bullet drop at ${d.R} m`, real,
           `impact ${f4(d.dy)} m relative to a level aim point, mean of ${d.n} rounds, standard error `
           + `${f4(d.se)} m (per-round 68% interval ${f4(d.scatter)} m wide, from the 0.0004 rad spread `
@@ -544,7 +666,13 @@ export default async function run(sim, report) {
             ? `implied muzzle velocity ${f2(vFromDrop(d))} m/s at the game's ${gravity} m/s^2`
             : `the round lands level to within ${f4(Math.abs(d.dy))} m against a ${f4(floor)} m threshold `
               + '— nothing is integrating gravity on the round'}`
-          + (tgt ? `; sourced target ${f3(tgt.value)} m from ${tgt.source}` : '; no sourced target yet'));
+          // The research file records, explicitly, that no numeric
+          // drop-in-metres-at-range figure could be corroborated for any CoD
+          // title — only that drop exists and was kept deliberately small. So
+          // there is nothing to assert this against, and the asserted form of
+          // the claim is the boolean below.
+          + '; no sourced drop-in-metres figure exists (see the note on '
+          + 'ballistics.bullet_gravity_drop_present)');
       }
 
       // Drop is quadratic in range, so 150 m must drop about 9x as far as
@@ -570,6 +698,7 @@ export default async function run(sim, report) {
       // and a system that fakes one of them makes them disagree loudly.
       const vT = travel.find((x) => x.R === 150)?.delay;
       const vTravel = Number.isFinite(vT) && vT > 0 ? 150 / vT : Infinity;
+      dropK = d150 && -d150.dy > dropFloor(150) ? -d150.dy / (150 * 150) : 0;
       const vDrop = vFromDrop(d150);
       const agree = Number.isFinite(vTravel) && Number.isFinite(vDrop)
         && Math.abs(vTravel - vDrop) / vTravel < 0.3;
@@ -578,64 +707,131 @@ export default async function run(sim, report) {
         + `drop implies ${Number.isFinite(vDrop) ? `${f2(vDrop)} m/s` : 'infinite (no measurable drop)'} — `
         + `${agree ? 'the two mechanisms agree'
           : 'neither quantity exists, so the two mechanisms cannot be checked against each other'}`);
+
+      // The sourced form of the claim: gravity acts on bullets at all.
+      against('bullets are affected by gravity', 'ballistics.bullet_gravity_drop_present',
+        bothReal ? 1 : 0, ' (1 = drop present)');
     }
 
     /* ============================================= 3. penetration ====== */
     //
-    // A 4 cm collider at 4 m, with a soldier at 20 m behind it, and the same
+    // A thin collider at 4 m, with a soldier at 20 m behind it, and the same
     // burst fired with and without the plate. The paired shot is the whole
     // point: it turns "0 HP transmitted" from an absence of evidence into a
     // measurement, because the identical burst through empty air is on the
     // record next to it.
+    //
+    // Four thicknesses, and the shape the research describes decides what they
+    // are for. As of the current model, penetration is a per-material
+    // MAX-THICKNESS GATE plus ONE flat damage percentage: a round either gets
+    // through or it does not, and when it does the penalty is the same
+    // regardless of how thick the obstruction was
+    // (ballistics.penetration_damage_falloff_is_flat_not_thickness_scaled).
+    // That is why this section does NOT assert that damage falls off with
+    // thickness — an earlier draft did, and it would have been asserting the
+    // pre-Season-01 model against the documented current one. What the
+    // thicknesses buy instead is the gate: something thin must pass, something
+    // thick must not, and everything that passes must retain the same fraction.
+    //
+    // The retained percentage itself is unpublished, so no number is asserted
+    // for it. It is measured and printed.
     {
       await zeroSpread();
       const aim0 = await placeTarget(20, { health: 1e6 });
-      const bare = await sim.drive({ seconds: 0.45, dt: DT, input: aimBody({}), sample: SAMPLE_ENEMY });
+      // Six rounds then a trailing window, for the same reason as the falloff
+      // sweep: the burst that is compared with and without the collider has to
+      // give a slow round time to arrive, or "nothing got through" is the
+      // instrument closing early.
+      const BURST = { seconds: 1.0, dt: DT, sample: SAMPLE_ENEMY,
+        input: aimBody({ fireWhile: 'g.weapon.ammo > 24' }) };
+      const bare = await sim.drive(BURST);
       const bareDmg = await damageEvents();
       const bareDealt = bareDmg.reduce((s, d) => s + d.amount, 0);
       const bareRounds = roundCount(bare);
 
-      const aim1 = await placeTarget(20, { health: 1e6 });
-      const plate = await sim.eval((c) => window.__BALL.addPlate(c), {
-        w: 6, h: 6, thick: 0.04, dist: 4, dx: LX, dz: LZ, name: 'ball-thin' });
-      const blocked = await sim.aimAt(0);
-      const thru = await sim.drive({ seconds: 0.45, dt: DT, input: aimBody({}), sample: SAMPLE_ENEMY });
-      const thruDmg = await damageEvents();
-      const thruImp = await sim.eval(() => window.__BALL.impacts.slice());
-      await sim.eval(() => window.__BALL.dropPlates());
+      const walls = [];
+      for (const thick of [0.04, 0.08, 0.3, 1.0]) {
+        const aimPre = await placeTarget(20, { health: 1e6 });
+        await sim.eval((c) => window.__BALL.addPlate(c), {
+          w: 6, h: 6, thick, dist: 4, dx: LX, dz: LZ, name: `ball-wall-${thick}` });
+        const blocked = await sim.aimAt(0);
+        const rows = await sim.drive(BURST);
+        const dmg = await damageEvents();
+        const imps = await sim.eval(() => window.__BALL.impacts.slice());
+        await sim.eval(() => window.__BALL.dropPlates());
+        walls.push({
+          thick, aimPre, blocked,
+          dealt: dmg.reduce((s, d) => s + d.amount, 0),
+          events: dmg.length,
+          hpLost: hpDrops(rows).reduce((s, d) => s + d, 0),
+          rounds: roundCount(rows),
+          surface: imps[0]?.surface ?? 'none',
+          impacts: imps.length,
+        });
+      }
       await popSpec();
-
-      const thruDealt = thruDmg.reduce((s, d) => s + d.amount, 0);
-      const thruRounds = roundCount(thru);
-      const hpLost = hpDrops(thru).reduce((s, d) => s + d, 0);
+      const thin = walls[0], thick = walls[walls.length - 1];
 
       report.check('the penetration probe can see damage when nothing is in the way',
         bareDealt > 0 && bareRounds > 0 && aim0.clear,
         `${bareRounds} rounds through clear air at 20 m dealt ${f2(bareDealt)} HP `
         + `(${bareDmg.length} damage events, ${f2(bareDealt / Math.max(1, bareDmg.length))} HP each)`);
-      report.check('the thin collider is where the rounds go',
-        blocked.clear === false && Math.abs((blocked.worldDist ?? 0) - 4) < 0.3,
-        `aimAt reports the first world hit at ${f2(blocked.worldDist)} m against a body at `
-        + `${f2(blocked.enemyDist)} m, so the 4 cm plate is between the two; `
-        + `${thruImp.length} impacts recorded on it, surface "${thruImp[0]?.surface ?? 'none'}"`);
+      report.check('the colliders are between the muzzle and the body',
+        walls.every((w) => w.aimPre.clear === true && w.blocked.clear === false
+          && Math.abs(w.blocked.worldDist - 4) < 0.5),
+        walls.map((w) => `${w.thick} m plate: body reachable before it was added (clear=${w.aimPre.clear}), `
+          + `first world hit then at ${f2(w.blocked.worldDist)} m against a body at `
+          + `${f2(w.blocked.enemyDist)} m, ${w.impacts} impacts on it as "${w.surface}"`).join('; '));
 
-      const frac = bareDealt > 0 ? thruDealt / bareDealt : NaN;
-      const tgt = targetFor(['ballistics.penetration.thin', 'ballistics.wallbangDamageScale']);
-      report.check('a thin collider transmits some damage', thruDealt > 0,
-        `${thruRounds} rounds into a 4 cm collider transmitted ${f2(thruDealt)} HP to the body behind it `
-        + `(${thruDmg.length} damage events, ${f2(hpLost)} HP off the target's health) against `
-        + `${f2(bareDealt)} HP for the same burst with the collider removed — `
-        + `${(100 * frac).toFixed(1)}% gets through`
-        + (tgt ? `; sourced target ${f3(tgt.value)} from ${tgt.source}` : '; no sourced target yet'));
+      const frac = bareDealt > 0 ? thin.dealt / bareDealt : NaN;
+      report.check('a thin collider transmits some damage', thin.dealt > 0,
+        `${thin.rounds} rounds into a ${thin.thick * 100} cm collider transmitted ${f2(thin.dealt)} HP to the `
+        + `body behind it (${thin.events} damage events, ${f2(thin.hpLost)} HP off the target's health) `
+        + `against ${f2(bareDealt)} HP for the same burst with the collider removed — `
+        + `${(100 * frac).toFixed(1)}% gets through; the retained percentage is unpublished in the research, `
+        + 'so the number is reported and not asserted');
 
-      // The mechanism, stated as its own measurement so the fix has a target:
-      // resolveBullet() compares the enemy hit against the first world hit and
-      // returns on the world hit, so thickness and material are not consulted
-      // at all. A 4 cm plate and a 4 m bunker wall are the same object to it.
-      report.check('penetration depends on what the round hit', thruDealt > 0,
-        `a 0.04 m collider stops ${f2(bareDealt - thruDealt)} of ${f2(bareDealt)} HP — the same as a solid `
-        + 'wall would, because the round is resolved against the first raycast hit and never carries '
-        + 'energy past it');
+      // The gate. resolveBullet() compares the enemy hit against the first
+      // world hit and returns on the world hit, so thickness is never
+      // consulted: a 4 cm sheet and a 1 m block are the same object to it, and
+      // there is no gate at all — everything blocks. This is the check that
+      // says so with numbers rather than by reading the source.
+      const passed = walls.filter((w) => w.dealt > 0);
+      const stopped = walls.filter((w) => w.dealt <= 0);
+      const orderOk = passed.every((p) => stopped.every((q) => p.thick < q.thick));
+      report.check('thickness gates whether a round penetrates at all',
+        passed.length > 0 && stopped.length > 0 && orderOk,
+        walls.map((w) => `${w.thick} m -> ${f2(w.dealt)} HP through`).join(', ')
+        + `, against ${f2(bareDealt)} HP through open air: `
+        + `${passed.length} of ${walls.length} thicknesses penetrate`
+        + (passed.length && stopped.length
+          ? `, gate somewhere between ${Math.max(...passed.map((w) => w.thick))} and `
+            + `${Math.min(...stopped.map((w) => w.thick))} m`
+          : passed.length ? ' — nothing stops a round, so there is no gate either'
+            : ' — nothing penetrates, so there is no gate, only a wall'));
+
+      // And the sourced shape of the damage penalty: flat, not scaled by
+      // thickness. Measurable only where at least two thicknesses penetrate;
+      // where none do, inside() reports the non-finite measurement rather than
+      // this file inventing a verdict.
+      const fracs = passed.map((w) => w.dealt / w.rounds);
+      const flat = fracs.length >= 2
+        ? ((Math.max(...fracs) - Math.min(...fracs)) / mean(fracs) < 0.02 ? 1 : 0)
+        : NaN;
+      against('the penetration damage penalty is flat rather than thickness-scaled',
+        'ballistics.penetration_damage_falloff_is_flat_not_thickness_scaled', flat, ' (1 = flat)');
+      // Recorded, not assertable with one weapon: penetration strength is
+      // assigned per weapon class, and FMJ moves both the gate and the penalty.
+      // A single-weapon suite cannot see either, and saying so is the honest
+      // form of the coverage gap.
+      against('penetration strength is assigned by weapon class',
+        'ballistics.penetration_class_hierarchy', NaN);
+      const fmj = targetFor('ballistics.fmj_attachment_effect');
+      if (fmj) USED.push(describe('ballistics', 'fmj_attachment_effect'));
+      report.check('attachment control over penetration', true,
+        `not measurable from one weapon with no attachment system: the sourced model requires `
+        + `${fmj ? fmj.value : 2} separate FMJ effects (raise the thickness gate, soften the flat `
+        + 'penalty) — reported as a coverage gap, not asserted');
     }
 
     /* ========================================== 4. damage falloff ====== */
@@ -646,13 +842,23 @@ export default async function run(sim, report) {
     // argument, and the health delta off the trace. They must agree for a body
     // hit (zone multiplier 1.0) and the check says so, because if they diverge
     // one of the two is not what this file thinks it is.
+    //
+    // Six rounds and then a second of quiet, at every range, rather than a
+    // continuous 0.45 s burst. Under hitscan the two are identical; under a
+    // projectile at the slow end of the plausible band a 200 m round is half a
+    // second in the air, and a window that closes with the trigger reported
+    // "0 of 6 body hits at 200 m" — a range the instrument had failed to reach
+    // dressed up as a range the gun cannot hurt.
     const curve = [];
     {
       await zeroSpread();
       for (let R = 10; R <= 200; R += 10) {
         const aim = await placeTarget(R, { health: 1e6 });
         if (!aim.clear) { curve.push({ R, blocked: true }); continue; }
-        const rows = await sim.drive({ seconds: 0.45, dt: DT, input: aimBody({}), sample: SAMPLE_ENEMY });
+        const rows = await sim.drive({
+          seconds: 1.5, dt: DT, sample: SAMPLE_ENEMY,
+          input: aimBody({ fireWhile: 'g.weapon.ammo > 24', elevate: Math.atan(dropK * R) }),
+        });
         const dmg = await damageEvents();
         const body = dmg.filter((d) => d.zone === 'body');
         const drops = hpDrops(rows);
@@ -669,7 +875,9 @@ export default async function run(sim, report) {
       const usable = curve.filter((c) => !c.blocked && c.n >= 3);
       report.check('the falloff sweep collected body hits at every range',
         usable.length === curve.length && curve.every((c) => !c.blocked),
-        curve.map((c) => (c.blocked ? `${c.R} m BLOCKED` : `${c.R} m: ${c.n}/${c.fired} body`)).join(', '));
+        curve.map((c) => (c.blocked ? `${c.R} m BLOCKED` : `${c.R} m: ${c.n}/${c.fired} body`)).join(', ')
+        + `; holdover from the measured drop curvature k=${dropK.toExponential(2)} m/m^2, `
+        + `${(Math.atan(dropK * 200) * DEG * 60).toFixed(1)} arcmin at 200 m`);
 
       report.check('the applied damage and the health delta agree on a body hit',
         usable.every((c) => Math.abs(c.amount - c.hp) < 0.01),
@@ -697,12 +905,18 @@ export default async function run(sim, report) {
       // measured the same way and told apart by two numbers: how many distinct
       // plateaus the curve has, and how uneven its steps are.
       //
-      // The expectation of bands here is structural, not a sourced figure and
-      // not a claim about any specific CoD weapon's numbers. What bands buy is
-      // learnability: with them a player can hold "three shots inside this
-      // range, four beyond it" and be right, and the shot count changes at a
-      // small number of announced distances. Under a continuous lerp the shot
-      // count boundary lands wherever 100/damage crosses an integer, so it
+      // The expectation of bands is not invented here: the research file records
+      // a weapon whose falloff is explicitly stepwise — three discrete stops at
+      // 22.5, 40 and 50 m — and the M4A1 entries describe a flat plateau, one
+      // linear segment, then a flat floor, i.e. two stops and one ramp between
+      // them. No numeric band count is asserted, because none is published as a
+      // general figure; the assertion is about the SHAPE, and the citation is
+      // damage.striker45_mw2019_falloff_range_stops.
+      //
+      // What bands buy is learnability: with them a player can hold "three shots
+      // inside this range, four beyond it" and be right, and the shot count
+      // changes at a small number of announced distances. Under a continuous
+      // lerp the boundary lands wherever 100/damage crosses an integer, so it
       // moves by a metre or two per weapon tweak and nothing about it is
       // memorable. Both quantities are printed either way, so a reader who
       // disagrees with the expectation still gets the measurement.
@@ -713,25 +927,71 @@ export default async function run(sim, report) {
       const moving = steps.map(Math.abs).filter((s) => s > 0.005 * usable[0].amount);
       const evenness = moving.length ? Math.max(...moving) / mean(moving) : NaN;
       const banded = plateaus <= Math.max(4, usable.length / 4);
+      const stepwise = targetFor('damage.striker45_mw2019_falloff_range_stops');
+      if (stepwise) USED.push(describe('damage', 'striker45_mw2019_falloff_range_stops'));
       report.check('damage falls in discrete range bands rather than on a continuous ramp', banded,
         `${plateaus} distinct damage plateaus across ${usable.length} ranges 10 m apart; `
         + `${moving.length} of ${steps.length} adjacent pairs differ, steps `
         + `${moving.slice(0, 4).map((s) => f3(s)).join('/')}... with max/mean ${f3(evenness)} `
         + `(1.0 = perfectly even = a linear ramp) -> the curve is ${banded ? 'banded' : 'SMOOTH: one '
           + 'lerp from falloffStart to falloffEnd, so damage changes at every range and the shot-count '
-          + 'boundary sits wherever 100/damage happens to cross an integer'}. Structural expectation, `
-        + 'no sourced CoD figure involved');
+          + 'boundary sits wherever 100/damage happens to cross an integer'}. Shape claim, cited to `
+        + `${stepwise ? 'damage.striker45_mw2019_falloff_range_stops' : 'nothing — targets.mjs absent'}; `
+        + 'no numeric band count is asserted because none is published');
 
-      // The near plateau and the far floor, derived from the curve rather than
-      // read off SPEC — the point being that these are the numbers the game
-      // has, whatever the constants say.
+      // The near plateau, the far floor and the two range stops between them,
+      // all derived from the curve rather than read off SPEC — the point being
+      // that these are the numbers the game has, whatever the constants say.
+      //
+      // The stops are FITTED rather than read off the sweep grid, because the
+      // sweep steps 10 m and the sourced targets are +/-1 m and +/-1.5 m: "full
+      // damage out to 40 m, first drop by 50 m" cannot be compared with 37.5 m
+      // at all. So the ramp samples — everything strictly between the plateau
+      // and the floor — get a least-squares line, and the stops are where that
+      // line meets the plateau and the floor. The residual is printed, because
+      // the fit is only meaningful if the ramp really is a line, and if a future
+      // build makes it banded the residual is how the reader finds out the
+      // fitted stops have become meaningless.
       const near = usable[0].amount;
       const far = usable[usable.length - 1].amount;
-      const startR = usable.find((c) => c.amount < near - 0.01)?.R ?? null;
-      const endR = usable.find((c) => Math.abs(c.amount - far) < 0.01)?.R ?? null;
-      report.check('falloff onset and floor measured from the curve', startR != null,
-        `full ${f2(near)} HP out to ${startR != null ? startR - 10 : '?'} m, first drop by ${startR} m, `
-        + `floor ${f2(far)} HP (x${f3(far / near)} of point-blank) reached by ${endR} m`);
+      const ramp = usable.filter((c) => c.amount < near - 1e-6 && c.amount > far + 1e-6);
+      let nearStop = NaN, farStop = NaN, fitResid = NaN;
+      if (ramp.length >= 2) {
+        const mx = mean(ramp.map((c) => c.R)), my = mean(ramp.map((c) => c.amount));
+        const sxy = ramp.reduce((a, c) => a + (c.R - mx) * (c.amount - my), 0);
+        const sxx = ramp.reduce((a, c) => a + (c.R - mx) ** 2, 0);
+        const slope = sxy / sxx, intercept = my - slope * mx;
+        nearStop = (near - intercept) / slope;
+        farStop = (far - intercept) / slope;
+        fitResid = Math.sqrt(mean(ramp.map((c) => (c.amount - (intercept + slope * c.R)) ** 2)));
+      }
+      report.check('falloff range stops fitted from the curve', Number.isFinite(nearStop),
+        `full ${f2(near)} HP out to a fitted ${f2(nearStop)} m, then ${f3(-(near - far) / (farStop - nearStop))} `
+        + `HP/m to a ${f2(far)} HP floor (x${f3(far / near)} of point-blank) at a fitted ${f2(farStop)} m; `
+        + `${ramp.length} ramp samples, RMS residual ${f4(fitResid)} HP about the fitted line`);
+
+      // Against the research. Only the STOPS and the derived quantities are
+      // asserted; the raw HP-per-bullet figures are reported beside their
+      // sourced counterparts but NOT asserted, deliberately. 30 HP is the M4A1's
+      // number at 682 rpm and 100 HP, and a port is entitled to its own damage
+      // constant as long as the player-facing quantities — shots to kill and
+      // time to kill — land where they should. Those are asserted in section 6.
+      // Asserting damage-per-bullet on top would fail a build that was correct
+      // and send whoever read it to tune the wrong number.
+      against('falloff onset (near range stop)', 'damage.m4a1_mw2019_near_range_stop', nearStop, ' m');
+      against('falloff end (far range stop)', 'damage.m4a1_mw2019_far_range_stop', farStop, ' m');
+      const srcMax = targetFor('damage.m4a1_mw2019_max_damage');
+      const srcMin = targetFor('damage.m4a1_mw2019_min_damage');
+      const srcMcw = targetFor('damage.mcw_mw3_lower_torso_damage');
+      if (srcMax) USED.push(describe('damage', 'm4a1_mw2019_max_damage'));
+      if (srcMin) USED.push(describe('damage', 'm4a1_mw2019_min_damage'));
+      if (srcMcw) USED.push(describe('damage', 'mcw_mw3_lower_torso_damage'));
+      report.check('damage per bullet, against the sourced references', true,
+        `measured ${f2(near)} HP inside the plateau and ${f2(far)} HP on the floor, a x${f3(far / near)} `
+        + `retention. Sourced for comparison: M4A1 MW2019 ${srcMax?.value ?? '?'} -> `
+        + `${srcMin?.value ?? '?'} HP (x${srcMax && srcMin ? f3(srcMin.value / srcMax.value) : '?'} `
+        + `retention), MCW MW3 lower torso ${srcMcw?.value ?? '?'} HP. Reported and not asserted: the `
+        + 'player-facing quantity is shots-to-kill, asserted in section 6');
 
       // Liveness. Halving falloffScale must move the far end of the curve; if
       // it does not, the whole section is measuring the instrument.
@@ -739,7 +999,12 @@ export default async function run(sim, report) {
         await patchSpec({ falloffScale: SPEC.falloffScale * 0.5 });
         await zeroSpread();
         const aim = await placeTarget(200, { health: 1e6 });
-        const rows = await sim.drive({ seconds: 0.3, dt: DT, input: aimBody({}), sample: SAMPLE_ENEMY });
+        // Same burst shape and same holdover as the sweep it is validating, so
+        // the comparison is of damage and not of two different measurements.
+        await sim.drive({
+          seconds: 1.5, dt: DT, sample: SAMPLE_ENEMY,
+          input: aimBody({ fireWhile: 'g.weapon.ammo > 25', elevate: Math.atan(dropK * 200) }),
+        });
         const body = (await damageEvents()).filter((d) => d.zone === 'body');
         await popSpec();      // spread
         await popSpec();      // falloffScale
@@ -765,7 +1030,8 @@ export default async function run(sim, report) {
       async function zoneRun(mark) {
         await placeTarget(20, { health: 1e6 });
         const rows = await sim.drive({
-          seconds: 0.6, dt: DT, input: aimBody({ mark }), sample: SAMPLE_ENEMY,
+          seconds: 1.0, dt: DT, sample: SAMPLE_ENEMY,
+          input: aimBody({ mark, fireWhile: 'g.weapon.ammo > 23' }),
         });
         const dmg = await damageEvents();
         const drops = hpDrops(rows);
@@ -800,7 +1066,24 @@ export default async function run(sim, report) {
       report.check('zone damage multipliers', Number.isFinite(headMult) && Number.isFinite(bodyMult),
         Object.entries(byZone).map(([z, v]) => `${z} x${f4(median(v))} (n=${v.length}, `
           + `range ${f4(Math.min(...v))}..${f4(Math.max(...v))})`).join('; ')
-        + ' — measured as health delta over the post-falloff amount, no sourced target yet');
+        + ' — measured as health delta over the post-falloff amount');
+
+      // Against the research. The headshot multiplier is one of the few damage
+      // numbers CoD publishes consistently, and it is small: x1.4 on the M4A1
+      // and most MW2019 weapons, x1.3 on the MW3 MCW, x1.5 even on snipers, x1.0
+      // on shotguns. Both of this game's candidates — the 2.6 in ai.js and the
+      // 2.4 in SPEC — are roughly double the largest sourced figure, which makes
+      // a chest burst and a head burst two different weapons.
+      against('headshot multiplier', 'damage.m4a1_mw2019_headshot_multiplier', headMult, 'x');
+      against('headshot multiplier against the MW3 MCW figure',
+        'damage.mcw_mw3_headshot_multiplier_launch', headMult, 'x');
+      against('torso multiplier', 'damage.mcw_mw3_torso_multiplier_post_buff', bodyMult, 'x');
+      const srcSniper = targetFor('damage.mw2019_headshot_multiplier_sniper_rifles');
+      if (srcSniper) USED.push(describe('damage', 'mw2019_headshot_multiplier_sniper_rifles'));
+      report.check('the headshot multiplier is not above the sourced ceiling for any weapon class',
+        Number.isFinite(headMult) && srcSniper ? headMult <= srcSniper.value + srcSniper.tol.abs : true,
+        `x${f4(headMult)} measured on an assault rifle against x${srcSniper?.value ?? '?'} for sniper `
+        + 'rifles, the highest multiplier in the research file; shotguns are x1.0');
 
       // One number must govern it. SPEC.headshotMultiplier is 2.4; ai.js
       // applyDamage() hard-codes 2.6 and nothing reads the constant. Reported
@@ -854,7 +1137,12 @@ export default async function run(sim, report) {
     // failure to recoil climb; with recoil perfectly compensated the gun still
     // cannot kill at 80 m, because bloom alone opens the cone to ~0.03 rad of
     // sustained fire, which is 2.4 m of scatter radius at that range.
-    const RANGES = [10, 25, 45, 80, 120];
+    //
+    // 200 m is in the list only because the research has a target that needs it:
+    // damage.m4a1_mw2019_stk_min_range and ttk_min_range are both stated for a
+    // range PAST the minimum-damage stop, and this game's floor does not arrive
+    // until 150 m. 120 m is still on the near side of it.
+    const RANGES = [10, 25, 45, 80, 120, 200];
     const TTK = { held: {}, tracked: {}, perfect: {} };
     let maxDrift = 0;
     {
@@ -867,6 +1155,11 @@ export default async function run(sim, report) {
           // A kill that needs a reload is reported as "not within a magazine"
           // rather than folded into the median, because it is a different event.
           seconds: 2.6, dt: DT, sample: SAMPLE_ENEMY,
+          // No holdover here, deliberately, unlike the falloff sweep: these
+          // conditions model players, and "compensates recoil perfectly" is a
+          // different claim from "knows the ballistic drop table". If a build
+          // with travel time loses kills at 120 m to drop, that is a result
+          // about the build, not a gap in the instrument.
           input: cond === 'held' ? IN({ fire: true, ads: true }) : aimBody({}),
         });
         const dmg = await damageEvents();
@@ -954,15 +1247,17 @@ export default async function run(sim, report) {
       for (const cond of ['held', 'tracked', 'perfect']) {
         for (const R of RANGES) {
           const s = S[cond][R];
-          const tgt = targetFor([`ttk.${cond}.${R}m`, `ttk.${R}m`, `damage.ttk.${R}`]);
+          // No per-range sourced TTK target exists: the research states TTK
+          // inside the max-damage range and past the min-damage range, not a
+          // curve, so those two are asserted at the end of the section against
+          // the 'perfect' condition. These rows are the distribution itself.
           const detail =
             `median ${Number.isFinite(s.med) ? ms(s.med) : `no kill in a magazine (${f2(s.hpLeft)} HP left)`}, `
             + `16-84% ${Number.isFinite(s.p16) ? ms(s.p16) : 'inf'}..${Number.isFinite(s.p84) ? ms(s.p84) : 'inf'}, `
             + `${s.kills}/${s.n} engagements killed, median ${Number.isFinite(s.stkMed) ? s.stkMed : 'inf'} `
             + `rounds fired and ${s.landedMed} landed per kill, `
             + `${s.heads} head / ${s.limbs} limb hits across the set, cone at the first round `
-            + `${f4(s.cone * DEG * 2)} deg`
-            + (tgt ? `; sourced target ${ms(tgt.value)} from ${tgt.source}` : '; no sourced target yet');
+            + `${f4(s.cone * DEG * 2)} deg`;
           // The assertion is on the median engagement resolving, not on every
           // one of them. Both statements are worth making but only this one is
           // stable: at 25 m with the trigger held the per-engagement kill
@@ -970,8 +1265,8 @@ export default async function run(sim, report) {
           // the suite whenever anything upstream shifts the position of the
           // seeded random stream, and a check that flips teaches its reader to
           // ignore it. The strict "every engagement" version is made once,
-          // below, over all 110 of them, where it is red for a reason that does
-          // not move. The rate is in the detail either way.
+          // below, over all of them, where it is red for a reason that does not
+          // move. The rate is in the detail either way.
           report.check(`TTK ${cond} at ${R} m`, Number.isFinite(s.med), detail);
         }
       }
@@ -1025,6 +1320,13 @@ export default async function run(sim, report) {
         // be. So the best case is asserted separately. A shooter where a longer
         // shot can resolve faster than a shorter one — for any reason other than
         // the player's own aim — is non-monotone whatever the median says.
+        //
+        // This one check is a sampled lottery and will go red or green depending
+        // on whether a stray headshot landed in this run's draws — which also
+        // move when a suite that sorts before this one consumes seeded random
+        // numbers first. That is a property of the defect, not sloppiness in the
+        // check: the printed table is the measurement, and a green line here
+        // means "no stray headshot in N engagements", not "cannot happen".
         const bests = RANGES.map((R) => S[cond][R].best);
         const bBreaks = fallsIn(bests, ms);
         report.check(`best-case TTK never falls as range grows (${cond})`, bBreaks.length === 0,
@@ -1042,16 +1344,24 @@ export default async function run(sim, report) {
       // Two independent instruments — the applyDamage amount and a counted
       // engagement — reading the same property. Agreement is what licenses the
       // rest of the section.
+      //
+      // Counted against rounds *landed*, not rounds fired. Under hitscan the two
+      // are the same number, but the moment travel time exists the trigger has
+      // already sent the next round or two downrange before the fatal one
+      // arrives — a projectile shim made this check red at 80 m with 5 fired
+      // against 4 landed, which is the gun working correctly and the instrument
+      // counting the wrong thing. Rounds fired is still reported beside it,
+      // because that is the number the player pays for.
       const implied = RANGES.map((R) => {
         const d = S.perfect[R].dmg;
         return Number.isFinite(d) ? Math.ceil(100 / d) : NaN;
       });
-      const measuredStk = RANGES.map((R) => S.perfect[R].stkMed);
+      const measuredStk = RANGES.map((R) => S.perfect[R].landedMed);
       const agree = implied.every((v, i) => Number.isFinite(v) && v === measuredStk[i]);
       report.check('counted shots-to-kill matches the damage curve', agree,
         RANGES.map((R, i) => `${R}m ${f2(S.perfect[R].dmg)} HP/round implies ${implied[i]}, counted `
           + `${measuredStk[i]}`).join('; ')
-        + ' (implied = ceil(100 HP / measured body damage), counted = rounds fired in the '
+        + ' (implied = ceil(100 HP / measured body damage), counted = rounds that landed in the '
         + 'spread-neutralised engagement)');
 
       // What the two compensated conditions cost, as a single number: how much
@@ -1066,6 +1376,79 @@ export default async function run(sim, report) {
         + `${perf80.kills}/${perf80.n} at ${ms(perf80.med)} — so the far-range failure survives `
         + `perfect recoil compensation and is bloom: the cone is already `
         + `${f4(hit80.cone * DEG * 2)} deg at the first round and keeps opening`);
+
+      /* ---- against the research ---------------------------------------- */
+      //
+      // Everything here is asserted against the 'perfect' condition, because
+      // that is the only one that measures the WEAPON: 'held' and 'tracked' both
+      // fold in the spread and recoil systems, and a published CoD shots-to-kill
+      // figure is a statement about damage per bullet against 100 HP, not about
+      // how well the gun can be held on target. The recoil and bloom failures
+      // are already red above on their own terms.
+      //
+      // Health first: every shots-to-kill figure in the research is against
+      // 100 HP, so if this game's soldier had 150 the whole comparison would be
+      // wrong in a way no TTK row would reveal.
+      //
+      // Read off a freshly spawned soldier with the health override deliberately
+      // omitted — ai.js does not export CONFIG, and every other spawn in this
+      // file passes an explicit health, so asking one of those would have made
+      // the check assert this test's own argument back at itself.
+      await placeTarget(10, { health: undefined });
+      const enemyHealth = await sim.eval(() => window.__GAME.director.enemies[0]?.health ?? null);
+      against('enemy health', 'damage.health_mw2019', enemyHealth, ' HP');
+
+      const nearR = RANGES[0], farR = RANGES[RANGES.length - 1];
+      against('shots to kill inside the max-damage range',
+        'damage.m4a1_mw2019_stk_max_range', S.perfect[nearR].landedMed, ' shots');
+      against('shots to kill past the min-damage range',
+        'damage.m4a1_mw2019_stk_min_range', S.perfect[farR].landedMed, ' shots');
+      against('TTK inside the max-damage range',
+        'damage.m4a1_mw2019_ttk_max_range', S.perfect[nearR].med, ' s');
+      against('TTK past the min-damage range',
+        'damage.m4a1_mw2019_ttk_min_range', S.perfect[farR].med, ' s');
+      // Two independent cross-title readings of the same close-range number, so
+      // a reader cannot dismiss the gap as one wiki's arithmetic. The BO6 entry
+      // is the FASTEST full-auto AR in that game — nothing in the sourced set
+      // kills faster than it, so a measurement below it is a measurement below
+      // the whole genre.
+      against('TTK against the MW3 assault-rifle class average',
+        'damage.ar_mw3_typical_ttk', S.perfect[nearR].med, ' s');
+      against('TTK against the fastest full-auto AR in the sourced set',
+        'damage.bo6_fastest_full_auto_assault_rifle_ttk', S.perfect[nearR].med, ' s');
+      against('TTK against the BO6 assault-rifle class band',
+        'damage.bo6_average_assault_rifle_ttk', S.perfect[nearR].med, ' s');
+    }
+
+    /* ============================================ sourcing manifest ==== */
+    //
+    // Printed as a check so it cannot be dropped from the output, and so a
+    // reviewer auditing this suite for invented Call of Duty numbers can read
+    // every target it used, with its key, tolerance, confidence and URL, without
+    // opening the file. The two thresholds in this suite that are NOT sourced —
+    // the 0.02 m drop floor and the plateau count that decides banded-vs-smooth —
+    // are named here as well, because an unsourced threshold that hides is the
+    // same problem as an invented target.
+    {
+      const uniq = [...new Set(USED)];
+      report.check('every target asserted here comes from targets.mjs', uniq.length > 0,
+        (TARGETS
+          ? `${uniq.length} sourced targets used: ${uniq.join(' || ')}`
+          : 'targets.mjs is absent, so no sourced target was used and every quantity above is reported '
+            + 'as a bare measurement')
+        + ` || UNSOURCED THRESHOLDS OWNED BY THIS SUITE: drop floor 0.02 m at 150 m (a physics bound — `
+        + `any projectile under ~2300 m/s drops further than that, and it is ~4x the instrument's own `
+        + `standard error); banded-vs-smooth cut at <= max(4, ranges/4) distinct plateaus (a shape `
+        + `discriminator, not a magnitude)`);
+      if (missing) {
+        const mine = ['bullet_velocity', 'bullet_drop', 'penetration', 'damage_falloff', 'ttk_ranges'];
+        const gaps = missing().filter((m) => mine.includes(m));
+        report.check('this domain has no research blind spots', gaps.length === 0,
+          gaps.length
+            ? `no sourced target at all for: ${gaps.join(', ')}`
+            : `all ${mine.length} scope items in this domain (${mine.join(', ')}) have at least one `
+              + 'externally sourced target');
+      }
     }
   } finally {
     // Whatever happened: no patched constant and no injected collider may

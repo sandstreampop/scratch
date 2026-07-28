@@ -93,6 +93,26 @@ function targetFor(paths) {
   return null;
 }
 
+/**
+ * A target that is a BAND rather than a value.
+ *
+ * targets.mjs deliberately carries entries with `value: null` and a
+ * `tol: {min, max}` where the evidence supports a range but no central figure —
+ * ai.ai_reaction_delay_range is 0.2..0.4 s on exactly that basis. Reading those
+ * through targetFor() would silently skip them, which would leave a sourced
+ * constraint unasserted, so they get their own lookup.
+ */
+function bandFor(paths) {
+  if (!TARGETS) return null;
+  for (const p of [].concat(paths)) {
+    let node = TARGETS;
+    for (const k of p.split('.')) { if (node == null) break; node = node[k]; }
+    if (node == null || !node.tol || node.tol.min == null) continue;
+    return { min: node.tol.min, max: node.tol.max, unit: node.unit ?? '', source: node.source ?? `targets.mjs:${p}` };
+  }
+  return null;
+}
+
 /* ------------------------------------------------------------ plumbing -- */
 
 const BASE_INPUT = {
@@ -165,6 +185,10 @@ async function install(sim) {
         t: g.elapsed, id: this.id, dist: distance, state: this.state,
         hits: 0, amount: 0,
         speed: Math.hypot(g.player.velocity.x, g.player.velocity.z),
+        // Rounds still owed on this burst, including this one. The only way to
+        // tell a burst the agent meant to be short from one that was cut off by
+        // losing sight of the player halfway through it.
+        bl: this.burstLeft,
         // Filled in by the tracer tap below, which sees the post-spread ray.
         blocked: null, onTarget: null, missBy: null, lateral: null, geom: 0,
       });
@@ -215,6 +239,15 @@ async function install(sim) {
         const along = Math.max(0, Math.min(toP.dot(d), Math.min(wd, 200)));
         const closest = o.clone().addScaledVector(d, along);
         f.missBy = closest.distanceTo(g.camera.position);
+        // Where the aim point sits relative to the body it is shooting at.
+        // enemyShoot() aims at g.camera.position — the EYE — while the hit test
+        // is against the player's whole AABB, so the cone is centred near the top
+        // of the target and everything above the head is guaranteed to miss.
+        // Recorded as two numbers so a fix that re-centres the aim shows up.
+        const cy = (box.min.y + box.max.y) * 0.5;
+        f.aimAbove = g.camera.position.y - cy;
+        f.dy = closest.y - cy;
+        f.boxH = box.max.y - box.min.y;
         const v = g.player.velocity;
         const sp = Math.hypot(v.x, v.z);
         f.lateral = sp > 0.5
@@ -631,14 +664,25 @@ export default async function run(sim, report) {
         `${total.length}/${RANGES.length * REPEATS} trials usable — ${unseen} discarded for no line of `
         + `sight at t0, ${noShot} for no round inside 2.2 s`);
 
-      const tgtR = targetFor(['ai.reaction_time', 'ai.ai_reaction_time', 'ai.reactionTime']);
+      const tgtR = targetFor(['ai.ai_reaction_delay_base', 'ai.reaction_time', 'ai.reactionTime']);
       if (tgtR) {
         report.against('AI reaction time (first sight -> first round)', reactionMedian, tgtR.value, tgtR.tol, ' s');
-        report.check('AI reaction target is sourced', true, `source: ${tgtR.source}`);
+        report.check('AI reaction target is sourced', true,
+          `source: ${tgtR.source} — measured ${dist(total, 'ms')} at ${f2(median(firstDist))} m median `
+          + 'engagement range');
       } else {
         report.check('AI reaction time (first sight -> first round)', total.length > 0,
-          `${dist(total, 'ms')} at ${f2(median(firstDist))} m median engagement range — no sourced target `
-          + 'yet (targets.mjs lists ai_reaction in its own missing() set)');
+          `${dist(total, 'ms')} at ${f2(median(firstDist))} m median engagement range — no sourced target yet`);
+      }
+      // The sourced band, asserted separately from the sourced central value:
+      // a reaction can be outside the 0.25 s figure and still inside the range
+      // the literature supports, and those are different failures.
+      const bandR = bandFor(['ai.ai_reaction_delay_range']);
+      if (bandR) {
+        report.check('AI reaction time falls inside the sourced reaction-delay band',
+          reactionMedian >= bandR.min && reactionMedian <= bandR.max,
+          `median ${ms(reactionMedian)} against ${ms(bandR.min)}..${ms(bandR.max)} `
+          + `(p10 ${ms(quant(total, 0.1))}, p90 ${ms(quant(total, 0.9))}); source: ${bandR.source}`);
       }
 
       // The behaviour-vs-constant statement. CONFIG.reactionTime's upper bound
@@ -683,6 +727,7 @@ export default async function run(sim, report) {
     for (const d of RANGES) {
       const rec = {
         d, fired: 0, hit: 0, blocked: 0, onTarget: 0, misses: [], dists: [], amounts: [],
+        aimAbove: [], dys: [], boxH: [],
         unusable: 0, drift: 0, trials: 0, engageTicks: 0, ticks: 0,
       };
       const ttks = [];
@@ -708,6 +753,8 @@ export default async function run(sim, report) {
           if (f.blocked) rec.blocked++;
           if (f.hits > 0) { rec.hit++; rec.amounts.push(f.amount); }
           if (Number.isFinite(f.missBy) && !f.hits) rec.misses.push(f.missBy);
+          if (Number.isFinite(f.aimAbove)) { rec.aimAbove.push(f.aimAbove); rec.boxH.push(f.boxH); }
+          if (Number.isFinite(f.dy)) rec.dys.push(f.dy);
           if (!Number.isFinite(tFirst)) tFirst = f.t;
           cum += f.amount;
           if (cum >= SPEC.maxHealth && !Number.isFinite(tCross)) tCross = f.t;
@@ -767,6 +814,29 @@ export default async function run(sim, report) {
         RANGES.map((d, i) => `${d} m ${Number.isFinite(missMed[i]) ? `${f2(missMed[i])} m` : 'no misses'}`).join(', ')
         + ' median perpendicular miss at the eye — measured, no sourced target for the magnitude; the check '
         + 'is that the sequence does not decrease');
+      // Where the AI is aiming on the body, which is the mechanism behind the
+      // numbers above and is not in this project's baseline. enemyShoot() aims at
+      // camera.position, and the camera is the player's eye: a stance 1.80 m tall
+      // is tested as a single AABB, so an aim point 0.7-0.8 m above the box centre
+      // throws away most of the upper half of every cone. The aim offset is the
+      // finding; the distribution of where rounds actually passed is printed
+      // beside it to show the consequence — its p90 is how far over the head the
+      // top of the cone lands. A tolerance of 15% of the body height is structural —
+      // an aim point inside the middle 30% of the target is "centre mass" in any
+      // shooter — and is not a sourced CoD figure.
+      {
+        const aimAbove = RANGES.flatMap((d) => acc.get(d).aimAbove);
+        const dys = RANGES.flatMap((d) => acc.get(d).dys);
+        const h = median(RANGES.flatMap((d) => acc.get(d).boxH));
+        report.check('the AI aims at the centre of the player it is shooting at',
+          Math.abs(median(aimAbove)) < 0.15 * h,
+          `aim point sits ${f2(median(aimAbove))} m above the centre of the player's ${f2(h)} m AABB `
+          + `(${pct(median(aimAbove) / h)} of body height), and rounds pass the body a median `
+          + `${f2(median(dys))} m above its centre [p10 ${f2(quant(dys, 0.1))} .. p90 ${f2(quant(dys, 0.9))}, `
+          + `i.e. the top of the cone lands ${f2(quant(dys, 0.9) - h / 2)} m over the head] — `
+          + 'enemyShoot() aims at camera.position, i.e. the eye, while the hit test is against the whole body '
+          + 'box, so the upper half of every spread cone is thrown away over the head');
+      }
       // Rounds the world ate on their way to a player they would otherwise have
       // hit. Only on-target rounds can be blocked: counting every round whose
       // world hit came first counts every miss, since a miss never intersects the
@@ -774,14 +844,24 @@ export default async function run(sim, report) {
       // by walls and would have condemned the level for the AI's cone.
       const blocked = RANGES.reduce((s, d) => s + acc.get(d).blocked, 0);
       const onT = RANGES.reduce((s, d) => s + acc.get(d).onTarget, 0);
-      // 10%: past that the accuracy curve is a joint measurement of the AI and
-      // the terrain and should not be quoted as an AI figure. Below it the bias
-      // is named and bounded, which is the most an instrument can do about a
-      // round that clips a rise in the ground a metre short of the player.
+      // Tested per range, not in aggregate. The aggregate is dominated by the
+      // near ranges, where nothing is blocked, and a 7% total hid 6 of 10
+      // on-target rounds being eaten by the ground at 40 m — which is exactly the
+      // range whose accuracy figure the reader would most want to trust. 25% is
+      // the point past which the number stops being an AI measurement and becomes
+      // a joint measurement of the AI and the terrain it is shooting over; it is
+      // a validity threshold for this instrument, not a CoD figure.
+      const worst = Math.max(...RANGES.map((d) => {
+        const r = acc.get(d);
+        return r.onTarget ? r.blocked / r.onTarget : 0;
+      }));
       report.check('the measured misses are misses and not walls',
-        blocked / onT < 0.10,
-        `${blocked}/${onT} on-target rounds (${pct(blocked / onT)}) were stopped by level geometry before `
-        + `reaching the player: ${RANGES.map((d) => `${d} m ${acc.get(d).blocked}/${acc.get(d).onTarget}`).join(', ')}`);
+        worst < 0.25,
+        `${blocked}/${onT} on-target rounds (${pct(blocked / onT)}) overall were stopped by level geometry `
+        + `before reaching the player, worst range ${pct(worst)}: `
+        + `${RANGES.map((d) => `${d} m ${acc.get(d).blocked}/${acc.get(d).onTarget}`).join(', ')}. `
+        + 'A round aimed at the eye that clips a rise in the ground short of the player is a real miss in the '
+        + 'game, but it means the hit rate at that range understates the AI by this fraction');
     }
 
     /* =============================== 3. AI time to kill ================ */
@@ -858,7 +938,12 @@ export default async function run(sim, report) {
           const b = bursts[bursts.length - 1];
           if (b && b.run && f.t - b.end <= GAP) { b.end = f.t; b.n++; } else {
             if (b) b.run = false;
-            bursts.push({ start: f.t, end: f.t, n: 1, run: true, first: first === null });
+            // `intended` is burstLeft on the burst's first round, which is the
+            // count the agent rolled out of CONFIG.burstCount. Delivered can come
+            // out lower when the agent loses sight of the player mid-burst: the
+            // ENGAGE branch only advances a burst while `sees`, so the remaining
+            // rounds are simply never fired.
+            bursts.push({ start: f.t, end: f.t, n: 1, intended: f.bl, run: true, first: first === null });
           }
           if (first === null) first = f.t;
         }
@@ -908,12 +993,25 @@ export default async function run(sim, report) {
       // of five rounds at 0.098 s spacing takes 0.39 s of that interval, so a
       // 0.42 s roll leaves ~30 ms between one burst and the next and the player
       // hears one long burst. The gap distribution beside it is the evidence.
-      const over = lens.filter((n) => n > 5).length;
-      report.check('AI bursts stay inside CONFIG.burstCount [2, 5]',
-        lens.length > 0 && over === 0 && Math.min(...lens) >= 2,
-        `median ${f2(median(lens))} rounds per burst [p10 ${f2(quant(lens, 0.1))} .. p90 `
-        + `${f2(quant(lens, 0.9))}], min ${Math.min(...lens)}, max ${Math.max(...lens)}, ${over}/${lens.length} `
-        + `bursts longer than 5 rounds; shortest gap between bursts ${ms(Math.min(...gaps))} against a `
+      // Two checks, one phenomenon each, so a single cause cannot light up two
+      // red lines. The roll is what CONFIG.burstCount governs; whether the roll
+      // survives to the barrel is a separate question and belongs below.
+      const intended = bursts.map((b) => b.intended);
+      const outside = intended.filter((n) => n < 2 || n > 5).length;
+      report.check('the burst lengths the AI rolls stay inside CONFIG.burstCount [2, 5]',
+        intended.length > 0 && outside === 0,
+        `rolled ${intended.join('/')} — median ${f2(median(intended))} rounds [p10 `
+        + `${f2(quant(intended, 0.1))} .. p90 ${f2(quant(intended, 0.9))}], ${outside}/${intended.length} `
+        + 'outside [2, 5]');
+      const cut = bursts.filter((b) => b.n < b.intended).length;
+      const merged = bursts.filter((b) => b.n > b.intended).length;
+      report.check('every burst the AI starts is the burst it delivers',
+        cut === 0 && merged === 0,
+        `delivered ${lens.join('/')} against ${intended.join('/')} rolled: ${cut} bursts cut short, `
+        + `${merged} runs longer than the roll. The ENGAGE branch only advances a burst while it can see the `
+        + 'player, so a burst interrupted by cover is abandoned rather than resumed; and fireTimer is '
+        + 'decremented DURING the burst, so a 5-round burst spending 0.39 s of a 0.42 s interval can run '
+        + `straight into the next one — shortest observed gap between bursts ${ms(Math.min(...gaps))} against a `
         + 'CONFIG.fireInterval floor of 420 ms');
       report.check('AI inter-burst delay', gaps.length > 0,
         `${dist(gaps, 'ms')} between the last round of a burst and the first of the next, against a `
@@ -961,11 +1059,13 @@ export default async function run(sim, report) {
       const STRAFE = IN_DYN('{ left: Math.floor(t / 0.7) % 2 === 0, right: Math.floor(t / 0.7) % 2 === 1 }');
       const stand = { fired: 0, hit: 0, lat: [], atFire: [] };
       const move = { fired: 0, hit: 0, lat: [], atFire: [], speed: [], travel: [] };
-      // Eight pairs, not three: at ~30 rounds a side the difference between two
-      // hit rates is worth about a standard error of 12 points, so a small real
-      // effect and noise are indistinguishable. The detail prints the two-
-      // proportion standard error so the reader can tell which one this is.
-      for (let i = 0; i < 8; i++) {
+      // Twelve pairs, not three. At ~30 rounds a side one standard error on the
+      // difference of two hit rates is about 12 points, and the first run of this
+      // section measured strafing 21 points WORSE than standing while the second,
+      // after an unrelated change shifted where the shared seeded stream was,
+      // measured it 15 points BETTER. Both were noise. The detail prints the
+      // two-proportion standard error so the reader can see which it is.
+      for (let i = 0; i < 12; i++) {
         for (const [tag, rec2, input] of [['stand', stand, null], ['strafe', move, STRAFE]]) {
           const e = await engage({ d: 20, seconds: 5, dt: DT_LONG, state: 'engage', vulnerable: true, input });
           if (!e.pre.sees) continue;
@@ -1103,11 +1203,18 @@ export default async function run(sim, report) {
           untagged: s.untagged.map((o) => window.__AI.describe(o)),
         };
       });
-      report.check('every visible mesh on the soldier is zone-tagged',
-        counts.untagged.length === 0,
-        `${counts.tagged}/${counts.vis} visible meshes tagged (${counts.all} meshes total including the `
-        + `opacity-0 muzzle sprite); ${counts.untagged.length} visible and untagged: `
-        + counts.untagged.join(' | '));
+      const tgtI = targetFor(['integrity.hitbox_visible_mesh_hittable']);
+      const untaggedDetail = `${counts.tagged}/${counts.vis} visible meshes tagged (${counts.all} meshes total `
+        + `including the opacity-0 muzzle sprite); ${counts.untagged.length} visible and untagged: `
+        + counts.untagged.join(' | ');
+      if (tgtI) {
+        report.against('visible soldier meshes that cannot be hit',
+          counts.untagged.length, tgtI.value, tgtI.tol, ' meshes');
+        report.check('the hittable-mesh invariant is sourced', true, `source: ${tgtI.source} — ${untaggedDetail}`);
+      } else {
+        report.check('every visible mesh on the soldier is zone-tagged',
+          counts.untagged.length === 0, untaggedDetail);
+      }
 
       // 61x61 = 3721 rays. Chunked by rows: intersectObjects against ~50
       // rounded boxes per ray is real work, and one evaluate long enough to look
