@@ -436,8 +436,15 @@ const GradeShader = {
       // Bright saturated sources go white at the core, as film and sensors
       // both do. Without this a strong warm emitter keeps its hue all the way
       // up and reads as a coloured card rather than something incandescent.
-      float hot = smoothstep(0.55, 1.6, luma(color));
-      color = mix(color, vec3(luma(color)), hot * 0.65);
+      // Converge to neutral, not merely toward it. At 0.65 a warm source still
+      // carried a third of its chroma into the shoulder, so red reached the
+      // ceiling on its own and 3.7% of a sunlit frame sat at rgb(255,222,218) —
+      // a clipped warm plateau with no modelling left in it, which two
+      // reviewers described as the tone curve destroying form exactly where the
+      // eye goes first. Film and sensors both go white at the core; anything
+      // short of that leaves one channel to clip alone.
+      float hot = smoothstep(0.42, 1.30, luma(color));
+      color = mix(color, vec3(luma(color)), hot * 0.94);
 
       color = aces(color);
 

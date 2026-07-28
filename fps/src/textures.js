@@ -391,7 +391,13 @@ const SAMPLERS = {
 
     c.h = 0.62 + cloud * 0.10 + grain * 0.07 + agg * 0.05 - hole * 0.38 - seam * 0.20 - crack * 0.28;
 
-    const l = 0.528 + cloud * 0.070 + grain * 0.045 + skin * 0.062 - stain * 0.085;
+    // Peaked at 0.705 in red, which is a sheet of paper. Precast concrete is a
+    // dark material — 0.25 to 0.40 weathered, and it does not get much above
+    // 0.5 even fresh off the mould. At the old value a barrier facing a low sun
+    // clipped outright, and clipped in red alone because the key is warm, which
+    // is the plateau two reviewers described as the tone curve destroying form.
+    // The same mistake as the plaster wall, one material along.
+    const l = 0.380 + cloud * 0.070 + grain * 0.045 + skin * 0.062 - stain * 0.085;
     c.r = l * 1.000; c.g = l * 0.990; c.b = l * 0.962;
     // Exposed aggregate is warmer and darker than the paste around it.
     c.r = lerp(c.r, 0.472, agg * 0.35); c.g = lerp(c.g, 0.444, agg * 0.35); c.b = lerp(c.b, 0.402, agg * 0.35);
