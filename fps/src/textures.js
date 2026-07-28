@@ -295,9 +295,16 @@ const SAMPLERS = {
     // clock as a repeat and coarse enough to survive out to twenty metres,
     // which is the range at which flat ground stops looking like ground.
     const t = clamp(drift * 0.42 + patchy * 0.30 + ripple * loose * 0.12 + grain * 0.22, 0, 1);
-    c.r = lerp(0.678, 0.516, t) + grit * 0.030;
-    c.g = lerp(0.596, 0.436, t) + grit * 0.026;
-    c.b = lerp(0.470, 0.334, t) + grit * 0.020;
+    // Dry desert sand is a 0.35-0.45 material. This peaked at 0.708 in red and
+    // the ground mesh then multiplied it by a further 1.24, for an effective
+    // 0.878 — brighter than anything short of fresh snow, on the single largest
+    // surface in every frame. Sun-facing dune slopes meet a low sun at nearly
+    // N.L = 1, so they clipped to flat white, and four blind reviewers each
+    // named the untextured-looking white distance as the thing that destroyed
+    // the worst frame. It was not untextured; it was blown.
+    c.r = lerp(0.441, 0.335, t) + grit * 0.020;
+    c.g = lerp(0.387, 0.283, t) + grit * 0.017;
+    c.b = lerp(0.306, 0.217, t) + grit * 0.013;
 
     // Pebbles are pale chert and dark basalt in roughly equal measure; a
     // single pebble colour is as obvious a repeat as a single pebble shape.

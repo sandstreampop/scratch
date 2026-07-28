@@ -373,7 +373,11 @@ export class Level {
     geo.computeBoundingSphere();
 
     const ground = new THREE.Mesh(geo, this.mat('sand', 1, {
-      color: new THREE.Color(1.24, 1.19, 1.08),
+      // Was Color(1.24, 1.19, 1.08). applyOverrides multiplies, so this was
+      // pushing an already-too-bright sand another 24% up, past any albedo a
+      // real surface has. Neutral now; the warmth belongs in the sampler and
+      // in the key light, not in a gain above one.
+      color: new THREE.Color(1.0, 1.0, 1.0),
       normalScale: new THREE.Vector2(1.85, 1.85),
       vertexColors: true,
       aoMapIntensity: 0.55,
