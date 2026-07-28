@@ -18,6 +18,135 @@ import { Quality, platform } from './quality.js';
 const params = new URLSearchParams(location.search);
 const SHOT = params.get('shot');
 
+/* --------------------------------------------------------- simulation --- */
+
+/**
+ * The length of one simulation step.
+ *
+ * physics.multiplayer_server_tick_rate: 60 Hz is the rate the authoritative
+ * simulation runs at, so it is the rate this one runs at. Everything about the
+ * player, the weapon, the AI and the rounds in flight advances in steps of
+ * exactly this length whatever the display is doing — see Game.step.
+ */
+const TICK = 1 / 60;
+
+/**
+ * How many ticks one frame may consume before the debt is written off.
+ *
+ * Five is 83 ms of simulation: enough to absorb a shader compile or a GC pause
+ * without the world jumping, and short of the point where catching up costs
+ * more than the frame that fell behind, which is the accumulator death spiral.
+ * Past it the simulation runs slow rather than the frame rate collapsing, which
+ * is the trade a phone wants.
+ */
+const MAX_TICKS_PER_FRAME = 5;
+
+/* --------------------------------------------------------- ballistics --- */
+
+/**
+ * The sourced ballistic model. Every figure names its key in tools/targets.mjs;
+ * the two that have no sourced magnitude say so in place.
+ *
+ * This lives here rather than in SPEC because SPEC's damage block describes a
+ * different model — one flat damage figure lerped from 45 m to 150 m down to
+ * 0.55x — and the two cannot both be authoritative. SPEC.damage,
+ * SPEC.falloffStart/End/Scale and SPEC.headshotMultiplier are no longer read by
+ * anything; weapon.js is owned elsewhere, so they are left for that owner to
+ * remove rather than half-removed from here.
+ */
+const BALLISTICS = {
+  // ballistics.ar_muzzle_velocity_mcw_mw3_2023 (750 m/s post-buff), which also
+  // sits mid-band in ballistics.ar_muzzle_velocity_design_band (590..850).
+  muzzleVelocity: 750,
+
+  // ballistics.instant_hit_range_formula_divisor, which is exact: a 20 Hz
+  // authority resolves anything inside velocity/20 metres within a single tick,
+  // so the first 37.5 m of every round registers on the tick the trigger broke
+  // and only the remainder is flown. This is why a faithful model is NOT "a
+  // projectile at all ranges" — inside that radius CoD is indistinguishable
+  // from hitscan, and ballistics.perceptible_travel_time_threshold (40 +/- 15 m,
+  // reported as 30..60) is the same boundary measured from the player's side.
+  instantHitDivisor: 20,
+
+  // ballistics.bullet_gravity_drop_present. Drop exists and is deliberately
+  // small, and no title publishes a magnitude — so the round falls in the same
+  // field the player does instead of in an invented one, and the drop that
+  // produces (39 cm at 150 m) is measured rather than asserted.
+  gravity: TUNING.gravity,
+
+  // damage.m4a1_mw2019_max_damage / _near_range_stop / _far_range_stop /
+  // _min_damage: 30 HP flat to 37.5 m, linear to 20 HP at 50 m, then 20 HP flat
+  // for ever — CoD has no hard damage cutoff. Two range stops, which is the
+  // whole point: against 100 HP the shots-to-kill are 4 inside the plateau
+  // (ceil(100/30)) and 5 beyond the floor (100/20 exactly), and both boundaries
+  // are announced distances a player can learn. The lerp this replaced moved
+  // damage at every metre, so the shot-count boundary sat wherever 100/damage
+  // happened to cross an integer and moved with any tweak to either end.
+  maxDamage: 30,
+  nearStop: 37.5,
+  farStop: 50,
+  minDamage: 20,
+
+  // damage.m4a1_mw2019_headshot_multiplier is 1.4x, and the largest figure
+  // anywhere in the research is 1.5x for snipers. Both values this game carried
+  // were roughly double that: SPEC.headshotMultiplier (2.4, read by nothing)
+  // and a 2.6 literal inside ai.js applyDamage(). At 2.6 a head hit takes
+  // 78 HP, so two rounds of a spread cone could kill where four centred ones
+  // were needed — which is why TTK was measurably non-monotonic in range.
+  //
+  // Passed to applyDamage() as an explicit argument so this table is the single
+  // source. ai.js owns that method and still applies its own literal until it
+  // takes the argument; the zone multiplier measured through the game is the
+  // check that says which of the two is live.
+  //
+  // 'body' is damage.mcw_mw3_torso_multiplier_post_buff (1.0x, both torso zones
+  // flattened). 'limb' has no sourced figure in any title and keeps the value
+  // ai.js authored.
+  zoneMultiplier: { head: 1.4, body: 1.0, limb: 0.72 },
+};
+
+/**
+ * Surface penetration, by weapon class.
+ *
+ * ballistics.penetration_class_hierarchy: penetration strength is assigned by
+ * CLASS and not tuned per gun, ordered LMG > AR > SMG with snipers highest. The
+ * ORDERING is the sourced part of this table; neither the thickness gate in
+ * metres nor the retained fraction is published for any weapon, so those are
+ * design numbers authored to that ordering and measured rather than asserted.
+ *
+ * ballistics.penetration_damage_falloff_is_flat_not_thickness_scaled: past the
+ * gate the penalty is ONE flat percentage, decoupled from thickness. So
+ * `retain` is deliberately not a function of the measured path length anywhere
+ * below — a round that crosses 4 cm and a round that crosses 19 cm of the same
+ * class of surface arrive with the same damage, and only the gate is thickness.
+ */
+const PENETRATION = {
+  sniper: { maxThickness: 0.55, retain: 0.80 },
+  lmg: { maxThickness: 0.35, retain: 0.70 },
+  ar: { maxThickness: 0.20, retain: 0.55 },
+  smg: { maxThickness: 0.10, retain: 0.45 },
+};
+
+/**
+ * The class the shipped weapon belongs to. SPEC has no class field and
+ * weapon.js is owned elsewhere; the M4A1 is an assault rifle, so the tier is
+ * named here until SPEC can carry it.
+ */
+const WEAPON_CLASS = 'ar';
+
+// Scratch vectors for the per-tick round walk. Allocating inside it would put a
+// pair of Vector3s per projectile per tick through the nursery.
+const _rv = new THREE.Vector3();
+const _rd = new THREE.Vector3();
+const _rp = new THREE.Vector3();
+const _rm = new THREE.Matrix4();
+// materialPath's own, and not a reuse of _rd: it is called from inside
+// advanceRound's loop with advanceRound's direction vector as its argument, and
+// writing the local-space direction into that same vector left every round that
+// crossed a surface travelling in a direction transformed into the geometry's
+// object space.
+const _rpd = new THREE.Vector3();
+
 /* ------------------------------------------------------------ presets --- */
 // Deterministic camera/gameplay states used by the screenshot harness.
 
@@ -72,6 +201,20 @@ class Game {
     this.container = document.getElementById('game');
     this.clock = new THREE.Clock();
     this.elapsed = 0;
+    // Time owed to the simulation but not yet stepped. See step().
+    this._accumulator = 0;
+    this.tickLength = TICK;
+    // Rounds still in the air. A round only lands here once it has passed the
+    // instant-hit radius without hitting anything, so a close-quarters fight
+    // never allocates one.
+    this.projectiles = [];
+    // The two model tables, reachable from outside so the acceptance suite can
+    // perturb the model it is measuring and read the ordering of the penetration
+    // tiers. Nothing in the game reads them through the instance: these are the
+    // same objects the module-scope constants name, exposed for the same reason
+    // window.__THREE is.
+    this.ballistics = BALLISTICS;
+    this.penetration = PENETRATION;
     this.score = 0;
     this.running = false;
     this.ready = false;
@@ -347,7 +490,7 @@ class Game {
     const up = new THREE.Vector3().crossVectors(right, dir).normalize();
     dir.addScaledVector(right, Math.sin(a) * r).addScaledVector(up, Math.cos(a) * r).normalize();
 
-    this.resolveBullet(origin, dir, SPEC.damage, true);
+    this.fireRound(origin, dir, true);
 
     // Muzzle effects come off the actual viewmodel muzzle, projected into
     // the world so smoke and casings sit where the barrel is.
@@ -372,49 +515,216 @@ class Game {
     return this.camera.position.clone().addScaledVector(dir, Math.max(0.25, dist * 1.6));
   }
 
-  resolveBullet(origin, dir, damage, fromPlayer) {
-    const maxRange = SPEC.range;
-    const enemyHit = this.director.raycast(origin, dir, maxRange);
+  /* ----------------------------------------------------------- rounds --- */
 
-    const ray = new THREE.Raycaster(origin, dir, 0.1, maxRange);
-    const worldHits = ray.intersectObjects(this.level.raycastables, false);
-    const worldHit = worldHits.length ? worldHits[0] : null;
+  /** Damage a round still carries at `distance` from the muzzle. */
+  static damageAtRange(distance) {
+    const B = BALLISTICS;
+    if (distance <= B.nearStop) return B.maxDamage;
+    if (distance >= B.farStop) return B.minDamage;
+    // One linear segment between the two stops, and nothing outside them.
+    return B.maxDamage
+      + (B.minDamage - B.maxDamage) * ((distance - B.nearStop) / (B.farStop - B.nearStop));
+  }
 
-    const enemyFirst = enemyHit && (!worldHit || enemyHit.distance < worldHit.distance);
+  /**
+   * Sends one round down `dir` from `origin`.
+   *
+   * One authority tick of flight — 1/20 s, so velocity/20 = 37.5 m — is
+   * simulated here, on this tick, because that is what a 20 Hz server does with
+   * it: inside that radius travel time does not merely round down to nothing, it
+   * does not exist, and no amount of leading a target changes anything. Whatever
+   * survives that stretch goes onto the projectile list and is flown at TICK
+   * resolution from there.
+   *
+   * The instant stretch is flown in sub-steps rather than traced as a straight
+   * ray. Resolving it in one tick is a statement about WHEN the hit registers,
+   * not about the round not falling: a straight first 37.5 m makes the drop at
+   * 50 m one tick's worth instead of the whole flight's, so drop stops being
+   * quadratic in range and the two independent velocity estimates stop agreeing.
+   * Both of those were measured before this was sub-stepped.
+   */
+  fireRound(origin, dir, fromPlayer) {
+    const round = {
+      pos: origin.clone(),
+      vel: dir.clone().multiplyScalar(BALLISTICS.muzzleVelocity),
+      // What penetration has taken off, kept separate from range falloff so the
+      // two are composed at the moment of the hit rather than baked together.
+      retain: 1,
+      flown: 0,
+      fromPlayer,
+    };
+    const instantTime = 1 / BALLISTICS.instantHitDivisor;
+    let flownTime = 0;
+    let spent = false;
+    while (!spent && flownTime + 1e-9 < instantTime) {
+      const step = Math.min(TICK, instantTime - flownTime);
+      spent = this.stepRound(round, step);
+      flownTime += step;
+    }
+    // The streak is spawned once, at the muzzle, on the tick the trigger broke:
+    // a tracer that waited for the round to arrive would appear after the hit.
+    if (fromPlayer) this.spawnTracer(origin, dir, spent ? round.flown : SPEC.range);
+    if (!spent) this.projectiles.push(round);
+  }
 
-    if (enemyFirst) {
-      const { enemy, zone, point, distance } = enemyHit;
-      const falloff = THREE.MathUtils.clamp(
-        1 - (distance - SPEC.falloffStart) / (SPEC.falloffEnd - SPEC.falloffStart), 0, 1,
-      );
-      const dealt = damage * THREE.MathUtils.lerp(SPEC.falloffScale, 1, falloff);
-      const killed = enemy.applyDamage(dealt, zone, dir);
-      this.vfx.bloodBurst(point, dir, zone === 'head' ? 1.6 : 1);
-      this.vfx.bloodDecals.place(
-        new THREE.Vector3(point.x, this.level.groundHeight(point.x, point.z) + 0.02, point.z),
-        new THREE.Vector3(0, 1, 0), 0.7 + Math.random() * 0.5,
-      );
-      if (fromPlayer) {
-        this.audio.impact('flesh', distance);
-        if (!killed) { this.hud.hit(false); this.audio.hitmarker(false); }
+  /**
+   * Flies one round for `dt`. Returns true once it is spent.
+   *
+   * Gravity is integrated before the step (semi-implicit), which is the scheme
+   * the player uses, so a round and a body fall on the same curve.
+   */
+  stepRound(round, dt) {
+    round.vel.y -= BALLISTICS.gravity * dt;
+    _rv.copy(round.vel).multiplyScalar(dt);
+    const length = _rv.length();
+    if (length < 1e-6) return true;
+    _rd.copy(_rv).divideScalar(length);
+    const reach = this.advanceRound(round, _rd, length);
+    return reach.spent || round.flown >= SPEC.range;
+  }
+
+  /**
+   * Walks a round along one straight segment of its path.
+   *
+   * Returns `{spent, at}`: whether the round stopped inside the segment, and how
+   * far along it the first thing it touched was (for the tracer). Mutates
+   * `round.pos`, `round.flown` and `round.retain`.
+   *
+   * The loop is what penetration needs: a round that gets through a surface
+   * carries on from the far face inside the same segment, so a 4 cm sheet does
+   * not cost it a tick.
+   */
+  advanceRound(round, dir, length) {
+    let left = length;
+    let first = null;
+    // Three surfaces is a wall, a window and a crate: past that the round has
+    // nothing left worth spending another pair of raycasts on.
+    for (let crossings = 0; crossings < 3 && left > 1e-4; crossings++) {
+      const enemyHit = this.director.raycast(round.pos, dir, left);
+      const ray = new THREE.Raycaster(round.pos, dir, 0.02, left);
+      const worldHits = ray.intersectObjects(this.level.raycastables, false);
+      const worldHit = worldHits.length ? worldHits[0] : null;
+
+      if (enemyHit && (!worldHit || enemyHit.distance < worldHit.distance)) {
+        round.flown += enemyHit.distance;
+        round.pos.copy(enemyHit.point);
+        this.hitBody(round, enemyHit, dir);
+        return { spent: true, at: first ?? enemyHit.distance };
       }
-      if (fromPlayer) this.spawnTracer(origin, dir, distance);
-      return;
+      if (!worldHit) break;
+
+      if (first === null) first = worldHit.distance;
+      round.flown += worldHit.distance;
+      const path = this.materialPath(worldHit, dir);
+      const gate = PENETRATION[WEAPON_CLASS].maxThickness;
+      const through = path !== null && path <= gate;
+      this.hitSurface(round, worldHit, dir, through);
+      if (!through) return { spent: true, at: first };
+
+      // Flat, and deliberately not a function of `path`: past the gate the
+      // penalty is one percentage, which is what makes cover a yes/no decision
+      // rather than a thickness sum a player cannot see.
+      round.retain *= PENETRATION[WEAPON_CLASS].retain;
+      const step = worldHit.distance + path + 0.01;
+      round.pos.copy(worldHit.point).addScaledVector(dir, path + 0.01);
+      round.flown += path + 0.01;
+      left -= step;
     }
 
-    if (worldHit) {
-      const surface = this.classifySurface(worldHit.object);
-      const normal = worldHit.face
-        ? worldHit.face.normal.clone().transformDirection(worldHit.object.matrixWorld)
-        : new THREE.Vector3(0, 1, 0);
-      this.vfx.impact(worldHit.point, normal, surface, 1);
-      this.audio.impact(surface, worldHit.distance);
-      if (fromPlayer) this.spawnTracer(origin, dir, worldHit.distance);
-      else this.director.alertAll(worldHit.point, 12);
-      return;
-    }
+    const free = Math.max(0, left);
+    round.pos.addScaledVector(dir, free);
+    round.flown += free;
+    return { spent: round.flown >= SPEC.range, at: first };
+  }
 
-    if (fromPlayer) this.spawnTracer(origin, dir, maxRange);
+  /**
+   * Metres of material a round would have to cross to leave `hit.object`.
+   *
+   * Measured in the object's own space against its geometry bounding box, not
+   * against a world AABB: every plate in this game faces the shooter, and the
+   * world AABB of a 4 cm sheet rotated 45 degrees is a 4 m box, which would gate
+   * a sheet as if it were a bunker. Returns null when the object has no
+   * geometry to measure, which reads as "does not penetrate".
+   *
+   * For a merged mesh the box is the whole merge, so a wall that is one draw call
+   * with a building is treated as that thick. Conservative in the direction that
+   * keeps cover working.
+   */
+  materialPath(hit, dir) {
+    const geo = hit.object.geometry;
+    if (!geo) return null;
+    if (!geo.boundingBox) geo.computeBoundingBox();
+    const box = geo.boundingBox;
+    _rm.copy(hit.object.matrixWorld).invert();
+    // Local-space ray, nudged inside the surface so the entry face is behind it.
+    _rp.copy(hit.point).addScaledVector(dir, 1e-4).applyMatrix4(_rm);
+    _rpd.copy(dir).transformDirection(_rm);
+    let exit = Infinity;
+    for (const axis of ['x', 'y', 'z']) {
+      const d = _rpd[axis];
+      if (Math.abs(d) < 1e-9) continue;
+      const t = ((d > 0 ? box.max[axis] : box.min[axis]) - _rp[axis]) / d;
+      if (t < exit) exit = t;
+    }
+    if (!Number.isFinite(exit) || exit <= 0) return null;
+    // Back to world scale by measuring the exit point rather than the parameter,
+    // so a scaled mesh reports the thickness it actually has.
+    _rp.addScaledVector(_rpd, exit).applyMatrix4(hit.object.matrixWorld);
+    return _rp.distanceTo(hit.point);
+  }
+
+  /** A round arriving on a soldier. */
+  hitBody(round, hit, dir) {
+    const { enemy, zone, point, distance } = hit;
+    // Range falloff is applied to the base damage and penetration to that, both
+    // before the zone multiplier, so `amount` is what the round had left when it
+    // arrived and the multiplier is the only thing the zone contributes.
+    const amount = Game.damageAtRange(round.flown) * round.retain;
+    const zoneMult = BALLISTICS.zoneMultiplier[zone] ?? 1;
+    const killed = enemy.applyDamage(amount, zone, dir, zoneMult);
+    this.vfx.bloodBurst(point, dir, zone === 'head' ? 1.6 : 1);
+    this.vfx.bloodDecals.place(
+      new THREE.Vector3(point.x, this.level.groundHeight(point.x, point.z) + 0.02, point.z),
+      new THREE.Vector3(0, 1, 0), 0.7 + Math.random() * 0.5,
+    );
+    if (round.fromPlayer) {
+      this.audio.impact('flesh', distance);
+      if (!killed) { this.hud.hit(false); this.audio.hitmarker(false); }
+    }
+  }
+
+  /** A round arriving on world geometry, whether or not it gets through. */
+  hitSurface(round, hit, dir, through) {
+    const surface = this.classifySurface(hit.object);
+    const normal = hit.face
+      ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld)
+      : new THREE.Vector3(0, 1, 0);
+    // A round that punched through still spalls the face it went in at, at
+    // reduced strength: the effect is the evidence a player has that the surface
+    // is penetrable at all.
+    this.vfx.impact(hit.point, normal, surface, through ? 0.55 : 1);
+    this.audio.impact(surface, hit.distance);
+    if (!round.fromPlayer) this.director.alertAll(hit.point, 12);
+  }
+
+  /** Flies every round already in the air for one tick. */
+  updateProjectiles(dt) {
+    for (let i = this.projectiles.length - 1; i >= 0; i--) {
+      if (this.stepRound(this.projectiles[i], dt)) this.projectiles.splice(i, 1);
+    }
+  }
+
+  /**
+   * Drops everything in flight and the tick debt.
+   *
+   * A known world state has to include the rounds already in the air: a test
+   * that repositions a target while a round from the previous burst is still
+   * downrange gets that round's hit attributed to the new engagement.
+   */
+  resetSimulation() {
+    this.projectiles.length = 0;
+    this._accumulator = 0;
   }
 
   spawnTracer(origin, dir, distance) {
@@ -485,11 +795,71 @@ class Game {
 
   /* --------------------------------------------------------------- frame -- */
 
+  /**
+   * Advances one frame's worth of time, in fixed steps.
+   *
+   * The simulation used to integrate at whatever dt it was handed, which made
+   * every quantity a player learns a function of their frame rate: the jump
+   * apex measured 0.8875 m at 30 Hz against 0.9686 m at 144 Hz, a 9.6% spread on
+   * a 1 m jump, and two seconds of sprint covered 13.3636 m against 13.2858 m.
+   * Semi-implicit Euler overshoots by a term proportional to dt, and an
+   * exponential acceleration ramp sampled coarsely is a different ramp, so
+   * neither gap could be closed by retuning: the fix has to be that dt stops
+   * varying.
+   *
+   * So the frame's time is banked and drawn down in TICK-long steps. A 30 fps
+   * frame runs two ticks, a 144 fps frame runs one on two frames out of five,
+   * and the sequence of simulated states is identical either way — 120 ticks in
+   * two seconds at every frame rate.
+   *
+   * Presentation is not sub-stepped: the HUD, the sky, the sun and the damage
+   * post-effect are functions of the state the ticks left behind, and running
+   * them per tick would cost a phone three HUD updates on a slow frame to
+   * produce one frame's worth of pixels.
+   *
+   * Look is applied once per frame, before the ticks, and deliberately outside
+   * them: a mouse delta is not a rate, so it is frame-rate independent already,
+   * and quantising the view to 60 Hz is the one part of this a player would feel.
+   */
   step(dt) {
+    this.inputManager?.update();
+
+    this._accumulator += dt;
+    let ticks = 0;
+    // Ticks are run until the simulation covers the frame being presented, not
+    // until it merely nearly covers it: any time owed at all buys the tick that
+    // spans it, and the accumulator goes negative to pay for it. Draining to
+    // "acc < TICK" instead leaves the frame showing a state up to a whole frame
+    // old, and since that lag is a frame long it is worst exactly where the
+    // frame is longest — 33 ms of stale sprint at 30 Hz against none at 240 Hz,
+    // which is a frame-rate-dependent observation of a frame-rate-independent
+    // trajectory. This way the lead is bounded by one tick at every rate and
+    // this frame's input is always in this frame's picture. The 1e-9 is float
+    // dust from subtracting TICK a few hundred times, not a tolerance.
+    while (this._accumulator > 1e-9 && ticks < MAX_TICKS_PER_FRAME) {
+      this._accumulator -= TICK;
+      this.tick(TICK);
+      ticks++;
+    }
+    // A frame that could not be caught up on: write the debt off rather than
+    // carry it into the next frame, where it would buy another five ticks.
+    if (this._accumulator > 0) this._accumulator = 0;
+
+    this.present(dt);
+  }
+
+  /** One fixed simulation step. Everything a measurement can see happens here. */
+  tick(dt) {
     this.elapsed += dt;
 
-    this.inputManager?.update();
     this.player.update(dt, this.input, this.elapsed);
+
+    // Before the trigger, not after. A round fired on this tick has already flown
+    // its instant-hit stretch inside fireRound(), so flying it again here would
+    // add another tick of travel to it and put the boundary at velocity/20 plus
+    // one tick — 50 m rather than the sourced 37.5 m. Measured: with this call
+    // after playerShoot, a target at 50 m was hit with zero travel time.
+    this.updateProjectiles(dt);
 
     if (this.input.fire) this.playerShoot();
     if (this.weapon.ammo === 0 && !this.weapon.reloading && this.weapon.reserve > 0) {
@@ -497,17 +867,22 @@ class Game {
     }
 
     this.weapon.update(dt, this.elapsed, this.player, this.input);
-    this.weapon.syncLighting(this.atmosphere.sunDirection, this.camera);
 
     this.director.update(dt, this.player, this.elapsed);
-    this.atmosphere.update(this.camera);
     this.vfx.update(dt, this.elapsed, this.atmosphere.sunDirection);
-    this.post.updateSun(this.atmosphere.sunDirection);
 
     // Damage feedback decay.
     this._damageFlash = Math.max(0, (this._damageFlash ?? 0) - dt * 3.2);
+  }
+
+  /** Everything that reads the simulation to build a frame. */
+  present(dt) {
+    this.weapon.syncLighting(this.atmosphere.sunDirection, this.camera);
+    this.atmosphere.update(this.camera);
+    this.post.updateSun(this.atmosphere.sunDirection);
+
     const hurtLevel = Math.max(
-      this._damageFlash * 0.6,
+      (this._damageFlash ?? 0) * 0.6,
       (1 - this.player.health / TUNING.maxHealth) * 0.35,
     );
     this.post.setDamage(hurtLevel);

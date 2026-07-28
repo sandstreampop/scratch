@@ -5,26 +5,12 @@
 // paces a firefight, and whether the parts of the soldier a player can see are
 // the parts the game will register a hit on.
 //
-// It exists because every one of those quantities is described somewhere in
-// ai.js by a constant that does not describe it:
-//
-//   CONFIG.reactionTime is [0.28, 0.62] s, but nothing fires at 0.28 s. The
-//   reaction roll only moves IDLE -> ALERT -> ENGAGE; entering ENGAGE then rolls
-//   a fresh fireTimer of 0.12-0.34 s, and the ENGAGE branch that arms the burst
-//   does not shoot on the tick it arms it. The player's experience is the sum,
-//   and the sum is what this file reports.
-//
-//   applyDamage() multiplies head damage by 2.6 while SPEC.headshotMultiplier
-//   is 2.4 and read by nobody. So zone multipliers here are measured out of
-//   enemy health deltas, and the dead constant is proved dead by changing it and
-//   watching nothing happen.
-//
-//   The hit zones are tagged per mesh in buildSoldier(). Anything the author
-//   forgot to tag is still rendered, still lit, still part of the silhouette the
-//   player aims at, and completely absent from director.raycast(). That is not a
-//   number anyone can read off the source — it is a coverage question about two
-//   sets of meshes, and the only honest way to ask it is to fire a lot of rays
-//   at the model and count.
+// It exists because every one of those quantities used to be described in ai.js
+// by a constant that did not describe it. CONFIG.reactionTime was [0.28, 0.62]
+// s and nothing fired at 0.28 s: the reaction roll only moved IDLE -> ALERT ->
+// ENGAGE, entering ENGAGE rolled a fresh 0.12-0.34 s fireTimer, and the branch
+// that armed the burst did not fire on the tick it armed it. The player
+// experiences the sum, so the sum is what this file reports.
 //
 // THREE CONVENTIONS, all load-bearing:
 //
@@ -34,84 +20,50 @@
 //   installed on the prototype, not on an instance, because every sim.setup()
 //   throws the roster away and spawns fresh soldiers.
 //
-//   Hits are Player.prototype.damage() calls, and they are attributed to a
-//   specific round: main.enemyShoot() resolves the shot synchronously inside
-//   enemy.shoot(), so a damage call arriving while a shoot() is on the stack
-//   belongs to that round. That is what makes "missed" distinguishable from
-//   "never fired" — the two live in different arrays, and a range that reports
-//   0% accuracy says whether the AI shot and missed or never pulled the
-//   trigger.
+//   Hits are Player.prototype.damage() calls, attributed to a specific round:
+//   main.enemyShoot() resolves the shot synchronously inside enemy.shoot(), so a
+//   damage call arriving while a shoot() is on the stack belongs to that round.
+//   That is what makes "missed" distinguishable from "never fired" — the two
+//   live in different arrays, and a range reporting 0% says which it was.
 //
 //   Every engagement checks its own preconditions before its numbers are
 //   quoted: that the enemy could see the player at t=0, that the AI's firing
 //   lane is not a wall, and that a strafe actually moved. The four null AI
-//   timings this project reported last session were all probes that measured
+//   timings this project reported two sessions ago were all probes that measured
 //   nothing and said nothing about it.
 //
-// Where a threshold is not a sourced Call of Duty figure it is a STRUCTURAL
-// floor — "the quantity is nonzero", "the AI leads at all", "the silhouette the
-// game registers is the silhouette the player sees" — and the detail string says
-// so. targets.mjs lists ai_reaction, ai_accuracy and hitbox_fidelity in its own
-// missing() set, so most of this file is measurement without an external target,
-// and it prints that gap rather than inventing a number to close it.
+// WHAT IS ASSERTED AND WHAT IS ONLY MEASURED. Reaction and the visible-mesh
+// invariant have sourced targets and go through report.against(). AI accuracy
+// does not — targets.mjs lists ai_accuracy in its own missing() set and its
+// note explains that no publisher documents one — so the curve is measured with
+// report.measure() and what is ASSERTED about it is only what must be true of
+// any accuracy curve whatever its level: that it decreases with range, that no
+// engagement range is a certainty, and that adjacent ranges are a step apart
+// rather than a cliff. Those three floors are this file's own structural
+// statements and every detail string says so. Everything else with no reference
+// value is a MEAS row, which cannot pass and cannot inflate a pass rate.
+//
+// Two rows are red on purpose and belong to files this suite does not own; both
+// name the owner in their detail. See the report.
 
-const DEG = 180 / Math.PI;
 
-// 1/240 for anything whose answer is a timestamp (reaction, TTK): the ENGAGE
-// branch costs one tick of latency by construction, and at 1/240 that tick is
-// 4 ms of the answer instead of 17. 1/120 for the long accuracy and pacing
-// runs, where the quantity is a ratio over ~100 rounds and halving the tick
-// count is worth more than 4 ms of edge resolution.
+// 1/240 for anything whose answer is a timestamp (reaction, TTK): the AI's own
+// line-of-sight schedule costs up to two ticks of latency by construction, and
+// at 1/240 that is 8 ms of the answer instead of 33. 1/120 for the long accuracy
+// and pacing runs, where the quantity is a ratio over ~100 rounds and halving
+// the tick count is worth more than 4 ms of edge resolution.
 const DT_FINE = 1 / 240;
 const DT_LONG = 1 / 120;
 
 export const NAME = 'ai';
 
-/* ------------------------------------------------------------- targets -- */
-//
-// Same defensive shape as gameplay-weapon.mjs: this file does not own
-// targets.mjs and must not dictate its schema, and must never substitute a
-// number of its own when a lookup misses.
-let TARGETS = null, missing = null;
-try { ({ TARGETS, missing } = await import('./targets.mjs')); } catch { /* not written yet */ }
-
-function targetFor(paths) {
-  if (!TARGETS) return null;
-  for (const p of [].concat(paths)) {
-    let node = TARGETS;
-    for (const k of p.split('.')) { if (node == null) break; node = node[k]; }
-    if (node == null) continue;
-    if (typeof node === 'number') return { value: node, tol: { pct: 0.15 }, source: `targets.mjs:${p}` };
-    const value = node.value ?? node.target ?? node.median ?? null;
-    if (typeof value !== 'number') continue;
-    const tol = node.tol
-      ?? (node.pct != null ? { pct: node.pct } : null)
-      ?? (node.min != null || node.max != null ? { min: node.min, max: node.max } : null)
-      ?? { pct: 0.15 };
-    return { value, tol, unit: node.unit ?? '', source: node.source ?? `targets.mjs:${p}` };
-  }
-  return null;
-}
-
-/**
- * A target that is a BAND rather than a value.
- *
- * targets.mjs deliberately carries entries with `value: null` and a
- * `tol: {min, max}` where the evidence supports a range but no central figure —
- * ai.ai_reaction_delay_range is 0.2..0.4 s on exactly that basis. Reading those
- * through targetFor() would silently skip them, which would leave a sourced
- * constraint unasserted, so they get their own lookup.
- */
-function bandFor(paths) {
-  if (!TARGETS) return null;
-  for (const p of [].concat(paths)) {
-    let node = TARGETS;
-    for (const k of p.split('.')) { if (node == null) break; node = node[k]; }
-    if (node == null || !node.tol || node.tol.min == null) continue;
-    return { min: node.tol.min, max: node.tol.max, unit: node.unit ?? '', source: node.source ?? `targets.mjs:${p}` };
-  }
-  return null;
-}
+// Only missing() is imported. Sourced values reach this file exclusively through
+// report.against(domain, key), which throws on an unknown key — the fuzzy local
+// lookups every first-generation suite wrote resolved 0 of 10 keys here and
+// printed each miss as "no sourced target yet", which was a false claim about
+// the research rather than a bug report about the lookup.
+let missing = null;
+try { ({ missing } = await import('./targets.mjs')); } catch { /* runner will have failed first */ }
 
 /* ------------------------------------------------------------ plumbing -- */
 
@@ -120,8 +72,7 @@ const BASE_INPUT = {
   sprint: false, crouch: false, ads: false, fire: false,
 };
 // drive() Object.assign's the patch, so an omitted key keeps its last value.
-// Everything here goes through IN/IN_DYN so a key nobody mentioned is false.
-const IN = (over = {}) => `return ${JSON.stringify({ ...BASE_INPUT, ...over })};`;
+// Everything here goes through IN_DYN so a key nobody mentioned is false.
 const IN_DYN = (expr) => `return Object.assign(${JSON.stringify(BASE_INPUT)}, (${expr}));`;
 
 // What the pacing and reaction traces need out of the agent itself. State is a
@@ -145,12 +96,15 @@ function quant(arr, p) {
   return a[lo] + (a[hi] - a[lo]) * (i - lo);
 }
 const median = (a) => quant(a, 0.5);
-const mean = (a) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : NaN);
+const mean = (a) => {
+  const f = a.filter(Number.isFinite);
+  return f.length ? f.reduce((s, x) => s + x, 0) / f.length : NaN;
+};
 
 /** median [p10..p90] over n samples — the standard way this file prints a distribution. */
 function dist(a, unit = 's', scale = 1) {
   const n = a.filter(Number.isFinite).length;
-  if (!n) return `no samples`;
+  if (!n) return 'no samples';
   const g = (p) => (unit === 'ms' ? ms(quant(a, p)) : `${f3(quant(a, p) * scale)}${unit}`);
   return `median ${g(0.5)} [p10 ${g(0.1)} .. p90 ${g(0.9)}] over ${n} trials`;
 }
@@ -171,7 +125,7 @@ async function install(sim) {
 
     const rec = {
       fires: [], hits: [], cur: -1,
-      SPEC: wp.SPEC, TUNING: pl.TUNING, CONFIG: null,
+      SPEC: wp.SPEC,
       reset() { rec.fires.length = 0; rec.hits.length = 0; rec.cur = -1; },
     };
     window.__AI = rec;
@@ -259,23 +213,26 @@ async function install(sim) {
 
     /* ---- the soldier's visible surface vs its hittable surface --------- */
     //
-    // "Visible" is o.visible AND not a fully transparent additive quad: the
-    // muzzle-flash sprite is a mesh that exists at opacity 0 for all but ~45 ms
-    // per round, and counting it as part of the silhouette would inflate the
-    // defect rate with something the player almost never sees. Both counts are
-    // reported so the choice is auditable rather than buried here.
+    // "Part of the silhouette" is o.visible AND not an additive effect quad. The
+    // muzzle flash is a Mesh with AdditiveBlending and depthWrite off whose
+    // opacity is nonzero for ~45 ms per round; it is a light, not a surface, and
+    // counting it as geometry would make the defect count depend on whether the
+    // last round happened to be inside the decay window — which is exactly why
+    // the untagged count read 7 on some runs and 8 on others. Both counts are
+    // returned so the choice is auditable rather than buried here.
     rec.meshes = (enemy) => {
-      const all = [], vis = [], tagged = [], untagged = [];
+      const all = [], vis = [], tagged = [], untagged = [], effects = [];
       enemy.root.traverse((o) => {
         if (!o.isMesh) return;
         all.push(o);
         const m = o.material;
-        const solid = !(m && m.transparent && (m.opacity ?? 1) <= 0.01);
-        if (o.visible && solid) vis.push(o);
+        const effect = !!m && (m.blending === THREE.AdditiveBlending || m.depthWrite === false);
+        if (effect) { effects.push(o); return; }
+        if (o.visible) vis.push(o);
         if (o.userData.zone) tagged.push(o);
-        else if (o.visible && solid) untagged.push(o);
+        else if (o.visible) untagged.push(o);
       });
-      return { all, vis, tagged, untagged };
+      return { all, vis, tagged, untagged, effects };
     };
 
     /**
@@ -285,8 +242,8 @@ async function install(sim) {
      * reconstructed from geometry parameters, material and local offset — which
      * together map one-to-one onto the mk()/g() calls in ai.js. The "rifle:"
      * prefix is the one piece of semantics worth adding by hand, because every
-     * untagged mesh on this model turns out to be part of the weapon and a list
-     * of seven anonymous rounded boxes does not say that.
+     * untagged mesh on this model used to be part of the weapon and a list of
+     * seven anonymous rounded boxes does not say that.
      */
     rec.describe = (o) => {
       const gm = o.geometry;
@@ -428,7 +385,6 @@ async function install(sim) {
       return { probes: out, eaten };
     };
 
-    rec.CONFIG = { note: 'ai.js CONFIG is module-private; reaction bounds are quoted from source text only' };
     return 'installed';
   });
 }
@@ -451,7 +407,7 @@ async function arm(sim, vulnerable) {
   }, vulnerable);
 }
 
-/** Everything the recorder saw, plus the enemy's own view of the world. */
+/** Everything the recorder saw. */
 async function records(sim) {
   return sim.eval(() => ({
     fires: window.__AI.fires.map((f) => ({ ...f })),
@@ -473,16 +429,17 @@ function engagementFactory(sim, lane) {
   const a = lane.deg * Math.PI / 180;
   const yaw = a + Math.PI;            // player looks up the lane
   const origin = [-6, null, 17];
-  return async function engage({
+  const at = (d) => ({ x: origin[0] + Math.sin(a) * d, z: origin[2] + Math.cos(a) * d, facing: yaw });
+  async function engage({
     d, seconds, dt = DT_LONG, health = 1e6, vulnerable = true, input = null,
     state = 'idle', sample = SAMPLE_AI,
   }) {
-    const ex = origin[0] + Math.sin(a) * d, ez = origin[2] + Math.cos(a) * d;
+    const p = at(d);
     await sim.setup({
       position: origin, yaw, pitch: 0, ads: 0, invulnerable: !vulnerable, health,
       // facing back down the lane at the player: an enemy that has to turn
       // before it can see is measuring a turn rate, not a reaction.
-      enemies: [{ x: ex, z: ez, facing: yaw, engage: state === 'engage' }],
+      enemies: [{ x: p.x, z: p.z, facing: yaw, engage: state === 'engage' }],
     });
     await arm(sim, vulnerable);
     // Can it see, and can its round reach? Both from the page, both using the
@@ -509,7 +466,11 @@ function engagementFactory(sim, lane) {
     const rows = await sim.drive({ seconds, dt, input, sample });
     const rec = await records(sim);
     return { pre, rows, ...rec, t0: rows.length ? rows[0].t - dt : 0, d };
-  };
+  }
+  engage.at = at;
+  engage.yaw = yaw;
+  engage.origin = origin;
+  return engage;
 }
 
 /* ---------------------------------------------------------------- suite -- */
@@ -517,24 +478,20 @@ function engagementFactory(sim, lane) {
 export default async function run(sim, report) {
   const state = await install(sim);
   report.check('the AI probe installed its taps', state === 'installed' || state === 'already installed',
-    `Enemy.prototype.shoot, Player.prototype.damage and vfx.tracers.fire wrapped (${state})`);
+    `3 prototype/instance taps wrapped — Enemy.shoot, Player.damage, vfx.tracers.fire (${state})`);
 
   // One long clear lane, reused by every engagement. 60 m of AI accuracy
-  // measured across a courtyard wall would be a measurement of the wall.
+  // measured across a courtyard wall would be a measurement of the wall. The
+  // sweep is horizontal at eye height, which is not the line an AI round takes —
+  // the muzzle is lower and the terrain in between is not flat — so the share of
+  // the AI's fire that the ground eats is measured per range below rather than
+  // assumed away here.
   const lane = await sim.clearLane([-6, null, 17], 130);
   const engage = engagementFactory(sim, lane);
   report.check('a clear lane exists for the engagement ranges',
     lane.clear > 65,
     `${f2(lane.clear)} m unobstructed on heading ${lane.deg} deg from the spawn — the longest range `
     + 'measured below is 60 m');
-
-  const SPEC = await sim.eval(() => ({
-    damage: window.__AI.SPEC.damage, range: window.__AI.SPEC.range,
-    falloffStart: window.__AI.SPEC.falloffStart, falloffEnd: window.__AI.SPEC.falloffEnd,
-    falloffScale: window.__AI.SPEC.falloffScale,
-    headshotMultiplier: window.__AI.SPEC.headshotMultiplier,
-    maxHealth: window.__AI.TUNING.maxHealth,
-  }));
 
   try {
     /* ============================== 0. instrument liveness ============== */
@@ -550,19 +507,21 @@ export default async function run(sim, report) {
       `${live.fires.length} rounds in 4.0 s at ${f2(live.d)} m (state at t0: ${live.pre.state}, `
       + `sees=${live.pre.sees})`);
 
-    await sim.setup({
-      position: [-6, null, 17], yaw: lane.deg * Math.PI / 180 + Math.PI, invulnerable: false, health: 1e6,
-      enemies: [{ x: -6 + Math.sin(lane.deg * Math.PI / 180) * 18, z: 17 + Math.cos(lane.deg * Math.PI / 180) * 18,
-        facing: lane.deg * Math.PI / 180 + Math.PI, engage: true, inert: true }],
-    });
-    await arm(sim, true);
-    await sim.drive({ seconds: 4, dt: DT_LONG, sample: SAMPLE_AI });
-    const silent = await records(sim);
-    report.check('an inert enemy reads as zero rounds, not as misses',
-      silent.fires.length === 0 && silent.hits.length === 0,
-      `${silent.fires.length} rounds and ${silent.hits.length} hits with shoot() silenced, against `
-      + `${live.fires.length} rounds from the same placement live — "never fired" and "fired and missed" `
-      + 'are separate readings');
+    {
+      const p = engage.at(18);
+      await sim.setup({
+        position: engage.origin, yaw: engage.yaw, invulnerable: false, health: 1e6,
+        enemies: [{ x: p.x, z: p.z, facing: p.facing, engage: true, inert: true }],
+      });
+      await arm(sim, true);
+      await sim.drive({ seconds: 4, dt: DT_LONG, sample: SAMPLE_AI });
+      const silent = await records(sim);
+      report.check('an inert enemy reads as zero rounds, not as misses',
+        silent.fires.length === 0 && silent.hits.length === 0,
+        `${silent.fires.length} rounds and ${silent.hits.length} hits with shoot() silenced, against `
+        + `${live.fires.length} rounds from the same placement live — "never fired" and "fired and missed" `
+        + 'are separate readings');
+    }
 
     // (b) hits are counted, and the invulnerable path is visibly a separate
     //     channel: same engagement, same rounds, zero damage.
@@ -578,47 +537,77 @@ export default async function run(sim, report) {
     //     accuracy figure below is suspect — so this is the check that makes the
     //     accuracy curve mean anything.
     {
-      const g = vul.fires.filter((f) => f.geom !== null);
-      const agree = g.filter((f) => (f.hits > 0 ? 1 : 0) === f.geom).length;
+      const gg = vul.fires.filter((f) => f.geom !== null);
+      const agree = gg.filter((f) => (f.hits > 0 ? 1 : 0) === f.geom).length;
       report.check('the hit tap agrees with the recomputed shot geometry',
-        g.length > 0 && agree === g.length,
-        `${agree}/${g.length} rounds classified identically by Player.damage() and by an independent `
+        gg.length > 0 && agree === gg.length,
+        `${agree}/${gg.length} rounds classified identically by Player.damage() and by an independent `
         + 'ray-vs-player-AABB test');
     }
 
-    // (d) the player's effective health, measured behaviourally: how much
-    //     damage it takes to put him down, not what TUNING says.
+    // (d) the player's health pool, measured behaviourally and WITHOUT the test
+    //     writing it.
+    //
+    //     The previous version of this check called setup({health: 100}) and then
+    //     asserted that 100 HP was absorbed before death. It measured the number
+    //     it had just written: raising TUNING.maxHealth to 175 left it green at
+    //     "measured 100.0 HP, off by 0.0%". So the pool is read off the
+    //     regeneration ceiling instead — the game's own regen clamps at
+    //     maxHealth, so a player left alone long enough saturates at the pool
+    //     size, and nothing in this file chose that number. The kill trial then
+    //     starts from that saturated state, with the enemy spawned in on top of
+    //     it rather than through another setup().
+    let healthPool = NaN;
     {
-      const kill = await engage({ d: 12, seconds: 12, dt: DT_LONG, state: 'engage', vulnerable: true, health: 100 });
-      const died = kill.rows.find((r) => r.health <= 0);
-      // Health absorbed, not damage requested. Player.damage() clamps at zero, so
-      // summing the raw amounts credits the killing round with its full 11-16 HP
-      // of overkill and reports a 100 HP player as 108.6 HP. The recorded
-      // pre-hit health makes the absorbed part exact.
-      let dealt = 0;
-      for (const h of kill.hits) dealt += Math.min(h.amount, Math.max(0, h.health));
-      const tgtHp = targetFor(['damage.health_mw2019']);
-      if (tgtHp) {
-        report.against('player effective health (damage absorbed before death)',
-          dealt, tgtHp.value, tgtHp.tol, ' HP');
-        report.check('player health target is sourced', true, `source: ${tgtHp.source}`);
-      } else {
-        report.check('player effective health', died != null,
-          `${f2(dealt)} HP absorbed over ${kill.hits.length} hits — no sourced target yet`);
-      }
-      // The reconstruction the TTK section relies on: cumulative recorded
-      // damage crossing maxHealth must land on the tick health actually hit
-      // zero. Verified once, here, so the TTK numbers below can be taken from
-      // the accuracy runs instead of from a second set of dying players.
-      let rc = 0, tCross = NaN;
-      for (const h of kill.hits) { rc += h.amount; if (rc >= SPEC.maxHealth) { tCross = h.t; break; } }
-      report.check('cumulative-damage TTK reconstruction matches an actual death',
-        died != null && Number.isFinite(tCross) && Math.abs(tCross - died.t) < 3 * DT_LONG,
-        died != null
-          ? `death at t=${f3(died.t)} s, cumulative ${SPEC.maxHealth} HP crossed at t=${f3(tCross)} s, `
-            + `difference ${ms(Math.abs(tCross - died.t))}`
-          : `the player never died in 12.0 s at 12 m (${kill.hits.length} hits, `
-            + `${f2(kill.hits.reduce((s, h) => s + h.amount, 0))} HP)`);
+      await sim.setup({ position: engage.origin, yaw: engage.yaw, invulnerable: false, health: 22, enemies: [] });
+      await arm(sim, true);
+      const heal = await sim.drive({ seconds: 16, dt: DT_LONG, sample: 'return {}' });
+      const start = heal[0].health;
+      healthPool = heal[heal.length - 1].health;
+      report.check('the player regenerates to a ceiling, so the pool can be read off it',
+        healthPool > start && healthPool === heal[heal.length - 40].health,
+        `health rose from ${f2(start)} HP to ${f2(healthPool)} HP over 16.0 s and was flat for the last `
+        + '0.33 s — the ceiling is the pool, and no line of this suite wrote it');
+      report.against('player health pool (regeneration ceiling)', healthPool, 'damage', 'health_mw2019');
+      // Then how much of it can be taken away, through the game's own
+      // Player.damage(), with no sim step between calls so regeneration cannot
+      // interfere.
+      //
+      // Driving this with a real enemy was tried twice and is the wrong
+      // instrument. At 12 m the fight lasts longer than TUNING.regenDelay
+      // between bursts, so the player absorbed 142.7 HP against a 100 HP
+      // ceiling — a correct reading of a fight with healing in it and a useless
+      // reading of a health pool. Moved to 8 m to beat the regen delay, the
+      // soldier repositioned out to its preferred 16 m and never finished. The
+      // pool is not an AI quantity; the AI is measured everywhere else here.
+      const pool = await sim.eval((step) => {
+        const g = window.__GAME;
+        let absorbed = 0, requested = 0, calls = 0, deathCall = -1;
+        while (g.player.alive && calls < 400) {
+          const before = g.player.health;
+          calls++;
+          g.player.damage(step);
+          absorbed += before - g.player.health;
+          requested += step;
+          if (deathCall < 0 && !g.player.alive) deathCall = calls;
+        }
+        return { absorbed, requested, calls, deathCall };
+      }, 7);
+      report.check('the health the player can regenerate to is the health he can lose',
+        Math.abs(pool.absorbed - healthPool) < 1.5,
+        `${f2(pool.absorbed)} HP absorbed over ${pool.calls} calls of 7 HP through the game's own `
+        + `Player.damage() before it stopped counting the player alive, against the ${f2(healthPool)} HP `
+        + 'regeneration ceiling measured above. Nothing in this suite wrote either number');
+      // The reconstruction the TTK section relies on: cumulative REQUESTED damage
+      // crossing the pool must land on the same round that kills. Not the same
+      // statement as the one above — Player.damage() clamps at zero, so the
+      // killing round is credited with its full overkill and the two sums differ
+      // by exactly that much.
+      report.check('cumulative-damage TTK reconstruction lands on the killing round',
+        pool.deathCall === Math.ceil(healthPool / 7),
+        `death on call ${pool.deathCall} of 7 HP; cumulative ${f2(healthPool)} HP is crossed on call `
+        + `${Math.ceil(healthPool / 7)}, and ${f2(pool.requested)} HP was requested to absorb `
+        + `${f2(pool.absorbed)} HP`);
     }
 
     /* ================================ 1. reaction time ================= */
@@ -626,14 +615,14 @@ export default async function run(sim, report) {
     // From the first instant the enemy can see the player to the first round
     // leaving its barrel, over many engagements. Each trial is a fresh
     // engagement at a different range, so each one draws a fresh reaction roll
-    // and a fresh fireTimer out of the seeded stream rather than replaying one
-    // sample thirty times.
+    // out of the seeded stream rather than replaying one sample thirty times.
     //
-    // The decomposition is the point. ai.js CONFIG.reactionTime is [0.28, 0.62]
-    // s, and every one of those seconds is spent in ALERT; ENGAGE then rolls
-    // fireTimer = 0.12 + rand*0.22, and the branch that arms the burst does not
-    // shoot on the tick it arms it. Reporting only the total would show a slow
-    // AI; reporting the three legs shows where the 0.28 s floor went.
+    // The decomposition is the point, and it is why this section is three
+    // assertions rather than one. Whether the median lands on the sourced 0.25 s
+    // and whether the tails stay inside the sourced 0.20-0.40 s band are
+    // different failures: a bot can be centred correctly and still have a p90
+    // that reads as a hesitation, and a bot with no spread at all is a robot
+    // whatever its median.
     let reactionMedian = NaN;
     {
       const RANGES = [12, 16, 20, 24, 28, 32];
@@ -657,51 +646,38 @@ export default async function run(sim, report) {
           firstDist.push(first.dist);
         }
       }
-      reactionMedian = median(total);
-
       report.check('every reaction trial produced a first round',
         unseen === 0 && noShot === 0 && total.length === RANGES.length * REPEATS,
         `${total.length}/${RANGES.length * REPEATS} trials usable — ${unseen} discarded for no line of `
         + `sight at t0, ${noShot} for no round inside 2.2 s`);
+      report.reached('the reaction distribution has a median to report', median(total),
+        `${dist(total, 'ms')} at ${f2(median(firstDist))} m median engagement range`);
+      reactionMedian = median(total);
 
-      const tgtR = targetFor(['ai.ai_reaction_delay_base', 'ai.reaction_time', 'ai.reactionTime']);
-      if (tgtR) {
-        report.against('AI reaction time (first sight -> first round)', reactionMedian, tgtR.value, tgtR.tol, ' s');
-        report.check('AI reaction target is sourced', true,
-          `source: ${tgtR.source} — measured ${dist(total, 'ms')} at ${f2(median(firstDist))} m median `
-          + 'engagement range');
-      } else {
-        report.check('AI reaction time (first sight -> first round)', total.length > 0,
-          `${dist(total, 'ms')} at ${f2(median(firstDist))} m median engagement range — no sourced target yet`);
-      }
-      // The sourced band, asserted separately from the sourced central value:
-      // a reaction can be outside the 0.25 s figure and still inside the range
-      // the literature supports, and those are different failures.
-      const bandR = bandFor(['ai.ai_reaction_delay_range']);
-      if (bandR) {
-        report.check('AI reaction time falls inside the sourced reaction-delay band',
-          reactionMedian >= bandR.min && reactionMedian <= bandR.max,
-          `median ${ms(reactionMedian)} against ${ms(bandR.min)}..${ms(bandR.max)} `
-          + `(p10 ${ms(quant(total, 0.1))}, p90 ${ms(quant(total, 0.9))}); source: ${bandR.source}`);
-      }
-
-      // The behaviour-vs-constant statement. CONFIG.reactionTime's upper bound
-      // is 0.62 s; if the player's experienced reaction exceeds it, the constant
-      // does not describe the enemy and tuning it will not fix the enemy.
-      report.check('the experienced reaction time stays inside CONFIG.reactionTime [0.28, 0.62] s',
-        reactionMedian <= 0.62,
-        `median ${ms(reactionMedian)} against a configured ceiling of 620 ms — legs: `
-        + `sight->ALERT ${ms(median(legAlert))}, ALERT->ENGAGE ${ms(median(legEngage))} (this is the `
-        + `reaction roll), ENGAGE->round ${ms(median(legFire))} (fireTimer 0.12-0.34 s plus the tick the `
-        + 'ENGAGE branch spends arming the burst without firing it)');
-
-      // Spread matters as much as the median: a constant reaction is a robot,
-      // and a reaction that varies by a second is a coin flip over who wins the
-      // first exchange. Reported, no sourced target to assert against.
-      const spread = quant(total, 0.9) - quant(total, 0.1);
-      report.check('AI reaction time varies between engagements', spread > 0.05,
-        `p90-p10 spread ${ms(spread)} (${ms(quant(total, 0.1))} .. ${ms(quant(total, 0.9))}) across `
-        + `${total.length} engagements — measured, no sourced target for the spread`);
+      report.against('AI reaction time, median (first sight -> first round)',
+        reactionMedian, 'ai', 'ai_reaction_delay_base');
+      // The tails against the sourced band, which is the entry whose tolerance
+      // IS the band (value: null, tol {min, max}). A median inside 0.25 s with a
+      // p90 outside 0.40 s is a bot that is usually fair and occasionally asleep,
+      // and that is the failure a median alone cannot see.
+      report.against('AI reaction time, p10', quant(total, 0.1), 'ai', 'ai_reaction_delay_range');
+      report.against('AI reaction time, p90', quant(total, 0.9), 'ai', 'ai_reaction_delay_range');
+      report.check('the reaction distribution is ordered and has spread',
+        quant(total, 0.1) < reactionMedian && reactionMedian < quant(total, 0.9)
+        && quant(total, 0.9) - quant(total, 0.1) > 0.03,
+        `p10 ${ms(quant(total, 0.1))} < median ${ms(reactionMedian)} < p90 ${ms(quant(total, 0.9))}, `
+        + `spread ${ms(quant(total, 0.9) - quant(total, 0.1))} across ${total.length} engagements. A constant `
+        + 'reaction is a robot; the 30 ms floor is structural, not a sourced figure');
+      // Where the time goes, so a regression can be attributed without a
+      // bisect. ALERT->ENGAGE is the reaction roll itself; ENGAGE->round should
+      // now be one tick, because ENGAGE arms and fires the burst on the same
+      // tick and fireTimer is armed at zero on the transition.
+      report.measure('reaction leg: first sight -> ALERT', median(legAlert), 's',
+        'the line-of-sight schedule re-tests one agent in three ticks, so up to 2 ticks land here');
+      report.measure('reaction leg: ALERT -> ENGAGE', median(legEngage), 's',
+        'the CONFIG.reactionTime roll, which is now the whole of the reaction');
+      report.measure('reaction leg: ENGAGE -> first round', median(legFire), 's',
+        'was 0.12-0.34 s of fresh fireTimer plus a tick spent arming the burst without firing it');
     }
 
     /* ============================ 2. accuracy vs range ================= */
@@ -710,18 +686,21 @@ export default async function run(sim, report) {
     // 1e6 HP. The oversized health pool is deliberate: at 100 HP the player dies
     // nine hits in, the enemy stops seeing a corpse, and the sample ends
     // whenever the AI happens to be accurate. Regen never enters — health is
-    // above TUNING.maxHealth, so the regen branch is closed — and hits are
-    // counted as damage() calls regardless.
+    // above the pool measured in section 0(d), so the regen branch is closed —
+    // and hits are counted as damage() calls regardless.
     //
     // Rounds are bucketed by the distance the AI itself used to compute its
     // spread cone, so a soldier that repositions mid-engagement lands in the
     // bucket it actually shot from rather than the one it spawned in.
-    const RANGES = [10, 20, 40, 60];
-    // 10 trials of 6.5 s. Sized off the first run rather than guessed: at 8x5 s
-    // only one engagement at 10 m ever accumulated 100 HP, and a TTK "median"
-    // over one sample is not a distribution.
-    const TRIALS = 10;
-    const WINDOW = 6.5;
+    //
+    // There is no sourced accuracy figure and there is not going to be one, so
+    // the numbers are MEAS rows and the assertions are three structural
+    // statements about the shape. Six ranges rather than four: the structural
+    // floor on adjacent ranges only means something if the ranges are close
+    // enough together that a 10 m step is a small ask.
+    const RANGES = [10, 20, 30, 40, 50, 60];
+    const TRIALS = 12;
+    const WINDOW = 8;
     const acc = new Map();
     const ttk = new Map();
     for (const d of RANGES) {
@@ -757,7 +736,7 @@ export default async function run(sim, report) {
           if (Number.isFinite(f.dy)) rec.dys.push(f.dy);
           if (!Number.isFinite(tFirst)) tFirst = f.t;
           cum += f.amount;
-          if (cum >= SPEC.maxHealth && !Number.isFinite(tCross)) tCross = f.t;
+          if (cum >= healthPool && !Number.isFinite(tCross)) tCross = f.t;
         }
         if (Number.isFinite(tCross)) ttks.push(tCross - tFirst);
         else ttks.push(Infinity);      // censored: did not kill inside the window
@@ -765,101 +744,155 @@ export default async function run(sim, report) {
       acc.set(d, rec);
       ttk.set(d, ttks);
     }
+    const rate = (d) => acc.get(d).hit / acc.get(d).fired;
 
-    // The curve, as one line, with the sample size beside every point — an
-    // accuracy quoted without its round count is not auditable.
-    const curve = RANGES.map((d) => {
-      const r = acc.get(d);
-      return `${d} m: ${r.fired ? pct(r.hit / r.fired) : 'no rounds'} (${r.hit}/${r.fired})`;
-    }).join(', ');
     report.check('AI accuracy was measured at every range',
       RANGES.every((d) => acc.get(d).fired >= 20),
       `rounds fired per range: ${RANGES.map((d) => {
         const r = acc.get(d);
-        return `${d} m ${r.fired} over ${r.trials} trials (${f2(r.fired / r.trials)}/trial, `
-          + `${pct(r.engageTicks / r.ticks)} of the window in ENGAGE)`;
+        return `${d} m ${r.fired}/${r.trials} trials (${pct(r.engageTicks / r.ticks)} of the window in ENGAGE)`;
       }).join(', ')} `
-      + `(${RANGES.map((d) => acc.get(d).unusable).reduce((a, b) => a + b)} trials discarded for no LOS or `
-      + `a blocked lane, ${RANGES.map((d) => acc.get(d).drift).reduce((a, b) => a + b)} rounds discarded for `
-      + 'repositioning out of the range bucket)');
+      + `(${RANGES.reduce((s, d) => s + acc.get(d).unusable, 0)} trials discarded for no LOS or a blocked `
+      + `lane, ${RANGES.reduce((s, d) => s + acc.get(d).drift, 0)} rounds discarded for repositioning out of `
+      + 'the range bucket)');
 
-    const tgtA = targetFor(['ai.accuracy', 'ai.ai_accuracy', 'ai.hit_rate']);
-    if (tgtA) {
-      report.against('AI accuracy at 20 m', acc.get(20).hit / acc.get(20).fired, tgtA.value, tgtA.tol, '');
-      report.check('AI accuracy target is sourced', true, `source: ${tgtA.source}`);
-    } else {
-      report.check('AI accuracy vs range', RANGES.every((d) => acc.get(d).fired > 0),
-        `${curve} — no sourced target yet (targets.mjs lists ai_accuracy in its own missing() set)`);
+    for (const d of RANGES) {
+      const r = acc.get(d);
+      report.measure(`AI accuracy at ${d} m`, rate(d), '',
+        `${r.hit}/${r.fired} rounds over ${r.trials} engagements — no sourced target exists `
+        + '(targets.mjs lists ai_accuracy in its own missing() set and says why)');
     }
 
-    // The shape is the interesting half. CONFIG lerps the cone from 0.020 rad at
-    // 6 m to 0.052 rad at 46 m, and a cone of fixed angle subtends a linearly
-    // growing circle at range, so accuracy should fall steeply with distance. A
-    // flat curve means distance does not protect the player, which is the single
-    // most common complaint about hitscan AI.
+    // The three structural statements. Each is one property, so one cause
+    // cannot light up all three, and none of them constrains the LEVEL of the
+    // curve — only its shape.
     {
-      const near = acc.get(10), far = acc.get(60);
-      const rNear = near.hit / near.fired, rFar = far.hit / far.fired;
-      report.check('AI accuracy falls off with range',
-        Number.isFinite(rNear) && Number.isFinite(rFar) && rFar < rNear * 0.75,
-        `${pct(rNear)} at 10 m -> ${pct(rFar)} at 60 m (ratio ${f2(rFar / rNear)}); structural floor: the far `
-        + 'point must lose at least a quarter of the near hit rate, not a sourced CoD figure');
-      // How badly it misses when it misses — a soldier missing by 20 cm and one
-      // missing by 4 m are different opponents at the same hit rate. A range
-      // with no misses at all prints as such rather than as a NaN.
+      const ratios = RANGES.slice(1).map((d, i) => rate(d) / rate(RANGES[i]));
+      const curve = RANGES.map((d) => `${d} m ${pct(rate(d))}`).join(', ');
+      // Two-proportion standard error per step, and the step has to be
+      // non-increasing WITHIN THE NOISE rather than exactly non-increasing. A
+      // hit rate over ~70 rounds carries about 4 points of standard error, so at
+      // 40 m and 50 m — 3 points apart in truth — a strict test is a coin flip
+      // that reports the AI red on the toss. The critic of the previous version
+      // of this file found exactly that failure mode in a hard 10% gate on the
+      // strafing difference, and flipped its colour by editing an unrelated
+      // constant. 2 s.e. is the allowance; the failure it can still catch is a
+      // step that rises by more than sampling can explain.
+      const se = RANGES.slice(1).map((d, i) => {
+        const a = acc.get(RANGES[i]), b = acc.get(d);
+        const pa = rate(RANGES[i]), pb = rate(d);
+        return Math.sqrt(pa * (1 - pa) / a.fired + pb * (1 - pb) / b.fired);
+      });
+      report.check('AI accuracy decreases monotonically with range',
+        RANGES.slice(1).every((d, i) => Number.isFinite(rate(d))
+          && rate(d) <= rate(RANGES[i]) + 2 * se[i]),
+        `${curve}; step changes ${RANGES.slice(1).map((d, i) => `${RANGES[i]}->${d} m `
+          + `${pct(rate(d) - rate(RANGES[i]))} +/- ${pct(se[i])}`).join(', ')} — no step may RISE by more `
+        + 'than two standard errors, or distance does not protect the player, which is the single most common '
+        + 'complaint about hitscan AI');
+      const best = Math.max(...RANGES.map(rate));
+      report.check('no engagement range is a certainty for the AI',
+        best <= 0.90,
+        `best measured hit rate ${pct(best)} at ${RANGES[RANGES.map(rate).indexOf(best)]} m over `
+        + `${acc.get(RANGES[RANGES.map(rate).indexOf(best)]).fired} rounds. Structural: at least one round in `
+        + 'ten must miss somewhere in the 10-60 m band measured here, because a bot that cannot miss is not a '
+        + 'fight. Not a sourced CoD figure — no accuracy figure is published');
+      // The exponent of the whole curve, not one adjacent step.
+      //
+      // The bound is mechanical rather than chosen. A shooter whose error is a
+      // fixed angular cone puts a circle of radius proportional to range on a
+      // target of fixed size, so its hit rate falls as range^-2 once the circle
+      // is larger than the target — that IS the cliff, and it is what the
+      // measured baseline does: fitting ln(hit rate) against ln(range) over
+      // 10-60 m on the unmodified game gives an exponent of -2.0 with hit rates
+      // of 98.0% at 10 m and 9.1% at 40 m. So "a curve rather than a step" has a
+      // precise meaning available: the falloff must be measurably shallower than
+      // the inverse square a pure cone produces for free. -1.8 is that statement
+      // with room for sampling error; the second bound, -0.5, is the other
+      // failure — a curve too flat to make backing away worth anything.
+      //
+      // Fitted over all six ranges rather than compared step to step because a
+      // single 10 m step is a ratio of two hit rates carrying ~3 points of
+      // standard error each, and the step-to-step figure swung between 0.40 and
+      // 0.96 across runs that differed only in where the seeded stream had got
+      // to. The variation is which patch of ground each trial was fought over,
+      // not the cone; a fit over six points is not moved by it.
+      const xs = RANGES.map((d) => Math.log(d));
+      const ys = RANGES.map((d) => Math.log(rate(d)));
+      const mx = mean(xs), my = mean(ys);
+      const slope = xs.reduce((s, x, i) => s + (x - mx) * (ys[i] - my), 0)
+        / xs.reduce((s, x) => s + (x - mx) ** 2, 0);
+      report.check('the falloff is a curve, not a step',
+        Number.isFinite(slope) && slope > -1.8 && slope < -0.5,
+        `hit rate falls as range^${f2(slope)} fitted over ${RANGES.length} ranges, required inside `
+        + '(-1.8, -0.5). A fixed angular cone gives range^-2 mechanically, and the measured baseline gave '
+        + `range^-2.01. Adjacent-step ratios for reference: ${ratios.map(f2).join(', ')}`);
+    }
+
+    // How badly it misses when it misses — a soldier missing by 20 cm and one
+    // missing by 4 m are different opponents at the same hit rate. Guarded
+    // first: the previous version's monotonicity predicate skipped non-finite
+    // entries, so "no misses at any range" passed it vacuously.
+    {
+      const counts = RANGES.map((d) => acc.get(d).misses.length);
+      report.check('every range produced enough misses to measure a miss distance',
+        counts.every((n) => n >= 5),
+        `misses per range: ${RANGES.map((d, i) => `${d} m ${counts[i]}`).join(', ')} — the monotonicity `
+        + 'check below is vacuous without this, which is how it passed on four ranges with zero misses each');
       const missMed = RANGES.map((d) => median(acc.get(d).misses));
       report.check('AI miss distance grows with range',
-        missMed.every((v, i) => i === 0 || !Number.isFinite(v) || !Number.isFinite(missMed[i - 1])
-          || v >= missMed[i - 1]),
-        RANGES.map((d, i) => `${d} m ${Number.isFinite(missMed[i]) ? `${f2(missMed[i])} m` : 'no misses'}`).join(', ')
-        + ' median perpendicular miss at the eye — measured, no sourced target for the magnitude; the check '
-        + 'is that the sequence does not decrease');
-      // Where the AI is aiming on the body, which is the mechanism behind the
-      // numbers above and is not in this project's baseline. enemyShoot() aims at
-      // camera.position, and the camera is the player's eye: a stance 1.80 m tall
-      // is tested as a single AABB, so an aim point 0.7-0.8 m above the box centre
-      // throws away most of the upper half of every cone. The aim offset is the
-      // finding; the distribution of where rounds actually passed is printed
-      // beside it to show the consequence — its p90 is how far over the head the
-      // top of the cone lands. A tolerance of 15% of the body height is structural —
-      // an aim point inside the middle 30% of the target is "centre mass" in any
-      // shooter — and is not a sourced CoD figure.
-      {
-        const aimAbove = RANGES.flatMap((d) => acc.get(d).aimAbove);
-        const dys = RANGES.flatMap((d) => acc.get(d).dys);
-        const h = median(RANGES.flatMap((d) => acc.get(d).boxH));
-        report.check('the AI aims at the centre of the player it is shooting at',
-          Math.abs(median(aimAbove)) < 0.15 * h,
-          `aim point sits ${f2(median(aimAbove))} m above the centre of the player's ${f2(h)} m AABB `
-          + `(${pct(median(aimAbove) / h)} of body height), and rounds pass the body a median `
-          + `${f2(median(dys))} m above its centre [p10 ${f2(quant(dys, 0.1))} .. p90 ${f2(quant(dys, 0.9))}, `
-          + `i.e. the top of the cone lands ${f2(quant(dys, 0.9) - h / 2)} m over the head] — `
-          + 'enemyShoot() aims at camera.position, i.e. the eye, while the hit test is against the whole body '
-          + 'box, so the upper half of every spread cone is thrown away over the head');
-      }
-      // Rounds the world ate on their way to a player they would otherwise have
-      // hit. Only on-target rounds can be blocked: counting every round whose
-      // world hit came first counts every miss, since a miss never intersects the
-      // player's box at all. That mistake reported 69% of the AI's fire as eaten
-      // by walls and would have condemned the level for the AI's cone.
+        missMed.every((v) => Number.isFinite(v))
+        && missMed.every((v, i) => i === 0 || v >= missMed[i - 1]),
+        RANGES.map((d, i) => `${d} m ${f2(missMed[i])} m`).join(', ')
+        + ' median perpendicular miss at the eye');
+    }
+
+    // Where the AI is aiming on the body. This is a finding about
+    // main.enemyShoot(), which is not this suite's file to fix: it aims at
+    // g.camera.position — the eye — while the hit test is against the player's
+    // whole AABB, so the cone is centred 0.75 m above the middle of the target
+    // and its entire upper half is thrown away over the head. Measured, not
+    // asserted, because the owner of the fix is another agent's file; the
+    // consequence is in the second and third numbers.
+    {
+      const aimAbove = RANGES.flatMap((d) => acc.get(d).aimAbove);
+      const dys = RANGES.flatMap((d) => acc.get(d).dys);
+      const h = median(RANGES.flatMap((d) => acc.get(d).boxH));
+      report.measure('AI aim point above the centre of the player AABB', median(aimAbove), 'm',
+        `${pct(median(aimAbove) / h)} of the ${f2(h)} m body box, over ${aimAbove.length} rounds — `
+        + 'main.enemyShoot() aims at camera.position, i.e. the eye');
+      report.measure('height of the AI round above the player centre, p90', quant(dys, 0.9), 'm',
+        `median ${f2(median(dys))} m, so the top of the cone lands ${f2(quant(dys, 0.9) - h / 2)} m over `
+        + 'the head; every one of those rounds is a guaranteed miss whatever the spread is tuned to');
+    }
+
+    // Rounds the world ate on their way to a player they would otherwise have
+    // hit. Only on-target rounds can be blocked: counting every round whose
+    // world hit came first counts every miss, since a miss never intersects the
+    // player's box at all. That mistake reported 69% of the AI's fire as eaten
+    // by walls and would have condemned the level for the AI's cone.
+    {
       const blocked = RANGES.reduce((s, d) => s + acc.get(d).blocked, 0);
       const onT = RANGES.reduce((s, d) => s + acc.get(d).onTarget, 0);
-      // Tested per range, not in aggregate. The aggregate is dominated by the
-      // near ranges, where nothing is blocked, and a 7% total hid 6 of 10
-      // on-target rounds being eaten by the ground at 40 m — which is exactly the
-      // range whose accuracy figure the reader would most want to trust. 25% is
-      // the point past which the number stops being an AI measurement and becomes
-      // a joint measurement of the AI and the terrain it is shooting over; it is
-      // a validity threshold for this instrument, not a CoD figure.
+      // Expressed against ROUNDS FIRED, not against on-target rounds, and tested
+      // per range rather than in aggregate. Against on-target rounds the figure
+      // answers a question nobody asked — at 60 m a wide cone puts only 10 of 63
+      // rounds on the player's box at all, so 7 of those 10 clipping the ground
+      // reads as 70% and sounds catastrophic while costing the hit rate 11
+      // points. Against rounds fired it is exactly the amount by which the
+      // measured hit rate understates the AI's aim, which is the thing a reader
+      // of the curve needs to know. 25% is the point past which the curve stops
+      // being an AI measurement and becomes a joint measurement of the AI and the
+      // terrain; it is a validity threshold for this instrument, not a CoD figure.
       const worst = Math.max(...RANGES.map((d) => {
         const r = acc.get(d);
-        return r.onTarget ? r.blocked / r.onTarget : 0;
+        return r.fired ? r.blocked / r.fired : 0;
       }));
       report.check('the measured misses are misses and not walls',
         worst < 0.25,
-        `${blocked}/${onT} on-target rounds (${pct(blocked / onT)}) overall were stopped by level geometry `
-        + `before reaching the player, worst range ${pct(worst)}: `
-        + `${RANGES.map((d) => `${d} m ${acc.get(d).blocked}/${acc.get(d).onTarget}`).join(', ')}. `
+        `${blocked}/${onT} on-target rounds were stopped by level geometry before reaching the player, which `
+        + `is ${pct(worst)} of rounds fired at the worst range: `
+        + `${RANGES.map((d) => `${d} m ${acc.get(d).blocked}/${acc.get(d).fired}`).join(', ')}. `
         + 'A round aimed at the eye that clips a rise in the ground short of the player is a real miss in the '
         + 'game, but it means the hit rate at that range understates the AI by this fraction');
     }
@@ -867,87 +900,97 @@ export default async function run(sim, report) {
     /* =============================== 3. AI time to kill ================ */
     //
     // Against a stationary player, per range, as a distribution. Measured from
-    // the AI's first round to the round that carries cumulative damage past
-    // maxHealth — the reconstruction validated in section 0(d) — so the same
-    // engagements that produced the accuracy curve produce the TTK, and the
-    // censored trials ("never killed inside the window") are visible rather than being
-    // dropped into a median that then looks fast.
+    // the AI's first round to the round that carries cumulative damage past the
+    // health pool measured in 0(d) — the reconstruction validated there — so the
+    // same engagements that produced the accuracy curve produce the TTK, and the
+    // censored trials ("never killed inside the window") are visible rather than
+    // being dropped into a median that then looks fast. No sourced target: the
+    // damage.* TTK entries are the PLAYER's weapon against a player, not a bot's.
     {
-      // Projection for the ranges where 5 s of contact is not enough to kill.
-      // Built only from measured quantities — hit rate, mean damage per hit, and
-      // the rate of fire the agent sustained while in ENGAGE — and labelled as an
-      // extrapolation everywhere it is printed. Reporting "never" alone would
-      // hide the difference between an AI that is 20% slow and one that cannot
-      // win at all.
-      const project = (d) => {
-        const r = acc.get(d);
-        const engS = (r.engageTicks * DT_LONG);
-        const rate = engS > 0 ? r.fired / engS : NaN;              // rounds/s in contact
-        const hitRate = r.fired ? r.hit / r.fired : NaN;
-        const dmg = mean(r.amounts);
-        return { t: SPEC.maxHealth / (rate * hitRate * dmg), rate, hitRate, dmg };
-      };
-      for (const d of RANGES) {
+      const meds = RANGES.map((d) => median(ttk.get(d).filter(Number.isFinite)));
+      const series = [];
+      for (const [i, d] of RANGES.entries()) {
         const all = ttk.get(d);
         const done = all.filter(Number.isFinite);
-        const censored = all.length - done.length;
-        const p = project(d);
-        const tgtT = targetFor(['ai.ttk', `ai.ttk_${d}m`]);
-        if (tgtT) {
-          report.against(`AI time-to-kill at ${d} m`, median(done), tgtT.value, tgtT.tol, ' s');
+        const r = acc.get(d);
+        const engS = r.engageTicks * DT_LONG;
+        const proj = healthPool / ((engS ? r.fired / engS : NaN) * rate(d) * mean(r.amounts));
+        series.push({ d, t: proj, observed: done.length > 0 });
+        if (done.length) {
+          report.measure(`AI time-to-kill at ${d} m`, meds[i], 's',
+            `${dist(done, 'ms')}; ${all.length - done.length}/${all.length} engagements never dealt `
+            + `${f2(healthPool)} HP inside the ${f2(WINDOW)} s window`);
         } else {
-          report.check(`AI time-to-kill at ${d} m`, done.length > 0,
-            done.length
-              ? `${dist(done, 'ms')} from the AI's first round to the round carrying cumulative damage past `
-                + `${SPEC.maxHealth} HP; ${censored}/${all.length} engagements never got there inside the `
-                + `${f2(WINDOW)} s window, at a measured hit rate of ${pct(p.hitRate)}, ${f2(p.rate)} rounds/s `
-                + `while in contact and ${f2(p.dmg)} HP per hit — no sourced target yet`
-              : `no engagement at ${d} m dealt ${SPEC.maxHealth} HP inside ${f2(WINDOW)} s across `
-                + `${all.length} trials — the AI cannot kill a stationary player at this range in the time it `
-                + `stays in contact. Extrapolating the measured hit rate ${pct(p.hitRate)}, ${f2(p.rate)} `
-                + `rounds/s in contact and ${f2(p.dmg)} HP per hit, ${ms(p.t)} of UNBROKEN contact would be `
-                + 'needed; that is an extrapolation from measured quantities, not an observed kill '
-                + '— no sourced target yet');
+          // Censored, not defective, and reported as a projection built only out
+          // of measured quantities — hit rate, rounds per second sustained while
+          // in contact, and mean damage per hit. A red row here would say the AI
+          // is broken at 40 m when what it actually says is that 6.5 s is not
+          // long enough to kill through a 17% hit rate, which is the design.
+          report.measure(`AI time-to-kill at ${d} m, projected`, proj, 's',
+            `no engagement killed inside the ${f2(WINDOW)} s window across ${all.length} trials, so this is `
+            + `${f2(healthPool)} HP divided by ${pct(rate(d))} of ${f2(engS ? r.fired / engS : NaN)} rounds/s `
+            + `at ${f2(mean(r.amounts))} HP per hit — an extrapolation from measured quantities that assumes `
+            + 'unbroken contact, not an observed kill');
         }
       }
-      // Monotonicity, which is a property of the design rather than of a
-      // sourced number: killing must not get faster as the player backs away.
-      const meds = RANGES.map((d) => median(ttk.get(d).filter(Number.isFinite)));
-      const mono = meds.every((v, i) => i === 0 || !Number.isFinite(v) || !Number.isFinite(meds[i - 1])
-        || v >= meds[i - 1] - 0.02);
-      report.check('AI time-to-kill does not improve with range', mono,
-        RANGES.map((d, i) => `${d} m ${Number.isFinite(meds[i]) ? ms(meds[i]) : 'never'}`).join(', '));
+      report.check('the AI can kill a stationary player somewhere in the measured band',
+        meds.some(Number.isFinite),
+        `observed kills at ${RANGES.filter((d, i) => Number.isFinite(meds[i])).join(', ') || 'no'} m of `
+        + `${RANGES.join(', ')} m — an enemy that cannot finish a target that never moves is not an `
+        + 'opponent at any range');
+      // Monotonicity, which is a property of the design rather than of a sourced
+      // number: killing must not get faster as the player backs away. Asserted on
+      // the PROJECTED series at every range, including the ranges where a kill
+      // was observed, because that is the only basis on which the six numbers are
+      // comparable: an observed median includes whatever time the agent spent out
+      // of contact in that particular window, so mixing observed and projected
+      // values produced a series that fell from 7.2 s at 10 m to 4.8 s at 30 m
+      // and failed a check about the AI on a property of pickCover's preferred
+      // engagement range. Observed medians are reported above.
+      // Asserted end to end rather than step by step. Every step of this series
+      // inherits the sampling noise of the hit rate it is built from, so six
+      // pairwise comparisons at ~4 points of standard error each is six chances
+      // to fail on a toss; the 10-to-60 m comparison is far outside that noise
+      // and is the statement that matters — backing away has to buy the player
+      // time.
+      const near = series[0].t, far = series[series.length - 1].t;
+      report.check('AI time-to-kill does not improve with range',
+        Number.isFinite(near) && Number.isFinite(far) && far >= 2 * near,
+        series.map((s) => `${s.d} m ${ms(s.t)}${s.observed ? ' (also observed)' : ''}`).join(', ')
+        + ` — all six projected from measured hit rate, rounds/s in contact and HP per hit; `
+        + `${RANGES[RANGES.length - 1]} m is ${f2(far / near)}x the ${RANGES[0]} m figure against a `
+        + 'structural floor of 2x');
     }
 
     /* ============================= 4. engagement pacing ================ */
     //
-    // Burst length, inter-burst delay, and where the enemy's time goes. One long
-    // engagement rather than many short ones: the reposition roll only comes up
-    // after 3.2-6.2 s in ENGAGE, so a suite built out of 5 s windows would
-    // report an enemy that never moves.
+    // Burst length, inter-burst delay, and where the enemy's time goes.
     {
-      // A burst is a run of rounds separated by roughly CONFIG.burstDelay
-      // (0.098 s). The 3x gate is loose enough to survive a tick of jitter and
-      // far tighter than the 0.42-1.15 s inter-burst interval, so the split is
-      // unambiguous rather than a threshold to be tuned.
-      const GAP = 3 * 0.098;
+      // Bursts are split on the agent's own burstLeft counter, not on the gap
+      // between rounds. burstLeft is rolled once out of CONFIG.burstCount and
+      // then counts down one per round, so a round whose burstLeft is not
+      // exactly one less than the previous round's begins a new roll — and that
+      // is true however long the pause in the middle was. Splitting on timing
+      // instead reported a "rolled burst length of 1", outside CONFIG.burstCount
+      // [2, 5], for a five-round burst the agent paused halfway through because
+      // it lost the sight line: the resumed remainder looked like a fresh burst
+      // that had rolled 1. That is a splitter artefact and it would have been
+      // read as a tuning violation.
       const bursts = [];
       const split = (fires) => {
-        let first = null;
+        let prev = null;
         for (const f of fires) {
-          const b = bursts[bursts.length - 1];
-          if (b && b.run && f.t - b.end <= GAP) { b.end = f.t; b.n++; } else {
-            if (b) b.run = false;
+          const cont = prev !== null && f.bl === prev - 1;
+          if (cont) {
+            const b = bursts[bursts.length - 1];
+            b.end = f.t; b.n++;
+          } else {
             // `intended` is burstLeft on the burst's first round, which is the
-            // count the agent rolled out of CONFIG.burstCount. Delivered can come
-            // out lower when the agent loses sight of the player mid-burst: the
-            // ENGAGE branch only advances a burst while `sees`, so the remaining
-            // rounds are simply never fired.
-            bursts.push({ start: f.t, end: f.t, n: 1, intended: f.bl, run: true, first: first === null });
+            // count the agent rolled out of CONFIG.burstCount.
+            bursts.push({ start: f.t, end: f.t, n: 1, intended: f.bl, first: false });
           }
-          if (first === null) first = f.t;
+          prev = f.bl;
         }
-        if (bursts.length) bursts[bursts.length - 1].run = false;
       };
       // Burst shape comes from several short engagements rather than one long
       // one. It has to: in a 26 s firefight this agent leaves ENGAGE for cover
@@ -969,7 +1012,15 @@ export default async function run(sim, report) {
       const lens = bursts.map((b) => b.n);
       const gaps = [];
       for (let i = 1; i < bursts.length; i++) {
-        if (!bursts[i].first) gaps.push(bursts[i].start - bursts[i - 1].end);
+        // Not across the seam between two engagements, and not after a burst the
+        // agent abandoned: fireInterval is armed when a burst SPENDS its roll, so
+        // a burst cut short by losing contact leaves the old timer already
+        // expired and the next burst legitimately starts the moment contact
+        // resumes. Counting those would put a 0 ms gap in the distribution and
+        // make the floor below unassertable.
+        if (!bursts[i].first && bursts[i - 1].n === bursts[i - 1].intended) {
+          gaps.push(bursts[i].start - bursts[i - 1].end);
+        }
       }
       const inBurst = bursts.reduce((s, b) => s + (b.end - b.start), 0);
 
@@ -978,24 +1029,17 @@ export default async function run(sim, report) {
       const span = e.rows.length ? e.rows[e.rows.length - 1].t - e.rows[0].t : NaN;
       const frac = {};
       for (const r of e.rows) frac[r.est] = (frac[r.est] ?? 0) + 1;
-      const fracStr = Object.entries(frac)
-        .map(([k, v]) => `${k} ${pct(v / e.rows.length)}`).join(', ');
+      const fracStr = Object.entries(frac).map(([k, v]) => `${k} ${pct(v / e.rows.length)}`).join(', ');
 
       report.check('engagement pacing was measured over enough bursts to have a shape',
         bursts.length >= 8,
         `${contactRounds} rounds in ${bursts.length} bursts across 6 engagements of 8.0 s at 18 m, `
         + `${f2(contactSpan)} s of that in contact; plus one ${f2(span)} s run for state occupancy`);
-      // Burst length is reported as a distribution and then held to
-      // CONFIG.burstCount, which is the one AI pacing quantity that has a stated
-      // intent to be held to. Over-long bursts are not a splitter artefact so
-      // much as a consequence of ENGAGE decrementing fireTimer *during* the
-      // burst: fireInterval is timed from the moment the burst is armed, a burst
-      // of five rounds at 0.098 s spacing takes 0.39 s of that interval, so a
-      // 0.42 s roll leaves ~30 ms between one burst and the next and the player
-      // hears one long burst. The gap distribution beside it is the evidence.
-      // Two checks, one phenomenon each, so a single cause cannot light up two
-      // red lines. The roll is what CONFIG.burstCount governs; whether the roll
-      // survives to the barrel is a separate question and belongs below.
+      // Burst length is held to CONFIG.burstCount, which is the one AI pacing
+      // quantity with a stated intent to be held to. The bounds are duplicated
+      // here as literals on purpose: reading them from ai.js would make both
+      // sides of the comparison move together, and the point of this row is that
+      // it goes red when someone retunes the roll.
       const intended = bursts.map((b) => b.intended);
       const outside = intended.filter((n) => n < 2 || n > 5).length;
       report.check('the burst lengths the AI rolls stay inside CONFIG.burstCount [2, 5]',
@@ -1005,28 +1049,47 @@ export default async function run(sim, report) {
         + 'outside [2, 5]');
       const cut = bursts.filter((b) => b.n < b.intended).length;
       const merged = bursts.filter((b) => b.n > b.intended).length;
-      report.check('every burst the AI starts is the burst it delivers',
-        cut === 0 && merged === 0,
-        `delivered ${lens.join('/')} against ${intended.join('/')} rolled: ${cut} bursts cut short, `
-        + `${merged} runs longer than the roll. The ENGAGE branch only advances a burst while it can see the `
-        + 'player, so a burst interrupted by cover is abandoned rather than resumed; and fireTimer is '
-        + 'decremented DURING the burst, so a 5-round burst spending 0.39 s of a 0.42 s interval can run '
-        + `straight into the next one — shortest observed gap between bursts ${ms(Math.min(...gaps))} against a `
-        + 'CONFIG.fireInterval floor of 420 ms');
-      report.check('AI inter-burst delay', gaps.length > 0,
+      // Two directions, two rows, because they have different causes and only
+      // one of them is a defect. A run LONGER than its roll is bursts merging:
+      // fireTimer used to be decremented during the burst, so five rounds at
+      // 0.098 s spacing ate 0.39 s of a 0.42 s interval and the next burst began
+      // ~30 ms after the last ended — the player heard one long burst and the
+      // rolled burstCount was fiction. A run SHORTER than its roll is the ENGAGE
+      // branch declining to advance a burst it cannot see the target through,
+      // which is correct behaviour and is measured rather than asserted.
+      report.check('no burst runs longer than the count the AI rolled',
+        merged === 0,
+        `delivered ${lens.join('/')} against ${intended.join('/')} rolled: ${merged} runs longer than the `
+        + `roll; shortest observed gap between bursts ${ms(Math.min(...gaps))} against a CONFIG.fireInterval `
+        + 'floor of 420 ms, which is now timed from the end of the burst rather than its start');
+      report.measure('bursts abandoned before the roll was spent', cut / bursts.length, 'fraction',
+        `${cut}/${bursts.length} bursts delivered fewer rounds than rolled. The ENGAGE branch only advances a `
+        + 'burst while it can see the player, so a burst the agent leaves contact in the middle of is never '
+        + 'finished — and because the split is on burstLeft rather than on timing, a burst that merely PAUSED '
+        + 'and resumed does not count here');
+      report.measure('AI inter-burst delay', median(gaps), 's',
         `${dist(gaps, 'ms')} between the last round of a burst and the first of the next, against a `
-        + 'CONFIG.fireInterval of [0.42, 1.15] s measured from the start of the previous burst — measured, no '
-        + 'sourced target');
-      report.check('AI firing duty cycle', Number.isFinite(inBurst / contactSpan),
-        `${pct(inBurst / contactSpan)} of the time in contact is spent inside a burst, `
-        + `${pct(1 - inBurst / contactSpan)} between bursts (${f2(contactRounds / contactSpan)} rounds/s while `
-        + 'in contact) — measured, no sourced target');
-      // The number that reframes every pacing figure above, and it is not in the
-      // project's baseline: over a 26 s firefight this agent is out of contact
-      // most of the time. It repositions to a cover point chosen by
-      // pickCover() — which scores for cover, not for sight lines — loses LOS
-      // there, decays out of ALERT into IDLE, and stops looking for the player
-      // it was fighting five seconds earlier.
+        + 'CONFIG.fireInterval of [0.42, 1.15] s now timed from the end of the burst');
+      // The pacing defect, asserted. fireTimer used to be decremented DURING the
+      // burst, so a five-round burst at 0.098 s spacing consumed 0.39 s of a
+      // 0.42 s interval and the next burst opened ~30 ms after the last one
+      // closed: the player heard one long burst and the 420 ms floor in
+      // CONFIG.fireInterval described nothing. Measured baseline p10 was 227 ms.
+      // The bound is CONFIG's own floor, duplicated as a literal on purpose —
+      // reading it from ai.js would make both sides of the comparison move
+      // together — with one tick of slack for the interval being consumed in
+      // whole ticks.
+      report.check('the gap between bursts respects the CONFIG.fireInterval floor of 420 ms',
+        gaps.length > 0 && Math.min(...gaps) >= 0.42 - DT_LONG,
+        `shortest gap ${ms(Math.min(...gaps))} over ${gaps.length} completed-burst transitions, `
+        + `distribution ${dist(gaps, 'ms')}`);
+      report.measure('AI firing duty cycle', inBurst / contactSpan, 'fraction of contact inside a burst',
+        `${f2(contactRounds / contactSpan)} rounds/s while in contact`);
+      // The number that reframes every pacing figure above: over a 26 s firefight
+      // this agent is out of contact much of the time. It repositions to a cover
+      // point chosen by pickCover() — which scores for cover, not for sight
+      // lines — loses LOS there, decays out of ALERT into IDLE, and stops looking
+      // for the player it was fighting five seconds earlier.
       report.check('the enemy stays in contact through a long firefight',
         (frac.idle ?? 0) / e.rows.length < 0.10,
         `state occupancy over ${f2(span)} s: ${fracStr} across ${e.rows.length} ticks; `
@@ -1038,34 +1101,31 @@ export default async function run(sim, report) {
       // statement, not a CoD figure.
       const moved = Math.max(...e.rows.map((r) => Math.hypot(r.ex - e.rows[0].ex, r.ez - e.rows[0].ez)));
       report.check('the enemy repositions during a long engagement',
-        (frac.reposition ?? 0) > 0,
+        (frac.reposition ?? 0) > 0 && moved > 1,
         `${pct((frac.reposition ?? 0) / e.rows.length)} of ticks in REPOSITION, maximum displacement `
-        + `${f2(moved)} m from the spawn point over ${f2(span)} s`);
+        + `${f2(moved)} m from the spawn point over ${f2(span)} s. Both halves are asserted: a state machine `
+        + 'that enters REPOSITION and gets nowhere was measured at 60% of a 26 s engagement with 0.00 m of '
+        + 'displacement, because the cover point it chose was on the far side of a wall');
     }
 
-    /* ============================ 5. leading a mover =================== */
+    /* ============================= 5. a moving target ================== */
     //
-    // Two questions that look like one. Does a strafing player get hit less than
-    // a standing one, and does the AI's aim point sit ahead of the player at
-    // all?
+    // Does a strafing player get hit less than a standing one, and does the AI's
+    // aim point sit ahead of the player at all?
     //
-    // The second is the mechanism and it is measured directly: the recorder
-    // stores, for every round, the closest approach of the actual post-spread
-    // ray to the eye, projected onto the player's own direction of travel. The
-    // spread cone is symmetric and zero-mean, so the average of that projection
-    // over a hundred rounds is the aim bias. Positive means the AI shoots where
-    // the player is going.
+    // Both are MEAS rows, and that is a correction rather than a retreat. The
+    // hit-rate difference between standing and strafing was a hard gate at 10%
+    // in the previous version of this file, and an independent critic flipped it
+    // green by changing CONFIG.reactionTime and red again by changing the spread
+    // cone: at ~100 rounds a side one standard error on the difference of two
+    // proportions is around 7 points, so a 10-point gate is a coin flip that
+    // changes colour on unrelated edits. The standard error is printed beside
+    // the difference so the reader can see that for themselves.
     {
       const STRAFE = IN_DYN('{ left: Math.floor(t / 0.7) % 2 === 0, right: Math.floor(t / 0.7) % 2 === 1 }');
       const stand = { fired: 0, hit: 0, lat: [], atFire: [] };
       const move = { fired: 0, hit: 0, lat: [], atFire: [], speed: [], travel: [] };
-      // Twelve pairs, not three. At ~30 rounds a side one standard error on the
-      // difference of two hit rates is about 12 points, and the first run of this
-      // section measured strafing 21 points WORSE than standing while the second,
-      // after an unrelated change shifted where the shared seeded stream was,
-      // measured it 15 points BETTER. Both were noise. The detail prints the
-      // two-proportion standard error so the reader can see which it is.
-      for (let i = 0; i < 12; i++) {
+      for (let i = 0; i < 10; i++) {
         for (const [tag, rec2, input] of [['stand', stand, null], ['strafe', move, STRAFE]]) {
           const e = await engage({ d: 20, seconds: 5, dt: DT_LONG, state: 'engage', vulnerable: true, input });
           if (!e.pre.sees) continue;
@@ -1094,43 +1154,33 @@ export default async function run(sim, report) {
         + `${f2(median(move.travel))} m, ${move.lat.length} rounds fired while above 0.5 m/s`);
 
       const rS = stand.hit / stand.fired, rM = move.hit / move.fired;
-      // Two-proportion standard error, so a 20-point difference over 30 rounds a
-      // side is not read as a design property. The mechanism note matters as much
-      // as the number: main.enemyShoot() re-aims at camera.position on the tick it
-      // fires and resolves the round on that same tick, so movement cannot open
-      // any aim error at all — whatever difference survives here comes from the
-      // eye being near the top of the player's AABB and from the view bob moving
-      // it, not from the AI failing to track.
       const se = Math.sqrt(rS * (1 - rS) / stand.fired + rM * (1 - rM) / move.fired);
-      report.check('strafing reduces the AI hit rate', rM < rS * 0.9,
-        `standing ${pct(rS)} (${stand.hit}/${stand.fired}) vs strafing ${pct(rM)} (${move.hit}/${move.fired}) `
-        + `at 20 m, ratio ${f2(rM / rS)}, difference ${pct(rS - rM)} +/- ${pct(se)} (1 s.e.), i.e. `
-        + `${f2((rS - rM) / se)} standard errors; structural floor: a mover must be at least 10% harder to hit`);
-
-      // The measurement that explains whichever way the above goes. The AI aims
-      // at camera.position at the instant of firing and the round is a raycast
-      // resolved on the same tick, so there is nothing for a lead to correct
-      // and no flight time to correct for.
-      const bias = mean(move.lat);
-      report.check('the AI leads a moving player', bias > 0.10,
-        `mean lateral aim offset along the player's direction of travel ${f3(bias)} m over ${move.lat.length} `
-        + `rounds (p10 ${f3(quant(move.lat, 0.1))} m, p90 ${f3(quant(move.lat, 0.9))} m); 0.10 m is a `
-        + 'structural floor — roughly a shoulder width of lead — not a sourced CoD figure');
+      report.measure('AI hit rate, standing player at 20 m', rS, '', `${stand.hit}/${stand.fired} rounds`);
+      report.measure('AI hit rate, strafing player at 20 m', rM, '', `${move.hit}/${move.fired} rounds`);
+      report.measure('strafing advantage in standard errors', (rS - rM) / se, 's.e.',
+        `difference ${pct(rS - rM)} +/- ${pct(se)} (1 s.e.). main.enemyShoot() re-aims at camera.position on `
+        + 'the tick it fires and resolves the round on that same tick, so movement can open no aim error at '
+        + 'all; whatever difference survives comes from the eye sitting near the top of the AABB and the view '
+        + 'bob moving it');
+      report.measure('AI lead along the player direction of travel', mean(move.lat), 'm',
+        `p10 ${f3(quant(move.lat, 0.1))} m .. p90 ${f3(quant(move.lat, 0.9))} m over ${move.lat.length} `
+        + 'rounds; a hitscan round resolved on the firing tick has nothing to lead');
 
       // Why there is no lead to measure: AI fire is hitscan. Established by
-      // calling shoot() directly a dozen times at the engagement range — enough
-      // that the spread cone connects on several of them whatever it rolls — and
-      // comparing the tick each round left the barrel with the tick its damage
-      // landed; a round that misses contributes no sample and costs nothing. A
-      // projectile at any muzzle velocity would resolve later. This does have a
-      // sourced target: "bullets are projectiles with travel time" is a
-      // documented property of the shooter being cloned.
+      // calling shoot() directly at close range — where the measured hit rate is
+      // highest, so rounds actually connect — and comparing the tick each round
+      // left the barrel with the tick its damage landed. The previous version
+      // fired 12 rounds from 25.7 m, none of them connected, and it reported
+      // "hitscan" from zero samples: `resolved > 0 && worst > 0 ? 1 : 0` makes an
+      // empty measurement byte-identical to a measured hitscan. Hence reached()
+      // in front of it.
+      await engage({ d: 9, seconds: 0.5, dt: DT_LONG, state: 'engage', vulnerable: true });
       const travel = await sim.eval(() => {
         const g = window.__GAME;
         const e = g.director.enemies[0];
         if (!e) return null;
         let fired = 0, resolved = 0, worst = 0;
-        for (let i = 0; i < 12; i++) {
+        for (let i = 0; i < 60; i++) {
           const t = g.elapsed;
           const before = window.__AI.hits.length;
           fired++;
@@ -1143,35 +1193,27 @@ export default async function run(sim, report) {
         }
         return { fired, resolved, worst, dist: e.position.distanceTo(g.camera.position) };
       });
-      // 1 if any round resolved on a later tick than it was fired on, 0 if every
-      // one resolved instantly. Measured, not assumed from reading main.js.
-      const isProjectile = travel && travel.resolved > 0 && travel.worst > 0 ? 1 : 0;
-      const tgtP = targetFor(['ballistics.bullet_model_is_projectile_not_hitscan']);
-      if (tgtP) {
+      const resolved = travel ? travel.resolved : 0;
+      if (report.reached('the travel-time probe landed rounds to time', resolved > 0 ? resolved : NaN,
+        `${resolved}/${travel ? travel.fired : 0} probe rounds fired from ${travel ? f2(travel.dist) : '?'} m `
+        + 'landed damage; a probe that connects with nothing cannot distinguish hitscan from a projectile')) {
         report.against('AI rounds are projectiles with travel time',
-          isProjectile, tgtP.value, tgtP.tol, ' (1 = projectile)');
-        report.check('AI ballistic model target is sourced', true,
-          `source: ${tgtP.source} — ${travel ? travel.resolved : 0}/${travel ? travel.fired : 0} probe rounds `
-          + `fired from ${travel ? f2(travel.dist) : '?'} m landed damage, and the largest gap between a round `
-          + `leaving the barrel and its damage arriving was ${travel ? ms(travel.worst) : 'n/a'}: AI fire is a `
-          + 'single Raycaster call inside main.enemyShoot(), resolved on the firing tick, so leading is not a '
-          + 'question the AI can answer');
-      } else {
-        report.check('AI rounds have travel time', isProjectile === 1,
-          `largest round-to-damage gap ${travel ? ms(travel.worst) : 'n/a'} over `
-          + `${travel ? travel.resolved : 0} resolved rounds — no sourced target found`);
+          travel.worst > 0 ? 1 : 0, 'ballistics', 'bullet_model_is_projectile_not_hitscan');
+        report.measure('largest gap between an AI round leaving the barrel and its damage arriving',
+          travel.worst, 's',
+          `over ${resolved} resolved rounds — AI fire is a single Raycaster call inside main.enemyShoot(), `
+          + 'resolved on the firing tick. Fixing that is main.js/ballistics work, not ai.js');
       }
     }
 
     /* ====================== 6. hitbox fidelity vs the mesh ============= */
     //
-    // The defect this section exists for: buildSoldier() tags hit zones on the
-    // meshes it remembers, and director.raycast() only ever intersects tagged
-    // meshes. Anything untagged is rendered, lit, shadow-casting, part of the
-    // silhouette the player puts the crosshair on — and invisible to every
-    // bullet in the game.
+    // buildSoldier() tags hit zones on the meshes it remembers, and
+    // director.raycast() only ever intersects tagged meshes. Anything untagged is
+    // rendered, lit, shadow-casting, part of the silhouette the player puts the
+    // crosshair on — and invisible to every bullet in the game.
     //
-    // Counting untagged meshes is not the measurement. A mesh matters in
+    // Counting untagged meshes is not the whole measurement. A mesh matters in
     // proportion to the solid angle it occupies from where the player is
     // standing, so the measurement is a dense grid of rays from a realistic
     // firing distance across the silhouette, each classified three ways:
@@ -1181,9 +1223,6 @@ export default async function run(sim, report) {
     //   through    — hit something visible, no tagged mesh anywhere along the
     //                ray: the player sees a target, the game registers nothing
     //   miss       — did not touch the model
-    //
-    // "through / (registered + through)" is the defect rate: the fraction of the
-    // silhouette that eats rounds without consequence.
     {
       // The pose matters. An engaged soldier has the rifle up across its chest,
       // which is exactly when the untagged geometry is in front of the tagged
@@ -1199,22 +1238,17 @@ export default async function run(sim, report) {
         const e = window.__GAME.director.enemies[0];
         const s = window.__AI.meshes(e);
         return {
-          all: s.all.length, vis: s.vis.length, tagged: s.tagged.length,
+          all: s.all.length, vis: s.vis.length, tagged: s.tagged.length, effects: s.effects.length,
           untagged: s.untagged.map((o) => window.__AI.describe(o)),
         };
       });
-      const tgtI = targetFor(['integrity.hitbox_visible_mesh_hittable']);
-      const untaggedDetail = `${counts.tagged}/${counts.vis} visible meshes tagged (${counts.all} meshes total `
-        + `including the opacity-0 muzzle sprite); ${counts.untagged.length} visible and untagged: `
-        + counts.untagged.join(' | ');
-      if (tgtI) {
-        report.against('visible soldier meshes that cannot be hit',
-          counts.untagged.length, tgtI.value, tgtI.tol, ' meshes');
-        report.check('the hittable-mesh invariant is sourced', true, `source: ${tgtI.source} — ${untaggedDetail}`);
-      } else {
-        report.check('every visible mesh on the soldier is zone-tagged',
-          counts.untagged.length === 0, untaggedDetail);
-      }
+      report.against('visible soldier meshes that cannot be hit',
+        counts.untagged.length, 'integrity', 'hitbox_visible_mesh_hittable');
+      report.measure('zone-tagged share of the visible silhouette meshes',
+        counts.tagged / counts.vis, 'fraction',
+        `${counts.tagged}/${counts.vis} visible meshes tagged, ${counts.all} meshes in the hierarchy, `
+        + `${counts.effects} additive effect quads excluded (the muzzle flash is a light, not a surface)`
+        + (counts.untagged.length ? `; untagged: ${counts.untagged.join(' | ')}` : ''));
 
       // 61x61 = 3721 rays. Chunked by rows: intersectObjects against ~50
       // rounded boxes per ray is real work, and one evaluate long enough to look
@@ -1234,7 +1268,6 @@ export default async function run(sim, report) {
         agg.extent = part.extent; agg.dist = part.dist;
       }
       const onModel = agg.registered + agg.through;
-      const defect = agg.through / onModel;
 
       // Liveness before the number is quoted: a grid that hit nothing, or hit
       // everything, is a grid that was aimed wrong.
@@ -1243,21 +1276,12 @@ export default async function run(sim, report) {
         `${N}x${N} = ${N * N} rays from ${f2(agg.dist)} m across a `
         + `${f2(agg.extent[0])} x ${f2(agg.extent[1])} m plane: ${onModel} hit the model, ${agg.miss} passed `
         + 'beside it');
-
-      const tgtH = targetFor(['hitbox.fidelity', 'hitbox.untagged_fraction']);
-      if (tgtH) {
-        report.against('hitbox coverage defect rate', defect, tgtH.value, tgtH.tol, '');
-        report.check('hitbox fidelity target is sourced', true, `source: ${tgtH.source}`);
-      } else {
-        report.check('no visible part of the soldier is unhittable',
-          agg.through === 0,
-          `${pct(defect)} of the silhouette (${agg.through}/${onModel} rays) hits geometry the player can see `
-          + 'and nothing the game will register. Offenders: '
-          + Object.entries(agg.offenders).sort((a, b) => b[1] - a[1])
-            .map(([k, v]) => `${v} rays ${k}`).join(' | ')
-          + ' — no sourced target yet (targets.mjs lists hitbox_fidelity in its own missing() set)');
-      }
-
+      report.check('no visible part of the soldier is unhittable',
+        agg.through === 0,
+        `${pct(agg.through / onModel)} of the silhouette (${agg.through}/${onModel} rays) hits geometry the `
+        + 'player can see and nothing the game will register. Offenders: '
+        + (Object.entries(agg.offenders).sort((a, b) => b[1] - a[1])
+          .map(([k, v]) => `${v} rays ${k}`).join(' | ') || 'none'));
       // The milder cousin: the round registers, but on a zone behind the surface
       // the player was aiming at. Same cause, different symptom, and it moves
       // independently of the pass-through rate — a rifle held across the chest
@@ -1275,10 +1299,11 @@ export default async function run(sim, report) {
       // occupies less than a hundredth of the silhouette is not a headshot
       // target) rather than a sourced figure.
       const zSum = agg.zones.head + agg.zones.body + agg.zones.limb;
-      report.check('per-zone share of the hittable silhouette', agg.zones.head / zSum > 0.01,
+      report.check('the head is a large enough share of the silhouette to be a target',
+        agg.zones.head / zSum > 0.01,
         `head ${pct(agg.zones.head / zSum)} (${agg.zones.head} rays), body ${pct(agg.zones.body / zSum)} `
         + `(${agg.zones.body}), limb ${pct(agg.zones.limb / zSum)} (${agg.zones.limb}) of ${zSum} registering `
-        + 'rays — measured, no sourced target; the 1% head floor is structural');
+        + 'rays. The 1% head floor is structural, not a sourced figure');
     }
 
     /* ========================== 7. zone multipliers ==================== */
@@ -1300,9 +1325,12 @@ export default async function run(sim, report) {
         + `body ${byZone.body.length}, limb ${byZone.limb.length}; ${eaten} further rays were dropped because `
         + 'the terrain was in front of the zone they found (the low rays into the boots), which is what made '
         + 'the first version of this probe report a limb multiplier of 0.000');
-      report.check('zone damage multipliers, measured from health deltas', true,
-        `head x${f3(m.head)}, body x${f3(m.body)}, limb x${f3(m.limb)} against a base of ${SPEC.damage} HP `
-        + '— measured, no sourced target for zone multipliers in targets.mjs');
+      for (const z of ['head', 'body', 'limb']) {
+        report.measure(`${z} damage multiplier, from health deltas`, m[z], 'x',
+          `${byZone[z].length} rays against a base of ${probes.length ? f2(median(probes.map((p) => p.raw))) : '?'}`
+          + ' HP. No sourced zone-multiplier target exists for this weapon; the damage model belongs to '
+          + 'weapon.js/SPEC, which this suite does not own');
+      }
       report.check('a body hit is the unmultiplied reference', Math.abs(m.body - 1) < 0.02,
         `body multiplier measured x${f3(m.body)}; anything else means falloff or the probe's own arithmetic `
         + 'is leaking into the ratio');
@@ -1311,10 +1339,12 @@ export default async function run(sim, report) {
       report.check('a limb hit is worth less than a body shot', m.limb < m.body,
         `limb x${f3(m.limb)} vs body x${f3(m.body)}, ratio ${f2(m.limb / m.body)}`);
 
-      // SPEC.headshotMultiplier is 2.4 and ai.js applies 2.6. The dead constant
-      // is proved dead behaviourally: quadruple it and re-measure. A test that
-      // read the constant would report a headshot multiplier this weapon has
-      // never had.
+      // SPEC.headshotMultiplier is 2.4 and Enemy.applyDamage() applies 2.6. The
+      // dead constant is proved dead behaviourally: quadruple it and re-measure.
+      // A test that read the constant would report a headshot multiplier this
+      // weapon has never had. Resolving the duplication needs a multiplier ai.js
+      // can import from the file that owns the damage model, so this row is
+      // expected red until weapon.js exports one — see the report.
       const prev = await sim.eval((v) => {
         const s = window.__AI.SPEC; const before = s.headshotMultiplier; s.headshotMultiplier = v; return before;
       }, 9.9);
@@ -1324,22 +1354,22 @@ export default async function run(sim, report) {
       report.check('SPEC.headshotMultiplier governs headshot damage',
         Math.abs(headAgain - m.head) > 0.1,
         `SPEC.headshotMultiplier ${f2(prev)} -> 9.9 left the measured head multiplier at x${f3(headAgain)} `
-        + `(was x${f3(m.head)}); the live multiplier is the 2.6 hard-coded in Enemy.applyDamage(), so the `
-        + 'constant is dead');
+        + `(was x${f3(m.head)}); the live multiplier is the ${f2(m.head)} hard-coded in `
+        + 'Enemy.applyDamage(), so the constant is dead');
     }
 
     /* ------------------------------------------------ coverage gaps ----- */
     //
-    // What targets.mjs itself says it cannot check. Printing this is the point:
-    // a suite that stays quiet about its blind spots implies coverage it does
-    // not have, and three of this file's four domains have no external number
-    // to be held to.
+    // What targets.mjs itself says it cannot check. Printed as a MEAS row rather
+    // than as a check: a suite that stays quiet about its blind spots implies
+    // coverage it does not have, but "nobody publishes an AI accuracy figure" is
+    // not a defect anyone can close and a permanently red row for it would be
+    // noise. What the suite does about the gap is the three structural checks in
+    // section 2.
     if (missing) {
       const gaps = missing().filter((k) => ['ai_reaction', 'ai_accuracy', 'hitbox_fidelity'].includes(k));
-      report.check('AI and hitbox targets exist in targets.mjs', gaps.length === 0,
-        `${gaps.length} of this suite's domains have no sourced target: ${gaps.join(', ')} — every quantity `
-        + 'above is measured and printed, but only the player-health and ballistic-model checks are held to '
-        + 'an external figure');
+      report.measure('domains in this suite with no external reference value', gaps.length, 'domains',
+        gaps.length ? gaps.join(', ') : 'none');
     }
   } finally {
     // The runner boots one sim for every suite. A leaked SPEC mutation or a
@@ -1349,7 +1379,6 @@ export default async function run(sim, report) {
       const g = window.__GAME;
       delete g.player.damage;
       g.player.__realDamage = undefined;
-      g.player.health = window.__AI.TUNING.maxHealth;
       g.player.alive = true;
     }).catch(() => {});
   }

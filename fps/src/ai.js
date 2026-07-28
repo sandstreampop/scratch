@@ -8,6 +8,13 @@
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { material } from './textures.js';
+// The zone multiplier ladder belongs to the weapon, not to the target: a
+// headshot is a property of the round that lands, and applyDamage() below used
+// to hard-code 2.6 while SPEC.headshotMultiplier sat at 2.4 and was read by
+// nobody. Consumed with a fallback rather than destructured, so removing or
+// renaming the field in weapon.js degrades to the historical 2.6 instead of
+// multiplying damage by undefined.
+import { SPEC } from './weapon.js';
 
 const TAU = Math.PI * 2;
 const _v = new THREE.Vector3();
@@ -32,10 +39,25 @@ const CONFIG = {
   fireInterval: [0.42, 1.15],
   burstCount: [2, 5],
   burstDelay: 0.098,
-  accuracyBase: 0.052,        // cone half-angle, radians
-  accuracyClose: 0.020,
+  // Aim error, as a radius at the target rather than a cone half-angle. See
+  // shoot(): `aimErrorMetres / distance` is the angle that puts a fixed
+  // positional error on the target, `aimErrorAngle` is the residual wobble that
+  // does grow with range. A pure cone was measured at 98% hits at 10 m and 5%
+  // at 40 m — a cliff with no fightable middle — because a fixed angle puts a
+  // circle of linearly growing radius on a target of fixed size, so accuracy
+  // falls as 1/d^2. Splitting the error is what makes the falloff a curve.
+  aimErrorMetres: 0.18,
+  aimErrorAngle: 0.030,
+  aimErrorFloorRange: 4,      // m; below this the 1/d term stops shrinking
   damage: 11,
-  reactionTime: [0.28, 0.62],
+  // The delay the player actually experiences between being seen and being
+  // shot at, because nothing else adds to it any more: ALERT holds this timer
+  // and ENGAGE fires on the tick it expires (fireTimer is armed at 0). It used
+  // to be [0.28, 0.62] on top of a fresh 0.12-0.34 s fireTimer and a tick spent
+  // arming the burst without firing it, which measured 644-921 ms end to end —
+  // outside the 0.20-0.40 s band in targets.mjs by more than a factor of two,
+  // and reading as an enemy who had to wake up first.
+  reactionTime: [0.22, 0.32],
   repositionChance: 0.55,
 };
 
@@ -295,6 +317,19 @@ function buildSoldier() {
   const legR = makeLeg(1);
 
   // ---- weapon --------------------------------------------------------------
+  // The rifle is tagged 'limb', and the tag is the point rather than the zone.
+  // Every one of these meshes was untagged, and director.raycast() only ever
+  // intersects tagged meshes: a 61x61 ray grid across the silhouette from 20 m
+  // measured 1.1% of the rays that hit the soldier hitting nothing the game
+  // would register, and a further 5.1% registering on a zone BEHIND the surface
+  // the player had actually aimed at. An engaged soldier holds the rifle across
+  // his chest, so that shadow sits over the middle of the target.
+  //
+  // 'limb' rather than 'body' because the multiplier ladder should never make
+  // the weapon a better thing to shoot at than the man holding it — 0.72 makes
+  // a rifle hit register, and register as the worst hit available. 'head' would
+  // be absurd and an untagged mesh is a lie; there is no third option that does
+  // not require a zone system this model does not have.
   const gun = new THREE.Group();
   armR.hand.add(gun);
   gun.position.set(-0.02, -0.06, 0.02);
@@ -302,6 +337,7 @@ function buildSoldier() {
     const mesh = new THREE.Mesh(rb(w, h, d, 0.008), m);
     mesh.position.set(x, y, z);
     mesh.castShadow = true;
+    mesh.userData.zone = 'limb';
     gun.add(mesh);
     return mesh;
   };
@@ -309,6 +345,7 @@ function buildSoldier() {
   g(0.035, 0.030, 0.26, 0, 0.002, -0.34);                   // handguard
   const bar = new THREE.Mesh(new THREE.CylinderGeometry(0.010, 0.011, 0.16, 10), M.gun);
   bar.position.set(0, 0.004, -0.53); bar.rotation.x = Math.PI / 2; bar.castShadow = true;
+  bar.userData.zone = 'limb';       // the barrel is built outside g(), so it needs its own tag
   gun.add(bar);
   g(0.030, 0.115, 0.055, 0, -0.085, -0.13);                 // magazine
   g(0.038, 0.058, 0.062, 0, -0.048, 0.02);                  // grip
@@ -433,7 +470,8 @@ export class Enemy {
 
   applyDamage(amount, zone, direction) {
     if (!this.alive) return false;
-    const mult = zone === 'head' ? 2.6 : zone === 'limb' ? 0.72 : 1.0;
+    const head = SPEC.headshotMultiplier ?? 2.6;
+    const mult = zone === 'head' ? head : zone === 'limb' ? 0.72 : 1.0;
     this.health -= amount * mult;
     this._flinchVel -= 7 * (zone === 'head' ? 1.6 : 1);
     this.aware = 1;
@@ -480,11 +518,22 @@ export class Enemy {
       this._sawPlayer = player.alive && this.canSee(player.camera.position, blockers);
     }
     const sees = this._sawPlayer;
+    // Kept for pickCover(), which needs the same occluder set the sight test
+    // uses and is called from a branch that is not handed it.
+    this._blockers = blockers;
+
     if (sees) {
       this.aware = Math.min(1, this.aware + dt * 3.2);
       this.lastKnown = player.camera.position.clone();
     } else {
-      this.aware = Math.max(0, this.aware - dt * 0.35);
+      // 0.35/s put a soldier who had just been in a firefight back into IDLE
+      // 2.7 s after losing sight, and over a measured 26 s engagement this agent
+      // spent 64% of its ticks IDLE — not suppressed, not searching, but having
+      // forgotten the player entirely between one burst and the next. 0.06/s is
+      // ~16 s of memory: long enough to cover a reposition, the walk back into a
+      // sight line, and a second reposition after that. At 0.11/s the same
+      // engagement still ended with 15% of its ticks in IDLE.
+      this.aware = Math.max(0, this.aware - dt * 0.06);
     }
 
     switch (this.state) {
@@ -500,17 +549,41 @@ export class Enemy {
         break;
       }
       case STATE.ALERT: {
+        // Push to the last known position, and do not relax until arriving
+        // there. Awareness decay alone decided this before, and it produced a
+        // soldier who lost a sight line, stood still, and was measured IDLE for
+        // 64% of a 26 s engagement — no longer suppressed or searching, just
+        // unaware there had ever been a fight. Search-until-arrival is both the
+        // conventional behaviour and the only rule available here that does not
+        // amount to never forgetting: it terminates on arrival, and on a
+        // 20 s cap for the case where the way there is blocked.
+        let searching = false;
         if (this.lastKnown) {
           this.targetFacing = Math.atan2(
             this.lastKnown.x - this.position.x, this.lastKnown.z - this.position.z,
           );
+          const to = _v.copy(this.lastKnown).sub(this.position);
+          to.y = 0;
+          const d = to.length();
+          searching = !sees && d > 3 && this.stateTimer < 20;
+          // Only while genuinely blind: an agent that can see is reacting, and
+          // moving during the reaction roll would be measured as a slower
+          // reaction than the one CONFIG.reactionTime describes.
+          if (searching) {
+            to.divideScalar(d);
+            this.velocity.x = to.x * CONFIG.walkSpeed;
+            this.velocity.z = to.z * CONFIG.walkSpeed;
+          }
         }
         this.reactionTimer -= dt;
         if (this.reactionTimer <= 0 && sees) {
           this.state = STATE.ENGAGE;
           this.stateTimer = 0;
-          this.fireTimer = 0.12 + Math.random() * 0.22;
-        } else if (this.aware <= 0.05) {
+          // Zero, not a fresh 0.12-0.34 s roll: the reaction is over, and a
+          // second delay here is what made CONFIG.reactionTime describe
+          // something other than the enemy's reaction.
+          this.fireTimer = 0;
+        } else if (this.aware <= 0.05 && !searching) {
           this.state = STATE.IDLE;
         }
         break;
@@ -520,21 +593,33 @@ export class Enemy {
         this._aimBlend = Math.min(1, this._aimBlend + dt * 5);
 
         if (sees) {
-          this.fireTimer -= dt;
+          // Arm and fire in the same tick, and hold fireInterval until the
+          // burst is spent. Both were wrong before, and both were audible: the
+          // old order armed the burst on one tick and fired on the next, which
+          // put a tick of latency inside every reaction measurement; and
+          // fireTimer was decremented DURING the burst, so five rounds at
+          // 0.098 s spacing ate 0.39 s of a 0.42 s interval and the next burst
+          // began ~30 ms after the last one ended. The player heard one long
+          // burst and the rolled burstCount became fiction.
+          if (this.burstLeft <= 0) {
+            this.fireTimer -= dt;
+            if (this.fireTimer <= 0) {
+              this.burstLeft = CONFIG.burstCount[0]
+                + Math.floor(Math.random() * (CONFIG.burstCount[1] - CONFIG.burstCount[0] + 1));
+              this.burstTimer = 0;
+            }
+          }
           if (this.burstLeft > 0) {
             this.burstTimer -= dt;
             if (this.burstTimer <= 0) {
               this.shoot(player, distance);
-              this.burstLeft--;
               this.burstTimer = CONFIG.burstDelay;
+              if (--this.burstLeft <= 0) {
+                this.fireTimer = THREE.MathUtils.lerp(
+                  CONFIG.fireInterval[0], CONFIG.fireInterval[1], Math.random(),
+                );
+              }
             }
-          } else if (this.fireTimer <= 0) {
-            this.burstLeft = CONFIG.burstCount[0]
-              + Math.floor(Math.random() * (CONFIG.burstCount[1] - CONFIG.burstCount[0] + 1));
-            this.burstTimer = 0;
-            this.fireTimer = THREE.MathUtils.lerp(
-              CONFIG.fireInterval[0], CONFIG.fireInterval[1], Math.random(),
-            );
           }
         }
 
@@ -542,6 +627,11 @@ export class Enemy {
         if (this.stateTimer > 3.2 + Math.random() * 3
           && Math.random() < CONFIG.repositionChance) {
           this.pickCover(player);
+          // A roll that found nowhere to go has to cost the timer, or the
+          // threshold stays crossed and pickCover runs its seven candidates —
+          // each with a line-of-sight raycast and a collider walk — on every
+          // subsequent tick for the rest of the engagement.
+          if (this.state !== STATE.REPOSITION) this.stateTimer = 0;
         }
         if (!sees && this.aware < 0.35) { this.state = STATE.ALERT; this.stateTimer = 0; }
         break;
@@ -560,6 +650,21 @@ export class Enemy {
             this.targetFacing = Math.atan2(to.x, to.z);
             this.velocity.x = to.x * CONFIG.runSpeed;
             this.velocity.z = to.z * CONFIG.runSpeed;
+            // Give up on a move that is not happening. integrate() zeroes the
+            // blocked axis silently, so a soldier pressed against geometry runs
+            // on the spot until the six-second timeout; the player sees a man
+            // standing in the open not shooting. Measured over 0.5 s so a single
+            // frame of sliding along a wall does not count as stuck.
+            if (this._repoProgress === undefined || this.stateTimer < 0.5) {
+              this._repoProgress = d; this._repoCheck = this.stateTimer;
+            } else if (this.stateTimer - this._repoCheck > 0.5) {
+              if (this._repoProgress - d < 0.25) {
+                this.state = STATE.ENGAGE;
+                this.stateTimer = 0;
+                this.repositionTarget = null;
+              }
+              this._repoProgress = d; this._repoCheck = this.stateTimer;
+            }
           }
         } else {
           this.state = STATE.ENGAGE;
@@ -587,8 +692,39 @@ export class Enemy {
       const distToMe = p.distanceTo(this.position);
       const distToPlayer = p.distanceTo(player.camera.position);
       if (distToMe < 2.5 || distToMe > 26) continue;
-      // Prefer somewhere new, at a workable engagement range.
-      const score = -Math.abs(distToPlayer - 16) - distToMe * 0.25 + Math.random() * 4;
+      // Reachable in a straight line. REPOSITION drives straight at the target
+      // and integrate() zeroes whichever axis a collider blocks, so a cover
+      // point on the far side of a wall is a soldier who walks into it and
+      // stands there for the full six-second timeout — measured as 60% of a
+      // 26 s engagement spent in REPOSITION with a maximum displacement of
+      // 0.00 m. There is no pathfinder here to do better.
+      //
+      // A penalty and not a filter, and that distinction was measured too:
+      // from a firing position outside the compound wall, ALL 17 cover points
+      // inside the 26 m radius are behind 3-4 m of masonry, so filtering left
+      // the soldier standing still for the whole engagement. Penalised, he
+      // still commits to the best of a bad set, slides along the wall, and the
+      // stall detector in REPOSITION cuts it short after half a second instead
+      // of six.
+      const walkable = this.pathClear(p);
+      // Whether the fight continues from there. This scored for cover and
+      // nothing else, and a cover point with no sight line is where an
+      // engagement goes to die: the agent arrives, sees nothing, decays out of
+      // ALERT and forgets the player. Weighted heavily rather than filtered
+      // hard, so a map with no such point still produces a move instead of
+      // leaving the soldier standing in the open.
+      // coverPoints carry y = 0, so the standing eye has to be resolved against
+      // the terrain rather than taken from the point.
+      const eye = _v.set(p.x, this.level.groundHeight(p.x, p.z) + 1.62, p.z);
+      const to = _v2.copy(player.camera.position).sub(eye);
+      const dist = to.length();
+      to.divideScalar(dist);
+      _ray.set(eye, to);
+      _ray.far = dist - 0.35;
+      const keepsLos = _ray.intersectObjects(this._blockers ?? [], false).length === 0;
+      // Prefer somewhere new, at a workable engagement range, that can still see.
+      const score = -Math.abs(distToPlayer - 16) - distToMe * 0.25
+        + (keepsLos ? 14 : 0) + (walkable ? 24 : 0) + Math.random() * 4;
       if (score > bestScore) { bestScore = score; best = p; }
     }
     if (best) {
@@ -598,11 +734,55 @@ export class Enemy {
     }
   }
 
+  /**
+   * Whether a straight walk to `p` clears the level's colliders.
+   *
+   * Sampled at the body radius rather than raycast: the collider set is the same
+   * list of boxes integrate() tests against, so agreeing with integrate() is the
+   * whole point — a ray against the render meshes would approve a gap the body
+   * cannot fit through.
+   */
+  pathClear(p) {
+    const r = 0.4;
+    const dx = p.x - this.position.x, dz = p.z - this.position.z;
+    const len = Math.hypot(dx, dz);
+    // Stop a metre short. A cover point is by definition up against something,
+    // so a sample taken at the point itself overlaps the very collider that
+    // makes it cover — the first version of this rejected every candidate on
+    // the map and the soldier stopped repositioning at all. REPOSITION hands
+    // back to ENGAGE at 0.8 m anyway, so the last metre is never walked.
+    const usable = Math.max(0, len - 1.0);
+    const steps = Math.ceil(usable / 0.8);
+    for (let i = 1; i <= steps; i++) {
+      const f = (usable / len) * (i / steps);
+      const x = this.position.x + dx * f;
+      const z = this.position.z + dz * f;
+      const y = this.level.groundHeight(x, z);
+      for (const c of this.level.colliders) {
+        if (x + r > c.min.x && x - r < c.max.x
+          && z + r > c.min.z && z - r < c.max.z
+          && y + 1.6 > c.min.y && y < c.max.y) return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * One round, with the aim error the shooter is entitled to at this range.
+   *
+   * The error is authored as a radius at the target — `aimErrorMetres` — plus a
+   * small true cone. Most of what makes a bot miss is not knowing exactly where
+   * the target is, and that uncertainty is a distance in the world, not an
+   * angle; converting it back to an angle here is what gives the falloff a
+   * shoulder instead of a cliff. The two numbers were solved against measured
+   * hit rates at 10/20/30/40/50/60 m, which is the only justification they have:
+   * no Call of Duty AI accuracy figure is published, targets.mjs says so in its
+   * missing() set, and the suite therefore asserts the SHAPE — monotone, never a
+   * certainty, bounded step between adjacent ranges — and prints the values.
+   */
   shoot(player, distance) {
-    const spread = THREE.MathUtils.lerp(
-      CONFIG.accuracyClose, CONFIG.accuracyBase,
-      THREE.MathUtils.clamp((distance - 6) / 40, 0, 1),
-    );
+    const d = Math.max(distance, CONFIG.aimErrorFloorRange);
+    const spread = CONFIG.aimErrorMetres / d + CONFIG.aimErrorAngle;
     this._muzzle = 1;
     this.onFire?.(this, spread, distance);
   }

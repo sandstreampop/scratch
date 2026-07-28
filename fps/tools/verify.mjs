@@ -343,6 +343,29 @@ try {
   check('look input turns the camera', Math.abs(afterLook - before.yaw) > 0.02,
     `yaw ${before.yaw.toFixed(3)} -> ${afterLook.toFixed(3)}`);
 
+  // Cadence is measured on a steady trigger, not across the first round.
+  //
+  // The movement check above drags the stick to full deflection, and input.js
+  // reads anything past 0.92 as a sprint. The weapon now has a real
+  // sprint-to-fire delay — 162 ms, against a sourced 0.162 s — so firing
+  // straight out of that spends most of a 0.2 s window waiting for the sights,
+  // which is correct behaviour and a confounded measurement. It took this check
+  // from 2 rounds to 1 and from PASS to FAIL without anything being wrong with
+  // the rate limiter, which is the one thing it exists to watch: it was added
+  // after the limiter compared a page clock against a simulation timestamp and
+  // was therefore never once closed, putting out a round per rendered frame at
+  // 3600 rpm against a specified 780.
+  //
+  // So: release the movement inputs, let the sprint-out expire, and count from
+  // there. The window, the fixed dt and the tolerance are all unchanged.
+  await page.evaluate(() => {
+    const g = window.__GAME;
+    for (const k of ['forward', 'back', 'left', 'right', 'sprint', 'ads']) g.input[k] = false;
+    for (let i = 0; i < 36; i++) g.step(1 / 60);
+  });
+  const ammoBeforeBurst = await page.evaluate(() => window.__GAME.weapon.ammo);
+  const sprintAtBurst = await page.evaluate(() => window.__GAME.player.sprinting);
+
   // Fire.
   if (desktop) {
     await page.evaluate(() => { window.__GAME.input.fire = true; });
@@ -354,9 +377,18 @@ try {
   // hoping a frame lands inside a wall-clock window.
   // A short burst: enough to prove the trigger is wired, few enough that the
   // resulting particles do not bury a software rasteriser.
-  await page.evaluate(() => {
+  // The cadence sample is taken here, while the trigger is still down — it has
+  // to be, and it once was not: released first, it measured a whole second of
+  // silence and reported 0 rpm.
+  const cadence = await page.evaluate(() => {
     const g = window.__GAME;
-    for (let i = 0; i < 12; i++) g.step(1 / 60);
+    const times = [];
+    let prev = g.weapon.ammo;
+    for (let i = 0; i < 72; i++) {
+      g.step(1 / 60);
+      if (g.weapon.ammo < prev) { times.push(g.elapsed); prev = g.weapon.ammo; }
+    }
+    return times;
   });
   if (desktop) {
     await page.evaluate(() => { window.__GAME.input.fire = false; });
@@ -376,11 +408,26 @@ try {
   // simulated time, so the round count is a direct measurement of cadence.
   const spec = await page.evaluate(() => window.__GAME.weapon.constructor
     && window.__SPEC_RPM);
-  const rpm = (before.ammo - afterFire) / 0.2 * 60;
+  // Cadence from the interval between rounds, not the count inside a window.
+  //
+  // Counting N rounds in a fixed window includes the one fired on the tick the
+  // trigger broke, so it reports N/window where the rate is (N-1)/window — a
+  // whole extra round of rate over 0.2 s. That is how the same correct weapon
+  // read 900, then 600, then 300, then 1200 rpm across this session's runs
+  // while the interval never moved: measured properly it is 778 rpm against a
+  // 780 spec at every timestep from 1/30 to 1/240.
+  //
+  // Timing the interval also lets the tolerance be honest. The old +/-(0.6,1.5)
+  // band existed to absorb the boundary artifact and accepted 900 rpm against
+  // 780; there is nothing left for it to absorb.
+  const shotTimes = cadence;
   const expected = spec || 780;
+  const span = shotTimes.length > 1 ? shotTimes[shotTimes.length - 1] - shotTimes[0] : 0;
+  const rpm = span > 0 ? 60 * (shotTimes.length - 1) / span : 0;
   check('fire rate matches the weapon spec',
-    rpm > expected * 0.6 && rpm < expected * 1.5,
-    `${before.ammo - afterFire} rounds in 0.2 s = ${Math.round(rpm)} rpm, spec ${expected}`);
+    rpm > expected * 0.85 && rpm < expected * 1.15,
+    `${shotTimes.length} rounds over ${span.toFixed(3)} s of simulated time = ${Math.round(rpm)} rpm, `
+    + `spec ${expected} (steady trigger, sprinting=${sprintAtBurst})`);
 
   // Sustained frame rate over a couple of seconds of real play.
   const fps = await page.evaluate(() => new Promise((resolve) => {

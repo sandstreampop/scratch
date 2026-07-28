@@ -150,7 +150,11 @@ const DRIVER = () => {
     const dx = aim.x - eye.x, dy = aim.y - eye.y, dz = aim.z - eye.z;
     g.player.yaw = Math.atan2(-dx, -dz);
     g.player.pitch = Math.atan2(dy, Math.hypot(dx, dz));
-    g.step(1 / 240);
+    // One SIMULATION step, not one 1/240 step. The game banks the time it is
+    // handed and only integrates in fixed g.tickLength slices, so a 1/240 call
+    // advances nothing at all: this used to leave the camera wherever the
+    // previous section had left it and return an aim computed from a stale eye.
+    g.step(g.tickLength ?? 1 / 240);
     const dir = g.player.aimDirection(new THREE.Vector3());
     const enemyHit = g.director.raycast(g.camera.position, dir, 260);
     const worldDist = window.__SIM.rayWorld(
@@ -351,10 +355,21 @@ export async function openSim({
           spawned.push({ id: enemy.id, x: enemy.position.x, y: enemy.position.y, z: enemy.position.z });
         }
 
-        // One step so the camera, view matrices and enemy poses match the state
-        // just written. Without it the first sample of every trace is stale,
-        // which reads as a one-tick lag in every timing measured off tick zero.
-        g.step(1 / 240);
+        // A known world state includes what is already in the air and what the
+        // loop still owes: a round from the previous burst arriving after the
+        // roster was replaced is attributed to the new engagement, and a
+        // fractional tick left in the accumulator shifts the tick grid of the
+        // next trace, which is exactly the thing the frame-rate independence
+        // measurements are trying to hold still.
+        g.resetSimulation?.();
+
+        // One SIMULATION step so the camera, view matrices and enemy poses match
+        // the state just written. Without it the first sample of every trace is
+        // stale, which reads as a one-tick lag in every timing measured off tick
+        // zero. It has to be a whole g.tickLength: the game banks the time it is
+        // handed and integrates only in fixed slices, so a 1/240 call advances
+        // nothing whatsoever.
+        g.step(g.tickLength ?? 1 / 240);
         window.__SIM.events.length = 0;
         return { spawned, t: g.elapsed };
       }, { position, yaw, pitch, ads, enemies, audio, invulnerable, ammo, health, director });

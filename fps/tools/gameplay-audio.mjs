@@ -21,122 +21,105 @@
 // node graph and writes an envelope with setValueAtTime(v, T), and T is the real
 // onset. A test that only recorded when the *method* was called would report
 // zero latency for both the correct impact() (which delays by distance/343) and
-// the broken gunshot() (which does not), because both are called at the same
+// a broken gunshot() (which would not), because both are called at the same
 // instant. So this file installs a recorder on AudioParam.prototype and reads
 // the minimum scheduled time out of every audio call — that number is the sound
 // as the listener receives it, and it is the only number that can tell those two
 // functions apart.
 //
+// WHAT IS THE GAME AND WHAT IS THE MACHINE — the division this file is built
+// around, because it is the difference between an instrument and a wall of red.
+// sampleRate, baseLatency and outputLatency are properties of the device and the
+// browser. On this headless Chromium they sum to ~42 ms, which is over the 20 ms
+// imperceptible tier and at the 40 ms ceiling from the same literature, and NO
+// change to this codebase can move them by a microsecond. An earlier revision of
+// this suite asserted on them anyway and produced five reds that were true
+// statements about the container and zero statements about the game — which is
+// how a reader learns to skip the output. They are now report.measure()d: the
+// platform floor is printed, kept, quoted in the notes of the checks it bounds,
+// and counted separately from any pass.
+//
+// What IS asserted is what the engine decides: the scheduling lead it adds, the
+// ordering of cues, one sound per round, and the propagation delay it applies to
+// distance. Perturb any of those in src/ and this suite goes red; perturb the
+// machine and it reports a different number in the same green shape.
+//
 // WHAT IT FOUND, in one place, because the rest of the file is the evidence:
 //   - THE BRIEF FOR THIS SUITE WAS WRONG ABOUT DISTANT GUNFIRE. It stated that
 //     gunshot(distance) "uses distance only for level and filtering, so an
 //     enemy's report at 80 m arrives instantly", and that the check for it must
-//     fail. It does not fail. src/audio.js line ~105 computes
-//     `const delay = distance / 343` and schedules every element at T = t +
-//     delay; measured onset lead is 233.24 ms at 80 m against 233.24 ms
-//     required, on an unmodified working tree (git diff on audio.js is empty).
-//     No failure was manufactured to match the brief. Instead the checks are
+//     fail. src/audio.js has computed `distance / SPEED_OF_SOUND` and scheduled
+//     every element at T = now + delay since the file was first committed
+//     (git log -p -- src/audio.js: the line arrives in the initial revision),
+//     and the measured onset lead at 80 m is 233 ms against 233 ms required. No
+//     failure was manufactured to match the brief. Instead the delay checks are
 //     backed by a NEGATIVE CONTROL that rebuilds the broken gunshot the brief
 //     described and requires the same assertions to reject it, so their green is
 //     evidence rather than an untested silence.
-//   - WHAT IS BROKEN AT DISTANCE INSTEAD: the delay is applied to the envelope
-//     and not to the source lifetimes. noise() stops each buffer source at
-//     ctx.currentTime + duration + 0.05, computed from NOW rather than from the
-//     delayed onset, so past 343 * 0.11 = 38 m the crack element's envelope is
-//     written after the source carrying it has been stopped, and past ~120 m the
-//     body goes the same way. A distant report loses its transient, which is the
-//     part that makes it locatable. Same defect in impact(): beyond ~93 m the
-//     single source is stopped before the envelope starts and the impact is
-//     entirely silent, inside SPEC.range of 220 m.
-//   - nothing is scheduled with any lead at all, not even the 128-sample render
-//     quantum, so every attack transient starts in the audio thread's past.
+//   - WHAT WAS ACTUALLY BROKEN AT DISTANCE: the delay was applied to the
+//     envelope and not to the source lifetimes. noise() stopped each buffer
+//     source at ctx.currentTime + duration + 0.05, computed from NOW rather than
+//     from the delayed onset, so past 343 * 0.11 = 38 m the crack element's
+//     envelope was written after the source carrying it had been stopped, and
+//     past ~120 m the body went the same way. A distant report lost its
+//     transient, which is the part that makes it locatable. Same defect in
+//     impact(): beyond ~93 m the single source was stopped before the envelope
+//     started and the impact was entirely silent, well inside SPEC.range of
+//     220 m. Fixed by scheduling the lifetime from the onset it belongs to.
+//   - nothing was scheduled with any lead at all, not even the 128-sample render
+//     quantum, so every attack transient started in the audio thread's past and
+//     was clamped forward to the next block boundary — the crack's 1.2 ms attack
+//     is 0.41 of a quantum long, so the transient this game is proudest of was
+//     the part being quantised away. Fixed by scheduling one quantum ahead.
 //   - the magazine-seat click plays ~190 ms (tactical) / ~240 ms (empty) after
 //     the magazine visually seats, past the ITU-R BT.1359-1 detectability
-//     threshold for audio lagging video.
+//     threshold for audio lagging video. That gate lives in weapon.js and is
+//     not this file's to change, so the check is left red on purpose.
 //   - the reload track documents a bolt-release phase and audio.js defines a
-//     'bolt' sound, and nothing ever plays it.
-//
-// A NOTE ON WHAT IS THE GAME AND WHAT IS THE MACHINE. sampleRate, baseLatency
-// and outputLatency are properties of the device and the browser, not of this
-// codebase, and a check on them fails on a laptop and passes on a workstation.
-// They are measured and reported because they set the floor every other number
-// in this file sits on top of, and the checks that assert on them say in their
-// detail string that they are environmental. The checks that a critic should be
-// able to move by perturbing the game are the ones about leads, counts, phases
-// and ordering.
+//     'bolt' sound, and nothing ever plays it. Also weapon.js.
 
 const DT = 1 / 240;      // four samples inside the 79 ms shot interval
 const DT_RELOAD = 1 / 240; // 2.18 s of reload is 523 ticks; 4 ms on a 2180 ms phase is 0.2%
-const SOS = 343;         // only used to FORM an expectation; asserted against targets.mjs below
 
 export const NAME = 'audio';
 
 /* ------------------------------------------------------------- targets -- */
 //
-// Defensive because targets.mjs is owned by a separate research workflow. The
-// rule this file follows: when a sourced target exists, assert against it and
-// print the source; when it does not, still measure the quantity and print the
-// number with the gap named. No Call of Duty figure is invented here — and note
-// that most of the audio domain is explicitly non-CoD general engineering
-// literature, which the detail strings repeat rather than quietly launder.
+// report.against() is the only way a target VALUE reaches an assertion in this
+// file: it takes a domain and a key, throws on an unknown one, and fixes the
+// tolerance at the source. Two things it deliberately cannot do, and how they
+// are handled here:
+//
+//   A ONE-SIDED BOUND. against() brackets, and competitive_audio_latency_target
+//   is 0.020 +/-0.005 — so a 7 ms engine budget would FAIL it for being too
+//   good. The threshold checks ("no worse than") read the sourced value through
+//   sourcedAudio() below and compare one-sidedly, printing the title and the URL
+//   in the detail. The number still comes from targets.mjs and nowhere else.
+//
+//   AN EXPECTATION TO FORM RATHER THAN COMPARE. distance/343 has to be computed
+//   before a residual against it can be measured. 343 is read out of
+//   audio.speed_of_sound_air together with its +/-2, so the suite and the
+//   research cannot drift apart. An earlier revision had `const SOS = 343` at
+//   the top of this file and a hand-written `<= 2` next to it, which was not an
+//   invented number but was a duplicated one, and duplicated expectations are
+//   how a suite ends up quietly asserting last quarter's research.
+const { TARGETS } = await import('./targets.mjs');
 
-let TARGETS = null, inside = null, describe = null;
-try { ({ TARGETS, inside, describe } = await import('./targets.mjs')); } catch { /* not written yet */ }
-
-/** Raw target record, or null. Never falls back to a number of our own. */
-function T(key) { return TARGETS?.audio?.[key] ?? null; }
-
-/** Source line for a detail string, or an explicit statement that there is none. */
-function src(key) {
-  const t = T(key);
-  if (!t) return 'NO SOURCED TARGET for this quantity';
-  if (describe) return describe('audio', key);
-  return `${t.title} — ${t.source}`;
-}
-
-/**
- * Bracket check against a target whose tolerance is a real bracket (a band or a
- * +/-). Used for speed of sound, baseLatency, outputLatency.
- */
-function bracket(report, name, key, measured, unit = ' s') {
-  const t = T(key);
-  if (!t || !inside) {
-    report.check(name, true, `measured ${fx(measured)}${unit} — no sourced target yet`);
-    return null;
+/** Sourced audio record, by exact key. Throws like against() rather than degrading. */
+function sourcedAudio(key) {
+  const t = TARGETS?.audio?.[key];
+  if (!t) {
+    throw new Error(`sourcedAudio("${key}") is not in targets.mjs. `
+      + `Known audio keys: ${Object.keys(TARGETS?.audio ?? {}).join(', ') || '(no audio domain)'}`);
   }
-  const v = inside('audio', key, measured);
-  report.check(name, v.ok,
-    `measured ${fx(measured)}${unit}, target ${t.value === null ? `band ${t.tol.min}..${t.tol.max}` : t.value}`
-    + `${t.value === null ? '' : ` ${tolStr(t.tol)}`}${v.reason ? ` (${v.reason})` : ''} — ${src(key)}`);
-  return v.ok;
+  return t;
 }
+/** "title — url", for a detail string that has to carry its own provenance. */
+const cite = (key) => `${sourcedAudio(key).title} — ${sourcedAudio(key).source}`;
 
-function tolStr(tol) {
-  if (!tol) return '(no tolerance)';
-  if (tol.min !== undefined) return `[${tol.min}..${tol.max}]`;
-  if (tol.abs !== undefined) return `+/-${tol.abs}`;
-  return `+/-${(tol.pct * 100).toFixed(0)}%`;
-}
-
-/**
- * One-sided bound check. The perceptual targets (20 ms imperceptible, 40 ms
- * ceiling, 125 ms A/V detectability) are THRESHOLDS, not brackets: a measured
- * 5 ms is excellent and would fail inside(), which brackets 0.020 +/-0.005.
- * Calling inside() on them would have inverted the meaning of four checks, so
- * they go through here and the bound is read off the target's value.
- */
-function under(report, name, key, measured, unit = ' s') {
-  const t = T(key);
-  if (!t || typeof t.value !== 'number') {
-    report.check(name, true, `measured ${fx(measured)}${unit} — no sourced numeric bound available`);
-    return null;
-  }
-  const ok = measured <= t.value;
-  report.check(name, ok,
-    `measured ${fx(measured)}${unit} against a ${fx(t.value)}${unit} bound `
-    + `(${((measured / t.value - 1) * 100).toFixed(1)}% ${measured > t.value ? 'over' : 'under'}) — ${src(key)}`);
-  return ok;
-}
+const SOS = sourcedAudio('speed_of_sound_air').value;       // 343 m/s
+const SOS_TOL = sourcedAudio('speed_of_sound_air').tol.abs;  // +/-2 m/s
+const QUANTUM_FRAMES = sourcedAudio('web_audio_render_quantum').value; // 128, spec-fixed
 
 /* ------------------------------------------------------------ plumbing -- */
 
@@ -150,6 +133,7 @@ const IN = (over = {}) => `return ${JSON.stringify({ ...BASE_INPUT, ...over })};
 
 const ms = (v) => (Number.isFinite(v) ? `${(v * 1000).toFixed(2)} ms` : 'n/a');
 const fx = (v) => (Number.isFinite(v) ? (Math.abs(v) >= 100 ? v.toFixed(1) : v.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')) : 'n/a');
+const med = (xs) => (xs.length ? xs.slice().sort((a, b) => a - b)[xs.length >> 1] : NaN);
 
 /** Least-squares slope of y on x, through the data (not forced through zero). */
 function slope(xs, ys) {
@@ -176,7 +160,7 @@ function slope(xs, ys) {
 //
 //   AudioScheduledSourceNode.prototype.stop is patched the same way, because a
 //   scheduled onset means nothing if the source feeding it has already been
-//   stopped. That is a real state in this codebase (see the impact() sweep) and
+//   stopped. That was a real state in this codebase (see the impact() sweep) and
 //   without the stop times the suite would report a correct delay for a sound
 //   that is silent.
 //
@@ -247,16 +231,16 @@ const INSTALL = () => {
    *
    * The brief for this suite asserted that gunshot(distance) ignored distance
    * for timing and that the distance check "must fail today". It does not: the
-   * function computes `const delay = distance / 343` and adds it to T, on an
-   * unmodified src/audio.js (git diff is empty), so the claim was simply wrong.
-   * That leaves a real problem — a green check whose ability to go red has never
-   * been demonstrated is exactly the silence this project has been burned by.
+   * function has computed the delay and added it to T since the initial commit,
+   * so the claim was simply wrong. That leaves a real problem — a green check
+   * whose ability to go red has never been demonstrated is exactly the silence
+   * this project has been burned by.
    *
-   * So this builds the sound the brief DESCRIBED: the same three-element gunshot
-   * envelope, scheduled at ctx.currentTime with the distance argument used for
-   * level only, which is what a regression would look like. The suite runs the
-   * identical slope and per-distance maths over it and requires every one of
-   * those assertions to come out FALSE. If the control ever passes, the
+   * So this builds the sound the brief DESCRIBED: the same three-element
+   * gunshot envelope, scheduled at ctx.currentTime with the distance argument
+   * used for level only, which is what a regression would look like. The suite
+   * runs the identical slope and per-distance maths over it and requires every
+   * one of those assertions to come out FALSE. If the control ever passes, the
    * distance checks are decorative and their green means nothing.
    */
   const noDelay = (distance) => {
@@ -323,7 +307,7 @@ const INSTALL = () => {
      * this suite reports is onset - (currentTime read by the wrapper), while
      * audio.js reads currentTime again a few microseconds later; if a 128-frame
      * render-quantum boundary falls in that gap the two reads differ and the
-     * lead is out by ~2.7 ms. Requiring ctxBefore === ctxAfter proves no
+     * lead is out by one quantum. Requiring ctxBefore === ctxAfter proves no
      * boundary was crossed, which makes the sweep exact instead of exact-most-
      * of-the-time. The extra discarded calls are inaudible (--mute-audio) and
      * cost a handful of nodes.
@@ -375,39 +359,43 @@ export default async function run(sim, report) {
         + `${fx(alive.onset)} s vs ctx.currentTime ${fx(alive.ctxBefore)} s`
       : 'probe returned nothing — the recorder is not wired and every latency below would be null');
 
+  if (!Number.isFinite(info.sampleRate)) {
+    throw new Error('no AudioContext sampleRate — the render quantum is the unit every timing check '
+      + 'below is expressed in, so there is nothing to measure against');
+  }
+
   /* ------------------------------------------------- 1. the output path -- */
   //
-  // ENVIRONMENTAL, not a property of this codebase. Reported because it is the
-  // floor: the game cannot deliver a sound sooner than baseLatency +
-  // outputLatency after it schedules one, whatever it does, so every latency
-  // budget below is really this number plus the engine's contribution.
-  const total = (info.baseLatency ?? NaN) + (info.outputLatency ?? NaN);
-  const quantum = info.sampleRate ? 128 / info.sampleRate : NaN;
+  // ALL MEASUREMENTS, NO ASSERTIONS, on purpose. These are properties of the
+  // device and the browser: the game cannot deliver a sound sooner than
+  // baseLatency + outputLatency after it schedules one, whatever it does. On
+  // this container that sum is ~42 ms — over the 20 ms imperceptible tier and at
+  // the 40 ms ceiling — and no edit to src/ moves it, so asserting on it
+  // manufactures reds that are true about the machine and silent about the game.
+  // The numbers are printed because every engine budget below sits on top of
+  // them, and they are quoted in the notes of the checks they bound.
+  const quantum = QUANTUM_FRAMES / info.sampleRate;
+  const platform = (info.baseLatency ?? 0) + (info.outputLatency ?? 0);
+  const baseBand = sourcedAudio('web_audio_baselatency_interactive').tol;
+  const outBand = sourcedAudio('web_audio_outputlatency_wired').tol;
 
-  report.check('AudioContext sample rate reported', Number.isFinite(info.sampleRate),
-    `sampleRate ${info.sampleRate} Hz, so the Web Audio render quantum of 128 frames is `
-    + `${ms(quantum)} — the quantisation floor on every scheduled onset in this file. ${src('web_audio_render_quantum')}`);
-
-  bracket(report, 'baseLatency is at the render-quantum floor (128/sampleRate)',
-    'web_audio_baselatency_interactive', info.baseLatency);
-  report.check('baseLatency is at least one render quantum',
-    info.baseLatency >= quantum - 1e-9,
-    `baseLatency ${ms(info.baseLatency)} vs one 128-frame quantum ${ms(quantum)} — `
-    + `${(info.baseLatency / quantum).toFixed(2)} quanta. audio.js constructs the AudioContext with `
-    + 'no latencyHint, so this is whatever the platform default is rather than "interactive"');
-
-  bracket(report, 'outputLatency is inside the wired-output band',
-    'web_audio_outputlatency_wired', info.outputLatency);
-
-  report.check('unavoidable output latency measured',
-    Number.isFinite(total),
-    `baseLatency ${ms(info.baseLatency)} + outputLatency ${ms(info.outputLatency)} = ${ms(total)} `
-    + 'of latency the engine cannot remove — every sound below arrives this late at the ear '
-    + 'even when its scheduled onset is exact');
-  under(report, 'unavoidable output latency inside the imperceptible tier',
-    'competitive_audio_latency_target', total);
-  under(report, 'unavoidable output latency under the hard ceiling',
-    'competitive_audio_latency_ceiling', total);
+  report.measure('platform sample rate', info.sampleRate, 'Hz',
+    `so the spec-fixed ${QUANTUM_FRAMES}-frame render quantum is ${ms(quantum)} — the quantisation floor `
+    + `on every scheduled onset in this file. ${cite('web_audio_render_quantum')}`);
+  report.measure('platform baseLatency', info.baseLatency * 1000, 'ms',
+    `${(info.baseLatency / quantum).toFixed(2)} render quanta; audio.js constructs the AudioContext with no `
+    + `latencyHint, so this is the platform default rather than "interactive", whose reference band is `
+    + `${baseBand.min * 1000}..${baseBand.max * 1000} ms. ${cite('web_audio_baselatency_interactive')}`);
+  report.measure('platform outputLatency', info.outputLatency * 1000, 'ms',
+    `reference band ${outBand.min * 1000}..${outBand.max * 1000} ms for a wired path, and the source notes `
+    + `that some platforms return exactly 0, so there is no floor to assert against. ${cite('web_audio_outputlatency_wired')}`);
+  report.measure('platform output path the engine cannot remove', platform * 1000, 'ms',
+    `baseLatency + outputLatency, i.e. `
+    + `${(platform / sourcedAudio('competitive_audio_latency_target').value).toFixed(2)}x the `
+    + `${ms(sourcedAudio('competitive_audio_latency_target').value)} imperceptible-tier target and `
+    + `${(platform / sourcedAudio('competitive_audio_latency_ceiling').value).toFixed(2)}x the `
+    + `${ms(sourcedAudio('competitive_audio_latency_ceiling').value)} ceiling. HEADLESS CHROMIUM, not the `
+    + `game: ${cite('windows_wired_headset_total_audio_latency')}`);
 
   /* --------------------------------------------- 2. the player's gunshot -- */
   //
@@ -459,70 +447,120 @@ export default async function run(sim, report) {
   for (const c of shotCalls) perTick.set(c.sim, (perTick.get(c.sim) ?? 0) + 1);
   const worstTick = Math.max(0, ...perTick.values());
   const gaps = shotCalls.slice(1).map((c, i) => c.sim - shotCalls[i].sim);
+  const minGap = Math.min(...gaps);
   report.check('no simulated tick carries two gunshots',
     worstTick <= 1,
-    `worst tick carried ${worstTick} gunshot(s); min gap between consecutive gunshots `
-    + `${ms(Math.min(...gaps))}, median ${ms(gaps.slice().sort((a, b) => a - b)[gaps.length >> 1])} `
-    + `over ${gaps.length} intervals`);
+    `worst tick carried ${worstTick} gunshot(s); min gap between consecutive gunshots ${ms(minGap)}, `
+    + `median ${ms(med(gaps))} over ${gaps.length} intervals`);
 
   // Round -> scheduling latency, on both clocks. The two events happen in the
   // same synchronous playerShoot() body, so simulated latency is structurally
   // zero and the AudioContext delta is whatever the audio thread advanced by
   // while the JS ran — which is the number that would grow if scheduling ever
   // moved to a deferred queue.
+  //
+  // PAIRED ON THE TICK, NOT ON weapon.lastShot. An earlier revision matched
+  // rounds to gunshots by `lastShot === c.sim`, which silently collapsed to
+  // 1/30 matches: weapon.js:1065 now advances lastShot by exactly one fire
+  // interval while the trigger is held (`lastShot + interval`) rather than
+  // stamping g.elapsed, so it is deliberately OFF the tick grid and equality
+  // against a tick timestamp can only hold for the first round of a burst. The
+  // round's tick is the tick its ammo decrement was sampled on, which is what
+  // is used here — and 1/30 matching is exactly what a "0 samples reported as
+  // fine" bug looks like from the outside, so the count is asserted.
   const perRound = [];
-  for (const t of lastShots) {
-    const fireEv = evs.find((e) => e.kind === 'weapon.fire' && e.sim === t && e.audio !== null);
-    const shot = shotCalls.find((c) => c.sim === t);
-    if (!fireEv || !shot) continue;
-    perRound.push({ t, dSim: shot.sim - t, dAudio: shot.ctxBefore - fireEv.audio, lead: shot.onset - shot.ctxBefore });
+  for (let k = 0; k < Math.min(decrements.length, shotCalls.length); k++) {
+    const shot = shotCalls[k];
+    const fireEv = evs.filter((e) => e.kind === 'weapon.fire' && e.sim === shot.sim && e.audio !== null).pop();
+    if (!fireEv) continue;
+    perRound.push({
+      t: decrements[k].t,
+      dSim: shot.sim - decrements[k].t,
+      dAudio: shot.ctxBefore - fireEv.audio,
+      lead: shot.onset - shot.ctxBefore,
+    });
   }
   const maxSim = Math.max(...perRound.map((r) => Math.abs(r.dSim)));
   const maxAud = Math.max(...perRound.map((r) => Math.abs(r.dAudio)));
   report.check('gunshot is scheduled on the same simulated tick the round leaves',
     perRound.length === decrements.length && maxSim === 0,
-    `${perRound.length}/${decrements.length} rounds matched to a gunshot; worst simulated gap `
-    + `${ms(maxSim)} (zero by construction — fire() and gunshot() are in one synchronous body)`);
-  report.check('gunshot scheduling costs nothing on the AudioContext clock',
-    Number.isFinite(maxAud) && maxAud < 0.005,
-    `worst ctx.currentTime advance between weapon.fire and audio.gunshot ${ms(maxAud)} over `
-    + `${perRound.length} rounds, median ${ms(perRound.map((r) => r.dAudio).sort((a, b) => a - b)[perRound.length >> 1])}`);
+    `${perRound.length}/${decrements.length} rounds matched to a gunshot on the same tick; worst simulated `
+    + `gap ${ms(maxSim)} (zero by construction — fire() and gunshot() are in one synchronous body, so a `
+    + 'nonzero value here would mean the sound had been deferred to a later tick)');
 
-  // Trigger press -> round. One tick, and that tick is the engine's entire
-  // input-to-sound contribution, so the end-to-end figure is it plus the output
-  // path measured in section 1.
+  // Two bounds on the AudioContext-clock cost of scheduling, neither of them a
+  // round number of milliseconds.
+  //
+  // An earlier revision asserted `maxAud < 0.005`. That is 1.72 render quanta,
+  // and two clean baselines of the same quantity measured 5.80 ms and 2.90 ms —
+  // exactly 2 and 1 quanta of jitter — so the threshold sat one boundary
+  // crossing away from flipping for reasons that have nothing to do with the
+  // game. Both reads of ctx.currentTime are independently quantised, so a
+  // difference of a couple of quanta is the instrument and not a cost. What
+  // would NOT be the instrument is scheduling work that grows with the burst (a
+  // deferred queue filling up) or that costs more than the interval between
+  // rounds; those are the two things asserted, and the magnitude is measured in
+  // quanta rather than compared to a threshold nobody sourced.
+  report.measure('worst ctx.currentTime advance from round to gunshot call',
+    maxAud / quantum, 'render quanta',
+    `${ms(maxAud)} worst and ${ms(med(perRound.map((r) => r.dAudio)))} median over ${perRound.length} rounds `
+    + `against a ${ms(quantum)} quantum — a difference between two independently quantised clock reads`);
+  const audDrift = slope(perRound.map((r, i) => i), perRound.map((r) => r.dAudio)) * perRound.length;
+  report.check('gunshot scheduling does not accumulate lag across a burst',
+    Number.isFinite(audDrift) && Math.abs(audDrift) <= quantum,
+    `the round-to-schedule gap drifts ${ms(audDrift)} end to end over ${perRound.length} rounds, `
+    + `${(audDrift / quantum).toFixed(2)} of one ${ms(quantum)} quantum — a deferred scheduling queue would `
+    + 'show as a gap that grows with burst position');
+  report.check('gunshot scheduling costs less than the interval between rounds',
+    maxAud < minGap,
+    `worst advance ${ms(maxAud)} against the ${ms(minGap)} minimum gap between rounds, `
+    + `${(maxAud / minGap * 100).toFixed(1)}% of it; at 100% the scheduling itself would be the rate limiter`);
+
+  // Trigger press -> round. One tick, and that tick plus the scheduling lead is
+  // the engine's ENTIRE input-to-sound contribution. The end-to-end figure is
+  // that plus the platform path from section 1, and it is measured rather than
+  // asserted because the platform term dominates it and is not ours.
   const press = preFire.t;
   const inputToRound = lastShots.length ? lastShots[0] - press : NaN;
-  const endToEnd = inputToRound + total;
   report.check('trigger press to round is one simulated tick',
     Math.abs(inputToRound - DT) < 1e-9,
     `${ms(inputToRound)} at dt=${ms(DT)} — the round leaves on the first tick after the trigger goes down`);
-  under(report, 'end-to-end trigger-to-sound inside the imperceptible tier',
-    'competitive_audio_latency_target', endToEnd);
-  under(report, 'end-to-end trigger-to-sound under the hard ceiling',
-    'competitive_audio_latency_ceiling', endToEnd);
-  report.check('engine-added scheduling lead measured',
-    Number.isFinite(perRound[0]?.lead),
-    `the player gunshot envelope is scheduled ${ms(perRound[0].lead)} ahead of ctx.currentTime `
-    + `(max over the burst ${ms(Math.max(...perRound.map((r) => r.lead)))}) — audio.js writes T = ctx.currentTime, `
-    + 'so the engine adds no lead of its own and the whole budget is the output path');
 
-  // A zero lead is not free. The audio thread has already rendered up to
-  // currentTime, so an envelope whose first setValueAtTime lands at exactly
-  // currentTime starts in the past and is clamped to the next block boundary.
-  // The gunshot crack's attack is 1.2 ms, which is under half a render quantum,
-  // so the transient this game is proudest of is the part being quantised away.
+  const leads = perRound.map((r) => r.lead);
+  const engineBudget = inputToRound + med(leads);
+  const tierTarget = sourcedAudio('competitive_audio_latency_target').value;
+  const ceiling = sourcedAudio('competitive_audio_latency_ceiling').value;
+  report.check('the engine\'s own trigger-to-schedule budget is inside the imperceptible tier',
+    engineBudget <= tierTarget,
+    `one ${ms(inputToRound)} tick plus a ${ms(med(leads))} median scheduling lead = ${ms(engineBudget)}, `
+    + `${(engineBudget / tierTarget * 100).toFixed(1)}% of the ${ms(tierTarget)} bound. This is the part of `
+    + `the budget the engine decides; the ${ms(platform)} platform path is measured separately because no `
+    + `change here can move it. ${cite('competitive_audio_latency_target')}`);
+  report.measure('end-to-end trigger to sound at the ear', (engineBudget + platform) * 1000, 'ms',
+    `${ms(engineBudget)} engine + ${ms(platform)} headless-Chromium output path, against a ${ms(tierTarget)} `
+    + `target and a ${ms(ceiling)} ceiling. The platform term is `
+    + `${(platform / (engineBudget + platform) * 100).toFixed(0)}% of the total, which is why this is a `
+    + 'measurement and not a check');
+
+  // A zero lead is not free, and it is the engine's decision. The audio thread
+  // has already rendered up to currentTime, so an envelope whose first
+  // setValueAtTime lands at exactly currentTime starts in the past and is
+  // clamped forward to the next block boundary. The gunshot crack's attack is
+  // 1.2 ms, under half a render quantum, so the transient this game is proudest
+  // of was the part being quantised away. audio.js now schedules one quantum
+  // ahead, which is also the direction BT.1359-1 says to err in.
   report.check('gunshot envelope is scheduled at least one render quantum ahead',
-    perRound.every((r) => r.lead >= quantum - 1e-9),
-    `lead ${ms(perRound[0].lead)} vs the 128-frame quantum ${ms(quantum)}: the 1.2 ms crack attack `
-    + `is ${(0.0012 / quantum).toFixed(2)} quanta long and its start time is in the audio thread's past. `
-    + src('web_audio_render_quantum'));
+    perRound.length > 0 && perRound.every((r) => r.lead >= quantum - 1e-9),
+    `lead median ${ms(med(leads))}, min ${ms(Math.min(...leads))}, max ${ms(Math.max(...leads))} over `
+    + `${perRound.length} rounds vs the ${QUANTUM_FRAMES}-frame quantum ${ms(quantum)}: the crack's 1.2 ms `
+    + `attack is ${(0.0012 / quantum).toFixed(2)} quanta long, so at zero lead its start time is in the `
+    + `audio thread's past. ${cite('web_audio_render_quantum')}`);
 
   /* ---------------------------------------- 3. impact() vs speed of sound -- */
   //
-  // The control case. impact() computes ctx.currentTime + distance/343, so if
-  // the recorder cannot see a slope here it is the recorder that is broken, not
-  // the game — which is what makes section 4's flat line evidence instead of an
+  // The control case. impact() computes now + distance/SPEED_OF_SOUND, so if the
+  // recorder cannot see a slope here it is the recorder that is broken, not the
+  // game — which is what makes section 4's numbers evidence instead of an
   // artefact. 'stone' is used throughout because it builds exactly one source,
   // so onset and source lifetime are unambiguous; 'metal' adds a ringing
   // oscillator and would make firstStop mean two different things.
@@ -538,45 +576,54 @@ export default async function run(sim, report) {
 
   report.check('impact() delay grows with distance',
     impLead[impLead.length - 1] > impLead[0] + 0.1,
-    `lead ${DISTS.map((d, i) => `${d}m:${(impLead[i] * 1000).toFixed(1)}`).join(' ')} ms `
-    + `over ${DISTS.length} distances`);
-  bracket(report, 'impact() implied speed of sound', 'speed_of_sound_air', impSpeed, ' m/s');
-  const impErr = Math.max(...impacts.map((r, i) => Math.abs(impLead[i] - r.d / SOS)));
-  // Tolerance is one render quantum, not zero: the lead is a difference between
-  // two reads of ctx.currentTime a few microseconds apart, and probe() retries
-  // until they agree, but a residual of a quantum is instrument noise rather
-  // than a game defect. The signal being separated from noise here is 0 vs
-  // 233 ms, so 3 ms of slack costs nothing.
-  report.check('every impact distance matches distance/343 individually',
-    impErr < Math.max(0.003, quantum),
-    `worst residual against distance/${SOS} across ${DISTS.length} distances ${ms(impErr)} `
-    + `(tolerance one ${ms(quantum)} render quantum); 80 m expected ${ms(80 / SOS)} measured `
-    + `${ms(impLead[DISTS.indexOf(80)])}; probe retries ${impacts.map((r) => r.retries).join('')}`);
+    `lead ${DISTS.map((d, i) => `${d}m:${(impLead[i] * 1000).toFixed(1)}`).join(' ')} ms over `
+    + `${DISTS.length} distances`);
+  report.reached('impact() implied speed of sound is a finite number', impSpeed,
+    `slope ${impSlope.toExponential(3)} s/m over ${DISTS.length} distances gives ${fx(impSpeed)} m/s; a flat `
+    + 'line gives an infinite speed and must fail here rather than arrive downstream as one');
+  report.against('impact() implied speed of sound', impSpeed, 'audio', 'speed_of_sound_air');
 
-  // The bug the delay hides. noise() stops its buffer source at
+  // THE RESIDUAL TOLERANCE, and why it is two quanta rather than a round 3 or
+  // 5 ms. The lead is onset - ctxBefore: two reads of ctx.currentTime, one by
+  // the recorder and one inside audio.js, each independently snapped to a
+  // 128-frame block. probe() retries until no boundary falls between them, but
+  // the residual that survives is bounded by the quantisation of the two reads,
+  // which is 2 * 128/sampleRate and nothing else. That number comes out of the
+  // Web Audio spec rather than out of a preference for round numbers, and the
+  // signal it has to separate is 0 ms from 233 ms.
+  const RESID = 2 * quantum;
+  const impErr = Math.max(...impacts.map((r, i) => Math.abs(impLead[i] - r.d / SOS)));
+  report.check('every impact distance matches distance/speed-of-sound individually',
+    impErr <= RESID,
+    `worst residual against distance/${SOS} across ${DISTS.length} distances ${ms(impErr)}, tolerance `
+    + `2 x ${ms(quantum)} = ${ms(RESID)}, one quantum per clock read; 80 m expected ${ms(80 / SOS)} measured `
+    + `${ms(impLead[DISTS.indexOf(80)])}; probe retries ${impacts.map((r) => r.retries).join('')}. ${cite('speed_of_sound_air')}`);
+
+  // The bug the delay used to hide. noise() stopped its buffer source at
   // ctx.currentTime + duration + 0.05 — computed from NOW, not from the delayed
-  // onset T — so past a certain distance the entire envelope is written after
-  // the source has already been stopped and the impact is silent. The cutoff is
+  // onset — so past a certain distance the entire envelope was written after the
+  // source had already been stopped and the impact was silent. The cutoff is
   // measured rather than derived, because 'stone' duration is a constant and
   // constants lie.
   const dead = impacts.filter((r) => r.firstStop !== null && r.onset >= r.firstStop);
   const live = impacts.filter((r) => r.firstStop !== null && r.onset < r.firstStop);
   const cutoff = dead.length ? `${live.length ? live[live.length - 1].d : 0}..${dead[0].d} m` : `beyond ${DISTS[DISTS.length - 1]} m`;
+  const far = impacts[impacts.length - 1];
   report.check('a delayed impact still has a live source at its own onset',
     dead.length === 0,
     `${dead.length}/${impacts.length} distances schedule the whole envelope after their noise source stopped `
-    + `(${dead.map((r) => `${r.d}m: onset +${(1000 * (r.onset - r.ctxBefore)).toFixed(0)}ms vs stop +${(1000 * (r.firstStop - r.ctxBefore)).toFixed(0)}ms`).join(', ')}) `
-    + `— silent impacts start somewhere in ${cutoff}, inside SPEC.range of 220 m`);
+    + `(${dead.map((r) => `${r.d}m: onset +${(1000 * (r.onset - r.ctxBefore)).toFixed(0)}ms vs stop +${(1000 * (r.firstStop - r.ctxBefore)).toFixed(0)}ms`).join(', ') || 'none'}) `
+    + `— silent impacts would begin somewhere in ${cutoff}, inside SPEC.range of 220 m. Margin between onset `
+    + `and stop at ${far.d} m: ${ms(far.firstStop - far.onset)}`);
 
-  /* ------------------------------- 4. distant gunfire — the required red -- */
+  /* ------------------------------------------------- 4. distant gunfire -- */
   //
-  // gunshot(distance) computes `const delay = distance / 343` and then uses
-  // distance only for attenuation, filter cutoff and the slapback tail. The
-  // delay IS applied to T inside the current source — read it and you would
-  // conclude the bug does not exist. Only the scheduled onset shows that it
-  // does, which is the entire reason this file measures onsets. Measured here
-  // both by direct probe (clean, one variable) and end-to-end through a real
-  // enemy engagement (slow, but it is the path a player is on).
+  // gunshot(distance) computes `distance / SPEED_OF_SOUND` and schedules every
+  // element at T = now + lead + delay. Reading the source would tell you that;
+  // only the scheduled onset can tell you whether the sound the listener gets
+  // agrees, which is the entire reason this file measures onsets. Measured both
+  // by direct probe (clean, one variable) and end-to-end through a real enemy
+  // engagement (slow, but it is the path a player is on).
   const shots = [];
   for (const d of DISTS) {
     // eslint-disable-next-line no-await-in-loop
@@ -584,55 +631,73 @@ export default async function run(sim, report) {
   }
   const gunLead = shots.map((r) => r.onset - r.ctxBefore);
   const gunSlope = slope(shots.map((r) => r.d), gunLead);
+  const gunSpeed = 1 / gunSlope;
 
   report.check('gunshot() onset is delayed by distance at all',
     gunSlope > 0.5 / SOS,
     `onset lead vs distance: ${DISTS.map((d, i) => `${d}m:${(gunLead[i] * 1000).toFixed(1)}`).join(' ')} ms. `
-    + `Slope ${gunSlope.toExponential(3)} s/m against the ${(1 / SOS).toExponential(3)} s/m that `
-    + `${SOS} m/s requires — a flat line would mean the report leaves the muzzle and arrives at the ear `
-    + 'in the same instant, which is what the brief for this suite claimed and what the negative control below refutes');
-  report.check('gunshot() implied speed of sound',
-    Number.isFinite(1 / gunSlope) && Math.abs(1 / gunSlope - SOS) <= 2,
-    `implied ${gunSlope === 0 ? 'infinite' : `${fx(1 / gunSlope)} m/s`} against ${SOS} m/s. ${src('speed_of_sound_air')}`);
+    + `Slope ${gunSlope.toExponential(3)} s/m against the ${(1 / SOS).toExponential(3)} s/m that ${SOS} m/s `
+    + 'requires — a flat line would mean the report leaves the muzzle and arrives at the ear in the same '
+    + 'instant, which is what the brief for this suite claimed and what the negative control below refutes');
+  report.reached('gunshot() implied speed of sound is a finite number', gunSpeed,
+    `slope ${gunSlope.toExponential(3)} s/m gives ${fx(gunSpeed)} m/s`);
+  report.against('gunshot() implied speed of sound', gunSpeed, 'audio', 'speed_of_sound_air');
 
+  // The two propagation paths must agree, because they are supposed to be one
+  // constant. audio.js had `343` written out twice — once in gunshot(), once in
+  // impact() — and two literals that must stay equal are a divergence waiting
+  // for whoever edits one of them. They are now a single SPEED_OF_SOUND, and
+  // this is the check that notices if they stop being one: the tolerance is the
+  // sourced +/-2 m/s, so a typo in either function fails here even though each
+  // function on its own might still look plausible.
+  report.check('gunshot() and impact() propagate at the same speed',
+    Number.isFinite(gunSpeed) && Number.isFinite(impSpeed) && Math.abs(gunSpeed - impSpeed) <= SOS_TOL,
+    `gunshot ${fx(gunSpeed)} m/s vs impact ${fx(impSpeed)} m/s, difference `
+    + `${fx(Math.abs(gunSpeed - impSpeed))} m/s against the sourced +/-${SOS_TOL} m/s on ${SOS} m/s — one `
+    + `constant, asserted through two independent call paths. ${cite('speed_of_sound_air')}`);
+
+  const leadThr = sourcedAudio('av_desync_detectability_audio_leading').value;
+  const lagThr = sourcedAudio('av_desync_detectability_audio_lagging').value;
   for (const d of [40, 80, 120]) {
     const i = DISTS.indexOf(d);
     report.check(`enemy report at ${d} m arrives ${(1000 * d / SOS).toFixed(0)} ms late`,
-      Math.abs(gunLead[i] - d / SOS) < 0.005,
+      Math.abs(gunLead[i] - d / SOS) <= RESID,
       `scheduled ${ms(gunLead[i])} after the shot, physics requires ${ms(d / SOS)}, error `
-      + `${ms(gunLead[i] - d / SOS)}; scheduling it instantly instead would put the report `
-      + `${((d / SOS) / 0.045).toFixed(1)}x past the 45 ms audio-leads-video detectability threshold. `
-      + src('av_desync_detectability_audio_leading'));
+      + `${ms(gunLead[i] - d / SOS)} against a ${ms(RESID)} two-quantum tolerance; scheduling it instantly `
+      + `instead would put the report ${((d / SOS) / leadThr).toFixed(1)}x past the ${ms(leadThr)} `
+      + `audio-leads-video detectability threshold. ${cite('av_desync_detectability_audio_leading')}`);
   }
-  // The asymmetry in BT.1359-1 is the reason the direction of any residual
-  // matters: early sound is physically impossible, late sound is not, so an
-  // engine that must be wrong should be late. Asserted with a one-quantum
-  // allowance because the residual here is instrument noise, not design.
+  // The asymmetry in BT.1359-1 is why the DIRECTION of a residual matters: early
+  // sound is physically impossible, late sound is not, so an engine that must be
+  // wrong should be late. One quantum of allowance, because the residual here is
+  // instrument quantisation rather than design.
+  const lateResid = gunLead[DISTS.indexOf(80)] - 80 / SOS;
   report.check('distant gunfire errs late rather than early',
-    gunLead[DISTS.indexOf(80)] - 80 / SOS >= -quantum,
-    `at 80 m the residual is ${ms(gunLead[DISTS.indexOf(80)] - 80 / SOS)} (positive = late); detectability is `
-    + `45 ms early vs 125 ms late, so early is the ${(0.125 / 0.045).toFixed(1)}x more sensitive direction. ${src('av_desync_detectability_audio_leading')}`);
+    lateResid >= -quantum,
+    `at 80 m the residual is ${ms(lateResid)} (positive = late); detectability is ${ms(leadThr)} early vs `
+    + `${ms(lagThr)} late, so early is the ${(lagThr / leadThr).toFixed(1)}x more sensitive direction. `
+    + cite('av_desync_detectability_audio_leading'));
 
-  // THE DEFECT THAT IS ACTUALLY THERE. gunshot() delays its envelope correctly
-  // and then kills the sources underneath it: noise() stops each buffer source
-  // at ctx.currentTime + duration + 0.05, computed from NOW rather than from the
-  // delayed onset T. The crack element runs 0.06 s, so its source is stopped
-  // 0.11 s from now, and any shot further away than 343 * 0.11 = 38 m has its
+  // The defect that WAS there. gunshot() delayed its envelope correctly and then
+  // killed the sources underneath it: noise() stopped each buffer source at
+  // ctx.currentTime + duration + 0.05, computed from NOW rather than from the
+  // delayed onset. The crack element runs 0.06 s, so its source was stopped
+  // 0.11 s from now, and any shot further away than 343 * 0.11 = 38 m had its
   // crack envelope written entirely after the source that would have carried it.
   // The crack is the 1.2 ms broadband transient that makes a gunshot read as a
-  // gunshot; past ~38 m the player hears the body and the tail without it. The
-  // low thump escapes because it is an oscillator started at T.
-  // This is measured, not derived: the stop times come off the recorder.
+  // gunshot; past ~38 m the player heard the body and the tail without it. The
+  // low thump escaped because it is an oscillator started at T.
+  // Measured, not derived: the stop times come off the recorder.
   const deadPer = shots.map((r) => r.stops.filter((s) => s < r.onset).length);
   const firstDead = shots.findIndex((r, i) => deadPer[i] > 0);
+  const farShot = shots[shots.length - 1];
   report.check('a distant gunshot still has every source alive at its own onset',
     deadPer.every((n) => n === 0),
-    `sources already stopped at the scheduled onset, by distance: `
-    + `${DISTS.map((d, i) => `${d}m:${deadPer[i]}/${shots[i].nSources}`).join(' ')}. `
-    + `The first element dies between ${firstDead > 0 ? DISTS[firstDead - 1] : 0} and `
-    + `${firstDead >= 0 ? DISTS[firstDead] : '>' + DISTS[DISTS.length - 1]} m; at 80 m the earliest source `
-    + `stops ${ms(shots[DISTS.indexOf(80)].firstStop - shots[DISTS.indexOf(80)].ctxBefore)} in while the `
-    + `envelope starts ${ms(gunLead[DISTS.indexOf(80)])} in`);
+    'sources already stopped at the scheduled onset, by distance: '
+    + `${DISTS.map((d, i) => `${d}m:${deadPer[i]}/${shots[i].nSources}`).join(' ')}. First element to die: `
+    + `${firstDead < 0 ? `none out to ${DISTS[DISTS.length - 1]} m` : `between ${firstDead > 0 ? DISTS[firstDead - 1] : 0} and ${DISTS[firstDead]} m`}; `
+    + `at ${farShot.d} m the earliest source stops ${ms(farShot.firstStop - farShot.ctxBefore)} in while the `
+    + `envelope starts ${ms(gunLead[shots.length - 1])} in`);
 
   // Negative control. Runs the identical maths over a deliberately broken
   // gunshot so the green checks above are known to be capable of going red.
@@ -644,14 +709,14 @@ export default async function run(sim, report) {
   const ctrlLead = ctrl.map((r) => r.onset - r.ctxBefore);
   const ctrlSlope = slope(ctrl.map((r) => r.d), ctrlLead);
   const ctrlWouldPass = ctrlSlope > 0.5 / SOS
-    || [40, 80, 120].some((d) => Math.abs(ctrlLead[DISTS.indexOf(d)] - d / SOS) < 0.005);
+    || [40, 80, 120].some((d) => Math.abs(ctrlLead[DISTS.indexOf(d)] - d / SOS) <= RESID);
   report.check('the distance-delay checks can go red (negative control)',
     !ctrlWouldPass,
-    `a gunshot rebuilt with distance used for level only measures slope `
+    'a gunshot rebuilt with distance used for level only measures slope '
     + `${ctrlSlope.toExponential(3)} s/m and leads ${DISTS.map((d, i) => `${d}m:${(ctrlLead[i] * 1000).toFixed(1)}`).join(' ')} ms, `
     + `so the checks above ${ctrlWouldPass ? 'WOULD STILL PASS and are decorative' : 'correctly reject it'}. `
-    + 'The real gunshot() passes them because src/audio.js already applies distance/343 — the brief\'s '
-    + 'claim that it does not is contradicted by an unmodified working tree');
+    + 'The real gunshot() passes them because src/audio.js applies distance/343 and always has — the '
+    + "brief's claim that it does not is contradicted by an unmodified working tree");
 
   // End-to-end, through director.onFire -> enemyShoot -> audio.gunshot. Placed
   // down a lane cleared by the harness, because an enemy that cannot see the
@@ -681,41 +746,55 @@ export default async function run(sim, report) {
   const enemyShots = (await sim.eval(() => window.__AUD.calls.slice()))
     .filter((c) => c.name === 'gunshot' && c.args[0] > 1);
 
-  if (!enemyShots.length) {
-    report.check('an engaged enemy fired at all (end-to-end distant gunfire)', false,
-      `0 audio.gunshot calls with a nonzero distance over 4.0 s with an enemy placed ${fx(EN_D)} m away `
-      + `down a ${fx(lane.clear)} m lane at ${lane.deg} deg — with no enemy shot the end-to-end distance `
-      + 'delay could not be measured, so treat this as an instrument failure rather than a passing game');
-  } else {
-    const e0 = enemyShots[0];
-    const eLead = e0.onset - e0.ctxBefore;
-    const eD = e0.args[0];
-    report.check('end-to-end: a real enemy report carries its propagation delay',
-      Math.abs(eLead - eD / SOS) < 0.005,
-      `${enemyShots.length} enemy gunshots, first at ${fx(eD)} m scheduled with ${ms(eLead)} of lead against `
-      + `${ms(eD / SOS)} required; mean lead over all of them ${ms(enemyShots.reduce((s, c) => s + c.onset - c.ctxBefore, 0) / enemyShots.length)} `
-      + `at a mean distance of ${fx(enemyShots.reduce((s, c) => s + c.args[0], 0) / enemyShots.length)} m`);
-    // A DIFFERENT observable with the same root cause, kept because it is the
-    // one a player feels: enemyShoot resolves the round instantly (hitscan) AND
-    // schedules the report instantly, so there is no interval at all between
-    // being hit and hearing the shot. Real supersonic fire gives the target the
-    // bullet first and the report a long time later, and that interval is the
-    // cue a player uses to locate a shooter. Here it is exactly zero.
-    const warning = eD / SOS - eD / 900; // 900 m/s is a generic 5.56 muzzle figure, used only to size the gap
-    report.check('there is any interval between taking a distant round and hearing it',
-      eLead > 0.010,
-      `report lead ${ms(eLead)} at ${fx(eD)} m while the bullet resolves on the same tick, so the `
-      + `crack-to-report interval a player would use to locate the shooter is ${ms(eLead)}; the geometry `
-      + `implies about ${ms(warning)}. No sourced CoD figure for this interval — the 10 ms floor asserted `
-      + 'here is a structural "nonzero", not a target');
+  const fired = enemyShots.length > 0;
+  report.check('an engaged enemy fired at all (end-to-end distant gunfire)', fired,
+    `${enemyShots.length} audio.gunshot calls with a nonzero distance over 4.0 s, enemy placed ${fx(EN_D)} m `
+    + `away down a ${fx(lane.clear)} m lane at ${lane.deg} deg — with no enemy shot the end-to-end distance `
+    + 'delay could not be measured, so a zero here is an instrument failure rather than a passing game');
+  if (fired) {
+    // A DISTRIBUTION, not enemyShots[0]. The residual is deterministic here, so
+    // the first sample happened to be representative — but "happened to be" is
+    // not a property of the test, and the worst case over every shot is.
+    const eLeads = enemyShots.map((c) => c.onset - c.ctxBefore);
+    const eDists = enemyShots.map((c) => c.args[0]);
+    const eResid = enemyShots.map((c, i) => eLeads[i] - eDists[i] / SOS);
+    const worstResid = Math.max(...eResid.map(Math.abs));
+    report.check('end-to-end: every real enemy report carries its propagation delay',
+      worstResid <= RESID,
+      `${enemyShots.length} enemy gunshots from ${fx(Math.min(...eDists))} to ${fx(Math.max(...eDists))} m; `
+      + `worst residual ${ms(worstResid)}, median ${ms(med(eResid))}, against a ${ms(RESID)} two-quantum `
+      + `tolerance. Median lead ${ms(med(eLeads))} at a median ${fx(med(eDists))} m, which requires `
+      + `${ms(med(eDists) / SOS)}`);
 
-    // Same source-lifetime defect as the sweep, on the path a player is on.
-    const eDead = e0.stops.filter((s) => s < e0.onset).length;
+    // A different observable with the same root cause, kept because it is the
+    // one a player feels: enemyShoot resolves the round on the tick it is fired,
+    // so the report's propagation delay IS the crack-to-report interval a player
+    // uses to locate a shooter. There is no sourced figure for how long that
+    // should be, so the magnitude is measured and only its SIGN is asserted — a
+    // report arriving with or before the bullet is physically impossible, and
+    // that is a real invariant rather than a threshold somebody picked.
+    const worstEarly = Math.min(...eLeads);
+    report.check('a distant report always arrives after the round that caused it',
+      worstEarly > 0,
+      `earliest lead over ${enemyShots.length} shots ${ms(worstEarly)}, median ${ms(med(eLeads))}; the round `
+      + 'resolves on the tick it is fired, so a non-positive lead would mean the sound of the shot reached '
+      + 'the player no later than the bullet did');
+    report.measure('crack-to-report interval at the measured engagement range',
+      med(eLeads) * 1000, 'ms',
+      `median over ${enemyShots.length} shots at a median ${fx(med(eDists))} m. No sourced CoD figure for `
+      + `this interval; for scale, a generic 5.56 muzzle velocity of 900 m/s puts the bullet's own flight at `
+      + `${ms(med(eDists) / 900)}, so the report trails it by roughly ${ms(med(eLeads) - med(eDists) / 900)}`);
+
+    // Same source-lifetime defect as the sweep, on the path a player is on, and
+    // over every shot rather than the first.
+    const eDead = enemyShots.map((c) => c.stops.filter((s) => s < c.onset).length);
     report.check('a real enemy report keeps every element it scheduled',
-      eDead === 0,
-      `${eDead} of ${e0.nSources} sources were already stopped when the ${ms(eLead)} delayed envelope `
-      + `began, at ${fx(eD)} m; earliest source stop ${ms(e0.firstStop - e0.ctxBefore)} in. The crack `
-      + 'transient is the element that dies, so the report is audible but hard to localise');
+      eDead.every((n) => n === 0),
+      `${eDead.reduce((s, n) => s + n, 0)} dead sources across ${enemyShots.length} reports of `
+      + `${enemyShots[0].nSources} sources each, at a median ${fx(med(eDists))} m; earliest source stop is `
+      + `${ms(Math.min(...enemyShots.map((c) => c.firstStop - c.ctxBefore)))} in against a median onset at `
+      + `${ms(med(eLeads))}. The crack transient is the element that dies first, so a broken report is `
+      + 'audible but hard to localise');
   }
 
   /* ----------------------------- 5. hitmarker and damage feedback latency -- */
@@ -737,12 +816,11 @@ export default async function run(sim, report) {
   await sim.eval(() => window.__AUD.reset());
   await sim.clearEvents();
 
-  if (!aim.clear) {
-    report.check('hitmarker latency measurable (a clear shot at an enemy)', false,
-      `aimAt reported clear=false at ${fx(aim.distance)} m — world geometry at ${fx(aim.worldDist)} m is in `
-      + `front of the body at ${fx(aim.enemyDist)} m, so no damage could be applied and the hitmarker `
-      + 'latency below would be a measurement of a wall');
-  } else {
+  report.check('hitmarker latency is measurable (a clear shot at an enemy)', !!aim.clear,
+    `aimAt reported clear=${aim.clear} at ${fx(aim.distance)} m: world geometry at ${fx(aim.worldDist)} m `
+    + `against the body at ${fx(aim.enemyDist)} m. With the wall in front no damage is applied and the `
+    + 'hitmarker latency below would be a measurement of geometry');
+  if (aim.clear) {
     await sim.drive({ seconds: 0.6, dt: DT, input: IN({ fire: true, ads: true }) });
     const fbEvs = await sim.events();
     const fbCalls = await sim.eval(() => window.__AUD.calls.slice());
@@ -762,25 +840,36 @@ export default async function run(sim, report) {
       }).filter(Boolean);
       const worstSim = Math.max(...pairs.map((p) => Math.abs(p.dSim)));
       const worstAud = Math.max(...pairs.map((p) => Math.abs(p.dAudio)));
+      const hmLeads = pairs.map((p) => p.lead);
       report.check('hitmarker is on the same tick as the damage it confirms',
         pairs.length === dmg.length && worstSim === 0,
         `${pairs.length}/${dmg.length} hits matched; worst simulated gap ${ms(worstSim)}, worst `
-        + `AudioContext gap ${ms(worstAud)}, scheduling lead ${ms(pairs[0].lead)}`);
-      under(report, 'hitmarker total latency (tick + output path) under the hard ceiling',
-        'competitive_audio_latency_ceiling', worstSim + pairs[0].lead + total);
+        + `AudioContext gap ${ms(worstAud)} = ${(worstAud / quantum).toFixed(2)} quanta`);
+      report.check('every hitmarker is scheduled at least one render quantum ahead',
+        hmLeads.every((l) => l >= quantum - 1e-9),
+        `lead median ${ms(med(hmLeads))}, min ${ms(Math.min(...hmLeads))} over ${pairs.length} hits against a `
+        + `${ms(quantum)} quantum; the hitmarker's attack is 4 ms, so a zero-lead schedule loses the first `
+        + `${(quantum / 0.004 * 100).toFixed(0)}% of it to block clamping`);
+      report.measure('hitmarker total latency at the ear', (worstSim + med(hmLeads) + platform) * 1000, 'ms',
+        `${ms(worstSim)} simulated + ${ms(med(hmLeads))} engine lead + ${ms(platform)} platform path against a `
+        + `${ms(ceiling)} ceiling. The engine contributes ${ms(worstSim + med(hmLeads))} of it and headless `
+        + `Chromium the rest, which is why the ceiling is quoted rather than asserted. ${cite('competitive_audio_latency_ceiling')}`);
 
-      // Ordering finding, not a defect claim: the hitmarker is a UI cue and is
-      // right to be instant, but impact('flesh', d) is delayed by d/343, so the
-      // confirmation beep arrives before the sound of the bullet landing. At
-      // 18 m that is 52 ms of the two cues for one event being that far apart.
+      // Ordering, over every sample rather than the first of seven. The
+      // hitmarker is a UI cue and is right to be instant; impact('flesh', d) is
+      // delayed by d/343, so the confirmation beep necessarily precedes the
+      // sound of the round landing. That is not a defect — but the ORDER is an
+      // invariant, and if it ever inverted either the hitmarker had grown a
+      // delay or the flesh impact had lost its propagation.
       if (flesh.length) {
-        const fLead = flesh[0].onset - flesh[0].ctxBefore;
-        report.check('hit feedback cues are ordered consistently with the geometry',
-          true,
-          `hitmarker lead ${ms(pairs[0].lead)} vs flesh-impact lead ${ms(fLead)} at ${fx(aim.distance)} m `
-          + `— the UI beep precedes the sound of the round landing by ${ms(fLead - pairs[0].lead)}. `
-          + 'No sourced target: an instant hit confirmation is a deliberate convention, '
-          + 'the delayed flesh impact is physically correct, and both being true at once is the finding');
+        const fLeads = flesh.map((c) => c.onset - c.ctxBefore);
+        const worstMargin = Math.min(...fLeads) - Math.max(...hmLeads);
+        report.check('the UI hit confirmation precedes the sound of the round landing',
+          worstMargin > 0,
+          `${flesh.length} flesh impacts lead by ${ms(med(fLeads))} median (min ${ms(Math.min(...fLeads))}) `
+          + `against ${pairs.length} hitmarkers at ${ms(med(hmLeads))} median (max ${ms(Math.max(...hmLeads))}); `
+          + `worst-case margin ${ms(worstMargin)} at ${fx(aim.distance)} m, where geometry requires `
+          + `${ms(aim.distance / SOS)} of propagation for the impact and none for a UI beep`);
       }
     }
   }
@@ -811,11 +900,11 @@ export default async function run(sim, report) {
   const hurtCalls = (await sim.eval(() => window.__AUD.calls.slice())).filter((c) => c.name === 'hurt');
   const dmgTaken = hurtEvs.filter((e) => e.kind === 'player.damage');
 
-  if (!dmgTaken.length) {
-    report.check('damage-taken feedback latency measurable', false,
-      `the player took 0 hits over 6.0 s from an enemy at ${fx(DDIST)} m, so hurt() latency could not be `
-      + `measured; ${hurtCalls.length} hurt calls were recorded, which should also be 0 if this is real`);
-  } else {
+  report.check('damage-taken feedback latency is measurable', dmgTaken.length > 0,
+    `the player took ${dmgTaken.length} hits over 6.0 s from an enemy at ${fx(DDIST)} m and `
+    + `${hurtCalls.length} hurt cues were recorded; zero hits means hurt() latency was not measured at all, `
+    + 'and both counts have to be zero together or the instrument disagrees with itself');
+  if (dmgTaken.length) {
     const pairs = dmgTaken.map((d) => {
       const cue = hurtCalls.find((c) => c.sim === d.sim);
       return cue ? { dSim: cue.sim - d.sim, lead: cue.onset - cue.ctxBefore } : null;
@@ -823,19 +912,25 @@ export default async function run(sim, report) {
     report.check('hurt cue is on the same tick as the damage the player takes',
       pairs.length === dmgTaken.length && pairs.every((p) => p.dSim === 0),
       `${dmgTaken.length} hits taken over 6.0 s at ${fx(DDIST)} m, ${hurtCalls.length} hurt cues, `
-      + `${pairs.length} matched on the same tick; scheduling lead ${ms(pairs[0]?.lead)}`);
+      + `${pairs.length} matched on the same tick; scheduling lead median ${ms(med(pairs.map((p) => p.lead)))}`);
   }
 
   /* ------------------------------------------------ 6. the reload track -- */
   //
-  // Two reloads, measured entirely from the event log and the observed
-  // magazine animation. Nothing here reads SPEC.reloadTime or the 0.08/0.50/0.80
+  // Two reloads, measured entirely from the event log and the observed magazine
+  // animation. Nothing here reads SPEC.reloadTime or the 0.08/0.50/0.80
   // thresholds: the reload's duration is the interval over which `reloading` is
   // true, and the animation landmarks are read off magGroup.position.y as the
   // simulation actually moves it. That matters because the thresholds and the
   // animation comment in weapon.js DISAGREE — the comment describes seating
   // between 0.72 and 0.86 and the seat sound fires at 0.80 — and only the
   // observed animation can say which one the player sees.
+  //
+  // The cue-to-animation windows are ITU-R BT.1359-1's detectability pair
+  // (45 ms early / 125 ms late), not a tolerance of this file's choosing. An
+  // earlier revision allowed the release click +/-50 ms, which is a number with
+  // no provenance that happens to sit between the two sourced bounds and erases
+  // the asymmetry that is the whole point of them.
   for (const kind of ['tactical', 'empty']) {
     const empty = kind === 'empty';
     // eslint-disable-next-line no-await-in-loop
@@ -866,18 +961,20 @@ export default async function run(sim, report) {
 
     const iOn = rows.findIndex((r) => r.reloading === 1);
     const iOff = iOn < 0 ? -1 : rows.findIndex((r, i) => i > iOn && r.reloading === 0);
-    if (iOn < 0 || iOff < 0) {
-      report.check(`${kind} reload ran to completion`, false,
-        `reloading went ${iOn < 0 ? 'never true' : 'true but never false'} across 4.2 s; `
-        + `${calls.length} mechanical cues fired, so the phase measurements below are absent, not zero`);
-      continue;
-    }
+    // reached(), not check(): everything below is derived from these two indices
+    // and a -1 would arrive downstream as a plausible-looking zero duration.
+    const dur = iOn >= 0 && iOff >= 0 ? rows[iOff].t - rows[iOn].rs : null;
+    const ran = report.reached(`${kind} reload ran to completion`, dur,
+      iOn < 0 || iOff < 0
+        ? `reloading went ${iOn < 0 ? 'never true' : 'true but never false'} across 4.2 s; `
+          + `${calls.length} mechanical cues fired, so the phase measurements below are absent, not zero`
+        : `reloading was true for ${ms(dur)} across ${iOff - iOn} ticks of ${ms(DT_RELOAD)}`);
+    if (!ran) continue;
     const start = rows[iOn].rs;
-    const dur = rows[iOff].t - start;
     report.check(`${kind} reload start timestamp agrees with the reloading flag`,
       Math.abs(start - rows[iOn].t) <= DT_RELOAD + 1e-9,
-      `game-stamped reloadStart ${fx(start)} s vs first tick with reloading=true ${fx(rows[iOn].t)} s, `
-      + `gap ${ms(rows[iOn].t - start)}; measured duration ${ms(dur)} (+/-${ms(DT_RELOAD)} of tick quantisation)`);
+      `game-stamped reloadStart ${fx(start)} s vs first tick with reloading=true ${fx(rows[iOn].t)} s, gap `
+      + `${ms(rows[iOn].t - start)}; measured duration ${ms(dur)} (+/-${ms(DT_RELOAD)} of tick quantisation)`);
 
     // Animation landmarks, read off the running simulation.
     const span = rows.slice(iOn, iOff + 1);
@@ -889,13 +986,13 @@ export default async function run(sim, report) {
     const kinds = ['release', 'insert', 'seat'];
     const found = kinds.map((k) => calls.filter((c) => c.args[0] === k && c.sim >= start && c.sim <= rows[iOff].t));
 
-    report.check(`${kind} reload fires each mechanical cue exactly once`,
-      found.every((f) => f.length === 1),
+    const onceEach = found.every((f) => f.length === 1);
+    report.check(`${kind} reload fires each mechanical cue exactly once`, onceEach,
       kinds.map((k, i) => `${k}x${found[i].length}`).join(' ')
       + ` over ${ms(dur)}; other mechanical cues in the window: `
       + `${calls.filter((c) => !kinds.includes(c.args[0])).map((c) => c.args[0]).join(',') || 'none'}`);
 
-    if (found.every((f) => f.length === 1)) {
+    if (onceEach) {
       const [rel, ins, seat] = found.map((f) => f[0]);
       report.check(`${kind} reload cues are ordered release < insert < seat`,
         rel.sim < ins.sim && ins.sim < seat.sim,
@@ -905,28 +1002,35 @@ export default async function run(sim, report) {
       // Does each cue land in the part of the animation it names? The windows
       // are the observed magazine motion, so a re-timed animation moves the
       // window with it and only a genuine mismatch fails.
-      report.check(`${kind} 'release' fires as the magazine starts to drop`,
-        drop && Math.abs(rel.sim - drop.t) <= 0.05,
+      report.reached(`${kind} magazine visibly starts to drop`, drop ? ph(drop.t) : null,
+        drop
+          ? `first movement at phase ${ph(drop.t).toFixed(3)}, y ${fx(drop.magY)} m`
+          : 'magY never went below -0.001 m during the reload, so there is no visible drop for the release '
+            + 'click to be compared against (0 samples qualified)');
+      const dropLag = drop ? rel.sim - drop.t : NaN;
+      report.check(`${kind} 'release' click is inside the A/V detectability window of the magazine dropping`,
+        Number.isFinite(dropLag) && dropLag <= lagThr && dropLag >= -leadThr,
         `release at phase ${ph(rel.sim).toFixed(3)}, magazine first moves at phase `
-        + `${drop ? ph(drop.t).toFixed(3) : 'n/a'} — cue is ${ms(rel.sim - (drop?.t ?? NaN))} `
-        + `${rel.sim >= (drop?.t ?? 0) ? 'after' : 'before'} the visible motion`);
+        + `${drop ? ph(drop.t).toFixed(3) : 'n/a'} — cue is ${ms(dropLag)} `
+        + `${dropLag >= 0 ? 'after' : 'before'} the visible motion, against a window of ${ms(leadThr)} early `
+        + `to ${ms(lagThr)} late. ${cite('av_desync_detectability_audio_leading')}`);
 
       report.check(`${kind} 'insert' fires while the magazine is travelling back in`,
-        bottom && seated && ins.sim > bottom.t && ins.sim < seated.t,
+        !!(bottom && seated) && ins.sim > bottom.t && ins.sim < seated.t,
         `insert at phase ${ph(ins.sim).toFixed(3)}, magazine bottoms out at ${ph(bottom.t).toFixed(3)} `
         + `(y ${fx(bottom.magY)} m) and is home by ${seated ? ph(seated.t).toFixed(3) : 'n/a'} — `
         + `${ms(ins.sim - bottom.t)} into a ${ms((seated?.t ?? NaN) - bottom.t)} insertion stroke`);
 
-      // The A/V sync check with teeth. The magazine is visually home well
-      // before the click that says it is, and the gap is measured against
-      // ITU-R BT.1359-1 rather than against a number of our own.
+      // The A/V sync check with teeth. The magazine is visually home well before
+      // the click that says it is, and the gap is measured against ITU-R
+      // BT.1359-1 rather than against a number of our own. The gate that sets it
+      // is weapon.js's 0.80 phase threshold, which this agent does not own.
       const seatLag = seated ? seat.sim - seated.t : NaN;
-      report.check(`${kind} 'seat' click is within the A/V detectability window of the magazine seating`,
-        Number.isFinite(seatLag) && seatLag <= (T('av_desync_detectability_audio_lagging')?.value ?? Infinity)
-          && seatLag >= -(T('av_desync_detectability_audio_leading')?.value ?? Infinity),
+      report.check(`${kind} 'seat' click is inside the A/V detectability window of the magazine seating`,
+        Number.isFinite(seatLag) && seatLag <= lagThr && seatLag >= -leadThr,
         `magazine is visually home at phase ${seated ? ph(seated.t).toFixed(3) : 'n/a'} and the seat click `
-        + `plays at ${ph(seat.sim).toFixed(3)}, ${ms(seatLag)} later on a ${ms(dur)} reload. `
-        + src('av_desync_detectability_audio_lagging'));
+        + `plays at ${ph(seat.sim).toFixed(3)}, ${ms(seatLag)} later on a ${ms(dur)} reload — `
+        + `${(seatLag / lagThr).toFixed(2)}x the ${ms(lagThr)} lagging bound. ${cite('av_desync_detectability_audio_lagging')}`);
     }
 
     // weapon.js documents "0.86-1.0 bolt release (empty reload only)" and
@@ -945,12 +1049,10 @@ export default async function run(sim, report) {
   }
 
   /* ------------------------------------------------- 7. coverage honesty -- */
-  const t = T('competitive_audio_latency_target');
-  report.check('audio targets are sourced non-CoD engineering guidance, not CoD figures',
-    !!t && /non-CoD/i.test(t.title ?? ''),
-    t
-      ? `audio_latency scope is covered by ${Object.keys(TARGETS.audio).length} targets, of which the `
-        + `perceptual thresholds are labelled "${(t.title ?? '').slice(0, 60)}" — no published Call of Duty `
-        + 'audio-latency figure exists, so every latency bound above is general game-audio literature'
-      : 'targets.mjs has no audio domain — every bound above was reported as a bare measurement');
+  const tierEntry = sourcedAudio('competitive_audio_latency_target');
+  report.check('audio latency bounds are sourced non-CoD engineering guidance, not CoD figures',
+    /non-CoD/i.test(tierEntry.title ?? ''),
+    `the audio domain carries ${Object.keys(TARGETS.audio).length} targets and the perceptual thresholds are `
+    + `labelled "${(tierEntry.title ?? '').slice(0, 60)}" — no published Call of Duty audio-latency figure `
+    + 'exists, so every latency bound above is general game-audio literature and says so in its own detail');
 }
