@@ -19,6 +19,35 @@
 // SCOPE. This file is deliberately thin where the evidence is thin. Call missing() to get the scope
 // items that have no target at all, and print it — a suite that stays quiet about its blind spots
 // is implying coverage it does not have.
+//
+// SECOND VERIFICATION PASS (merged below the original four domains). A second pass was necessary
+// because the FIRST pass's verifiers ran out of search budget and returned roughly fifty values as
+// "unverified" WITHOUT ever testing them — an untested value was being reported as a failed value,
+// which understated coverage badly. A second set of verifiers re-queried those values with their own
+// independently-phrased searches and reproduced them. Everything in the `movement`, `physics`,
+// `audio`, `ai` domains, the `integrity` domain, and the MW3/BO6/MW2-2022 additions to `damage`
+// arrived on that second pass.
+//   'reproduced' (recorded here as confidence: 'corroborated') STILL MEANS ONLY THAT TWO
+//   INDEPENDENT SEARCHES AGREED. No primary source was read on either pass; hosts returned 403
+//   throughout. Do not read 'corroborated' as "verified against the shipping game".
+// Where the second pass produced a value that DUPLICATES an existing key from a different title, the
+// existing key was kept untouched and the new one added under a distinct, title-qualified name (for
+// example damage.health_mw2019 vs damage.health_mw2_2022 vs damage.health_mw3 vs damage.health_bo6,
+// and handling.xm4_base_movement_speed vs movement.base_walk_speed_legacy_iw). Two titles disagreeing
+// is DATA — both stay, each labelled with its title. Never resolve a cross-title disagreement by
+// deleting one side.
+//
+// SOURCING CLASSES. New entries carry an explicit `sourced` field, absent on first-pass entries
+// (undefined === 'external'):
+//   'external'      — an outside source (search-corroborated) states the figure. May still be
+//                     non-CoD general literature; the title says so when that is the case.
+//   'proxy-non-cod' — a number from a DIFFERENT game, recorded only as a placeholder anchor. Must
+//                     never be cited as a Call of Duty value and never counts as coverage.
+//   'internal'      — an invariant of THIS codebase, not a published figure. No external source
+//                     exists or can exist. Does not count as an external/sourced target and does not
+//                     count as scope coverage from research.
+// missing() and counts() both respect these classes, so a proxy or an internal invariant cannot
+// silently inflate coverage.
 
 const DEG = Math.PI / 180;
 
@@ -704,6 +733,1055 @@ export const TARGETS = Object.freeze({
         + '(b) the M4A1 profile only closes arithmetically at 100 HP — 4 x 30 = 120 >= 100 with 3 x 30 = 90 < 100 '
         + 'brackets it from above, and 5 x 20 = 100 is an exact fit that only works at 100.',
     }),
+
+    // ---- second verification pass: MW2019 hit-location multipliers ----
+    m4a1_mw2019_headshot_multiplier: Object.freeze({
+      value: 1.4,
+      unit: 'x (dimensionless)',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Modern Warfare (2019) — M4A1, and most weapons',
+      source: 'https://callofduty.fandom.com/wiki/Damage_Multiplier',
+      confidence: 'corroborated',
+      note: '1.4x, accept 1.35-1.45. Independently phrased query returned the CoD Wiki Headshot/Damage Multiplier '
+        + 'pages stating the headshot modifier is 1.4x for most MW2019 weapons and specifically for the M4A1, '
+        + '"typical for most assault rifles", letting it kill in one fewer bullet at some ranges. Dimensionless, no '
+        + 'unit conversion. SAFE AS AN AR DEFAULT, NOT AS A GLOBAL: it must NOT be applied to shotguns (1.0x) or to '
+        + 'snipers and the M14 (1.5x) — see the three sibling keys.',
+    }),
+    mw2019_headshot_multiplier_sniper_rifles: Object.freeze({
+      value: 1.5,
+      unit: 'x (dimensionless)',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Modern Warfare (2019) — sniper rifles',
+      source: 'https://callofduty.fandom.com/wiki/Damage_Multiplier',
+      confidence: 'corroborated',
+      note: 'Surfaced alongside the 1.4x general figure: sniper rifles use 1.5x in MW2019. Recorded because it '
+        + 'BOUNDS the 1.4x value as an assault-rifle/general default rather than a universal constant.',
+    }),
+    mw2019_headshot_multiplier_shotguns: Object.freeze({
+      value: 1.0,
+      unit: 'x (dimensionless)',
+      tol: Object.freeze({ abs: 0 }),
+      sourced: 'external',
+      title: 'Modern Warfare (2019) — shotguns',
+      source: 'https://callofduty.fandom.com/wiki/Damage_Multiplier',
+      confidence: 'corroborated',
+      note: 'Exact 1.0 — shotguns receive NO headshot bonus in MW2019. An implementation that applies 1.4x '
+        + 'globally is wrong for shotguns, hence the zero tolerance: 1.0 means exactly 1.0.',
+    }),
+    mw2019_m14_headshot_multiplier: Object.freeze({
+      value: 1.5,
+      unit: 'x (dimensionless)',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Modern Warfare (2019) — M14 marksman rifle',
+      source: 'https://callofduty.fandom.com/wiki/Damage_Multiplier',
+      confidence: 'corroborated',
+      note: 'Named exception in the same source: the M14 uses 1.5x rather than the 1.4x default. Kept as its own '
+        + 'key so a test can assert the exception list rather than a single blanket multiplier.',
+    }),
+    striker45_mw2019_falloff_range_stops: Object.freeze({
+      value: '3 stops, stepwise: first falloff at 22.5 m, further and more severe reductions at 40 m and 50 m',
+      unit: 'm (three range stops)',
+      tol: null,
+      sourced: 'external',
+      title: 'Modern Warfare (2019) — Striker 45 SMG',
+      source: 'https://zekevirant.medium.com/a-comparison-of-damage-falloff-in-pvp-fpss-7be74fbb131',
+      confidence: 'corroborated',
+      note: 'The concrete counter-example that drove the first pass to mark a generic two-stop falloff model as '
+        + 'CONTRADICTED: the Striker 45 has THREE stops, not two. Already in metres in the source, no conversion. '
+        + 'TOLERANCE: tol is null because the value is a list, not a scalar; assert each stop within +/-2 m and '
+        + 'assert that the number of stops is 3 and the reductions are monotonic. Structural lesson for the port: '
+        + 'the falloff table must support an arbitrary number of stops per weapon.',
+    }),
+
+    // ---- second verification pass: MW3 (2023) MCW damage profile ----
+    // MW3 expresses damage internally as a base value x a per-zone multiplier, so the absolute
+    // 44/37/34 triple below is DERIVED in-engine, not primitive. Both representations are kept.
+    mcw_mw3_head_damage: Object.freeze({
+      value: 44,
+      unit: 'HP per bullet',
+      tol: Object.freeze({ pct: 0.15 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW, launch-era',
+      source: 'https://codmunity.gg/weapon/mw3/mcw',
+      confidence: 'corroborated',
+      note: '44 HP (37.4-50.6). A non-leading query returned the triple together: "head, upper, and lower torso '
+        + 'damage of 44, 37, and 34 with a damage range of 26.7m, and a fire rate of 714.3 rpm". Ratio 44/37 = '
+        + '1.19x, consistent with the separately reported 1.3x headshot / 1.1x upper-torso multipliers (1.3/1.1 = '
+        + '1.18) — head/upper ratio should hold at 1.19x +/-0.12. That arithmetic self-consistency across two '
+        + 'unrelated sources is the strongest evidence in this batch.',
+    }),
+    mcw_mw3_upper_torso_damage: Object.freeze({
+      value: 37,
+      unit: 'HP per bullet',
+      tol: Object.freeze({ pct: 0.15 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW, launch-era',
+      source: 'https://codmunity.gg/weapon/mw3/mcw',
+      confidence: 'corroborated',
+      note: '37 HP (31.5-42.5), and it must be STRICTLY BETWEEN the lower-torso and head values — assert the '
+        + 'ordering as well as the number. Reproduced independently in the 44/37/34 triple. CAVEAT: a later balance '
+        + 'patch set MCW max damage to 38 with upper and lower torso multipliers flattened to 1.0x, so post-patch '
+        + 'all three torso zones converge near 38 and the strict ordering collapses to two zones. 37 is correct for '
+        + 'launch and within tolerance of the patched value either way.',
+    }),
+    mcw_mw3_lower_torso_damage: Object.freeze({
+      value: 34,
+      unit: 'HP per bullet',
+      tol: Object.freeze({ pct: 0.15 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW, launch-era',
+      source: 'https://codmunity.gg/weapon/mw3/mcw',
+      confidence: 'corroborated',
+      note: '34 HP (28.9-39.1); lower/upper ratio 0.92x +/-0.10. Three distinct zones with separate absolute '
+        + 'figures is corroborated for launch. Because the later patch flattened both torso multipliers to 1x, an '
+        + 'implementation with lower == upper torso is DEFENSIBLE for post-patch MW3 — pin the season before '
+        + 'treating a two-zone implementation as a failure.',
+    }),
+    mcw_mw3_mid_damage: Object.freeze({
+      value: 26,
+      unit: 'HP per bullet',
+      tol: Object.freeze({ pct: 0.15 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW, near-mid range tier',
+      source: 'https://codmunity.gg/weapon/mw3/mcw',
+      confidence: 'corroborated',
+      note: 'Near-mid damage tier, buffed from 24 to 26. Establishes that the MCW has at least THREE range tiers '
+        + '(max / near-mid / min), not merely a plateau and a floor — same structural point as the Striker 45 '
+        + 'three-stop falloff.',
+    }),
+    mcw_mw3_min_damage: Object.freeze({
+      value: 21.5,
+      unit: 'HP per bullet',
+      tol: Object.freeze({ min: 16.8, max: 26.4 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW, minimum-damage floor',
+      source: 'https://codmunity.gg/weapon/mw3/mcw',
+      confidence: 'single-source',
+      note: 'Reported as "21-22"; 21.5 is the midpoint of that stated pair and the band is the stated +/-20% on it '
+        + '(16.8-26.4). GENUINELY UNSTABLE — one source shows conflicting patch history in both directions: min '
+        + 'damage increased 20 -> 22 in one patch and decreased 24 -> 21 (-13%) in another. Do NOT treat as a '
+        + 'constant. The useful invariant to test is RELATIVE: min damage is roughly 55-60% of max damage.',
+    }),
+    mcw_mw3_max_damage_post_buff: Object.freeze({
+      value: 38,
+      unit: 'HP per bullet',
+      tol: Object.freeze({ pct: 0.10 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW, post-buff (Season 6-era)',
+      source: 'https://sportskeeda.com/call-of-duty-game/all-weapon-balancing-changes-mw3-season-6',
+      confidence: 'corroborated',
+      note: '38 HP (34.2-41.8). Patch text: "Max Damage increased from 28 to 38, with Max Range increased from '
+        + '31.8m to 34.3m. The Headshot multiplier was decreased from 1.3x to 1.27x, while Upper & Lower Torso '
+        + 'multipliers decreased from 1.1x to 1x." Deliberately a SEPARATE key from the launch-era zone damages '
+        + 'rather than an overwrite: launch and post-buff MCW are two different guns and both are recorded.',
+    }),
+    mcw_mw3_headshot_multiplier_launch: Object.freeze({
+      value: 1.3,
+      unit: 'multiplier on base damage',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW at launch',
+      source: 'https://sportskeeda.com/call-of-duty-game/all-weapon-balancing-changes-mw3-season-6',
+      confidence: 'corroborated',
+      note: 'The multiplier form is MORE DIRECTLY IMPLEMENTABLE than absolute per-zone damage, because that is how '
+        + 'the engine stores it. Cross-checks against the absolute triple: 1.3/1.1 = 1.18 vs 44/37 = 1.19.',
+    }),
+    mcw_mw3_headshot_multiplier_post_buff: Object.freeze({
+      value: 1.27,
+      unit: 'multiplier on base damage',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW after the max-damage buff',
+      source: 'https://sportskeeda.com/call-of-duty-game/all-weapon-balancing-changes-mw3-season-6',
+      confidence: 'corroborated',
+      note: 'Headshot multiplier decreased 1.3x -> 1.27x in the same patch that raised max damage 28 -> 38 — the '
+        + 'multiplier was trimmed to partly offset the base-damage buff. Kept separate from the launch value.',
+    }),
+    mcw_mw3_torso_multiplier_launch: Object.freeze({
+      value: 1.1,
+      unit: 'multiplier on base damage',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW at launch, upper and lower torso',
+      source: 'https://sportskeeda.com/call-of-duty-game/all-weapon-balancing-changes-mw3-season-6',
+      confidence: 'corroborated',
+      note: 'Upper and lower torso shared a single 1.1x multiplier at launch. NOTE THE TENSION with the distinct '
+        + '37/34 launch figures: a single 1.1x cannot produce two different zone damages, which suggests the zones '
+        + 'actually carried slightly different multipliers (roughly 1.1x and 1.01x on a 33-34 base) before the '
+        + 'change. Both readings are recorded rather than reconciled by deletion.',
+    }),
+    mcw_mw3_torso_multiplier_post_buff: Object.freeze({
+      value: 1.0,
+      unit: 'multiplier on base damage',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW after the max-damage buff',
+      source: 'https://sportskeeda.com/call-of-duty-game/all-weapon-balancing-changes-mw3-season-6',
+      confidence: 'corroborated',
+      note: 'Both torso multipliers reduced to 1.0x. Consequence worth testing explicitly: late-season MW3 has '
+        + 'effectively TWO hit zones (head and body), not three.',
+    }),
+    mcw_mw3_rpm: Object.freeze({
+      value: 714.3,
+      unit: 'rounds per minute',
+      tol: Object.freeze({ pct: 0.03 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW',
+      source: 'https://codmunity.gg/weapon/mw3/mcw',
+      confidence: 'corroborated',
+      note: '714.3 RPM (693-736). Reproduced verbatim in two separate searches (boostingfactory and codmunity). '
+        + 'RPM is a hard-coded weapon constant and was not patch-varied for the MCW in anything either pass '
+        + 'surfaced, hence the tight 3% band.',
+    }),
+    mcw_mw3_shot_interval: Object.freeze({
+      value: 0.08399,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.003 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW',
+      source: 'https://codmunity.gg/weapon/mw3/mcw',
+      confidence: 'derived',
+      note: '84.0 ms +/-3 ms between rounds. Arithmetic: 60000 / 714.3 = 83.99 ms; inherits the RPM band. This is '
+        + 'the quantum every MCW TTK claim must be an integer multiple of — see mcw_mw3_ttk, which is not.',
+    }),
+    mcw_mw3_near_range_stop: Object.freeze({
+      value: 26.7,
+      unit: 'm',
+      tol: Object.freeze({ pct: 0.10 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW, LAUNCH patch',
+      source: 'https://codmunity.gg/weapon/mw3/mcw',
+      confidence: 'corroborated',
+      note: '26.7 m (24.0-29.4) FOR LAUNCH BEHAVIOUR ONLY. Reproduced as "damage range of 26.7m" and corroborated '
+        + 'by patch text giving the exact pre-patch figure: "Max Damage Range increased to 30.48 meters, up from '
+        + '26.67". Conversion check: 26.67 / 0.0254 = 1050 game units (inches). A later patch note quotes 34.3 m, '
+        + 'so this key is GENUINELY VERSION-DEPENDENT — the value is right but the version must be stated. If '
+        + 'modelling any season after the max-damage-range buff, widen the acceptance band to 26.7-30.5 m and see '
+        + 'mcw_mw3_max_damage_range_mid_patch.',
+    }),
+    mcw_mw3_max_damage_range_mid_patch: Object.freeze({
+      value: 30.48,
+      unit: 'm',
+      tol: Object.freeze({ pct: 0.10 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW, after the first range buff (later 34.3 m)',
+      source: 'https://codmunity.gg/weapon/mw3/mcw',
+      confidence: 'corroborated',
+      note: 'Intermediate max-damage range: "increased to 30.48 meters, up from 26.67", later raised again to '
+        + '34.3 m. 30.48 m is EXACTLY 1200 inches / 100 ft, which is strong independent support for the 1 game '
+        + 'unit = 1 inch = 0.0254 m convention this whole file assumes: these ranges are round numbers in inches, '
+        + 'not in metres.',
+    }),
+    mcw_mw3_ttk: Object.freeze({
+      value: 0.290,
+      unit: 's',
+      tol: Object.freeze({ pct: 0.20 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — MCW (published figure, NOT simulable)',
+      source: 'https://game8.co/games/Modern-Warfare-3/archives/435289',
+      confidence: 'single-source',
+      note: '290 ms, band deliberately loose at +/-20% (232-348 ms) to span the published 290, the AR category '
+        + 'average ~310 and the arithmetically exact 336. TREAT WITH LESS CONFIDENCE THAN THE REST OF THIS BATCH: '
+        + 'the second pass CONFIRMED the first pass FLAGGED INCONSISTENCY rather than clearing it. The non-leading '
+        + 'TTK query did not return a per-weapon 290 ms for the MCW; it returned "ARs in MW3 have a time to kill of '
+        + 'roughly 310 milliseconds" at 150 HP with the MCW described as faster than average. Arithmetic: at 150 HP '
+        + 'and 37 upper-torso damage, STK = ceil(150/37) = 5 and TTK = 4 x 83.99 = 336 ms; an all-head 4-shot kill '
+        + 'gives 3 x 83.99 = 252 ms. 290 ms sits between these and is NOT an integer multiple of the 84 ms '
+        + 'interval, so it is almost certainly a mixed-hit-location or averaged marketing figure. RECOMMENDATION: '
+        + 'implement TTK as (STK - 1) x interval and validate against the 232-348 ms band; do not hard-code 290.',
+    }),
+    ar_mw3_typical_ttk: Object.freeze({
+      value: 0.310,
+      unit: 's',
+      tol: Object.freeze({ pct: 0.25 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — assault rifle class average, core MP at 150 HP',
+      source: 'https://game8.co/games/Modern-Warfare-3/archives/435289',
+      confidence: 'corroborated',
+      note: '310 ms (232-388 ms): "ARs in MW3 have a time to kill of roughly 310 milliseconds." A CLASS MEAN, not a '
+        + 'weapon value — useful as a sanity envelope for any AR the harness models, and as the reference point '
+        + 'against which the MCW claim of 290 ms should be judged (the MCW is described as faster than the class '
+        + 'average, so a sub-310 figure is at least directionally right).',
+    }),
+
+    // ---- second verification pass: per-title base health. FOUR keys on purpose. ----
+    // health_mw2019 (first pass, above) is 100. These three are separate titles, not replacements.
+    health_mw2_2022: Object.freeze({
+      value: 100,
+      unit: 'HP',
+      tol: Object.freeze({ abs: 0 }),
+      sourced: 'external',
+      title: 'Modern Warfare II (2022) — core multiplayer',
+      source: 'https://www.charlieintel.com/call-of-duty/modern-warfare-3-increases-health-for-slower-ttk-than-mw2-266568/',
+      confidence: 'corroborated',
+      note: 'Exact 100 HP, no tolerance. Stated implicitly but unambiguously as the baseline MW3 departed from '
+        + '("up from the 100 seen in the previous installment"). Needed to make the M4 4-shot-kill and 221 ms TTK '
+        + 'figures close arithmetically — and they do: ceil(100/28) = 4.',
+    }),
+    health_mw3: Object.freeze({
+      value: 150,
+      unit: 'HP',
+      tol: Object.freeze({ abs: 0 }),
+      sourced: 'external',
+      title: 'Modern Warfare III (2023) — core multiplayer (hardcore and other modes excluded)',
+      source: 'https://www.charlieintel.com/call-of-duty/modern-warfare-3-increases-health-for-slower-ttk-than-mw2-266568/',
+      confidence: 'corroborated',
+      note: 'Exact 150 HP, no tolerance. Directly reproduced: "Modern Warfare 3 raised the base health up to 150 in '
+        + 'multiplayer matches, up from the 100 seen in the previous installment." The development-history caveat '
+        + 'is also confirmed: "Sledgehammer landed on giving each player 150 health points, but it took trial and '
+        + 'error - and at one point even an armor system - to get right." WARNING WORTH PRESERVING: 150 is an '
+        + 'MW3-ONLY OUTLIER and is NOT the CoD norm — every other title in this file is 100. Any TTK computed here '
+        + 'must use the health value of the matching title.',
+    }),
+    health_bo6: Object.freeze({
+      value: 100,
+      unit: 'HP',
+      tol: Object.freeze({ abs: 0 }),
+      sourced: 'external',
+      title: 'Black Ops 6 — core multiplayer (hardcore modes excluded)',
+      source: 'https://callofduty.fandom.com/wiki/Health_System',
+      confidence: 'corroborated',
+      note: 'Exact 100 HP, no tolerance: "In Call of Duty: Black Ops 6, the health system returns to its 100 health '
+        + 'bar", explicitly framed as a reversion from MW3. The verifying query surfaced both 100 and 150 and the '
+        + 'results assigned them unambiguously — 100 to BO6, 150 to MW3 — so the two are cleanly separated rather '
+        + 'than conflated.',
+    }),
+
+    // ---- second verification pass: MW2 (2022) M4, the TTK-formula calibration case ----
+    m4_mw2_max_damage: Object.freeze({
+      value: 28,
+      unit: 'HP per bullet',
+      tol: Object.freeze({ pct: 0.10 }),
+      sourced: 'external',
+      title: 'Modern Warfare II (2022) — M4',
+      source: 'https://zilliongamer.com/modern-warfare-2/c/modern-warfare-2/m4-loadout',
+      confidence: 'corroborated',
+      note: '28 HP (25.2-30.8), flat across the plateau out to ~26 m. Reproduced: "the M4 deals 28 damage with a '
+        + 'fire rate of 811 RPM, is a 4-shot assault rifle with an average time to kill of 221ms up to 26 meters". '
+        + 'Self-consistency check passes: at MW2 100 HP, 28 damage gives ceil(100/28) = 4 shots, exactly the '
+        + '"4-shot" classification in the same sentence. That internal agreement is what makes the value '
+        + 'trustworthy independent of the source authority.',
+    }),
+    m4_mw2_ttk_max_range: Object.freeze({
+      value: 0.221,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.030 }),
+      sourced: 'external',
+      title: 'Modern Warfare II (2022) — M4, inside max-damage range',
+      source: 'https://zilliongamer.com/modern-warfare-2/c/modern-warfare-2/m4-loadout',
+      confidence: 'corroborated',
+      note: '221 ms +/-30 ms. Reproduced verbatim ("average time to kill of 221ms up to 26 meters") alongside the '
+        + '811 RPM and 28 damage in the same result. The (STK-1) x interval convention validates it exactly: '
+        + '3 x (60000/811) = 3 x 73.98 = 221.9 ms vs published 221 ms, a 0.4% match. USE THIS AS THE CALIBRATION '
+        + 'CASE for the TTK formula, and judge the MW3 290 ms figure against the formula rather than the reverse.',
+    }),
+
+    // ---- second verification pass: BO6 / BO4 assault-rifle TTK envelope ----
+    bo6_average_assault_rifle_ttk: Object.freeze({
+      value: null,
+      unit: 's',
+      tol: Object.freeze({ min: 0.280, max: 0.350 }),
+      sourced: 'external',
+      title: 'Black Ops 6 — assault rifle class average',
+      source: 'https://www.dexerto.com/call-of-duty/black-ops-6-will-have-one-of-slowest-ttks-in-call-of-duty-history-2828733/',
+      confidence: 'corroborated',
+      note: 'A BAND (300-320 ms), so value is null and the tolerance IS the band, widened to 280-350 ms per the '
+        + 'stated +/-40 ms. Reproduced: BO6 has the "third-slowest average TTK for an assault rifle at just over '
+        + '300 ms", "almost identical to Black Ops Cold War and marginally slower than Modern Warfare 3". The '
+        + 'RELATIVE claim is testable too: slower than MW3, roughly equal to Black Ops Cold War. CLASS MEAN ONLY — '
+        + 'per-weapon spread inside the class is large (260 ms to ~400 ms).',
+    }),
+    bo6_fastest_assault_rifle_ttk: Object.freeze({
+      value: 0.260,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.020 }),
+      sourced: 'external',
+      title: 'Black Ops 6 — Goblin Mk2 (semi-auto), fastest AR TTK',
+      source: 'https://www.dexerto.com/call-of-duty/fastest-time-to-kill-weapons-in-black-ops-6-ranked-2968079/',
+      confidence: 'corroborated',
+      note: '260 ms +/-20 ms. "The Goblin Mk2 has the fastest TTK of any assault rifle at 260 ms". PATCH-SENSITIVE '
+        + '— re-check after any weapon balance update. Caveat confirmed: the record holder is SEMI-AUTO, so for '
+        + 'anything modelled on a full-auto M4A1-class AR use bo6_fastest_full_auto_assault_rifle_ttk instead.',
+    }),
+    bo6_fastest_full_auto_assault_rifle_ttk: Object.freeze({
+      value: 0.268,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.020 }),
+      sourced: 'external',
+      title: 'Black Ops 6 — AS VAL, fastest full-auto AR TTK',
+      source: 'https://www.dexerto.com/call-of-duty/fastest-time-to-kill-weapons-in-black-ops-6-ranked-2968079/',
+      confidence: 'corroborated',
+      note: '268 ms +/-20 ms. The better analogue than the semi-auto Goblin Mk2 (260 ms) for an M4A1-style '
+        + 'full-auto AR, which is what this port models. Patch-sensitive.',
+    }),
+    bo4_slowest_assault_rifle_ttk: Object.freeze({
+      value: 0.350,
+      unit: 's',
+      tol: Object.freeze({ min: 0.320, max: 0.400 }),
+      sourced: 'external',
+      title: 'Black Ops 4 — assault rifle class average (slowest in CoD history)',
+      source: 'https://www.dexerto.com/call-of-duty/black-ops-6-will-have-one-of-slowest-ttks-in-call-of-duty-history-2828733/',
+      confidence: 'corroborated',
+      note: 'Reported as ">350 ms" — a LOWER BOUND, not a point value, which is why 0.350 is recorded with an '
+        + 'explicit 320-400 ms window rather than a symmetric tolerance. Black Ops 4 holds the slowest average AR '
+        + 'TTK in CoD history. Recorded as the UPPER BOUND of the CoD AR TTK design space: with BO6 fastest at '
+        + '260 ms, the whole genre-plausible AR TTK envelope is roughly 260-400 ms.',
+    }),
+  }),
+
+  /**
+   * MOVEMENT SPEEDS — second verification pass.
+   * Two eras coexist here and must not be averaged. The LEGACY IW-engine values are dvars in game
+   * units (1 unit = 1 inch = 0.0254 m) and are moddable defaults, not physical constants. The MODERN
+   * values are m/s figures lifted from MW3/Warzone Season 4 patch notes and are mostly WEAPON- or
+   * KIT-SCOPED, not global player constants — the key names say which.
+   */
+  movement: Object.freeze({
+    base_walk_speed_legacy_iw: Object.freeze({
+      value: 4.83,
+      unit: 'm/s',
+      tol: Object.freeze({ pct: 0.08 }),
+      sourced: 'external',
+      title: 'Legacy IW-engine Call of Duty (g_speed 190 units/s) — fast/base movement class',
+      source: 'https://wiki.zeroy.com/index.php/Call_of_Duty_:_A_Study_on_FPS',
+      confidence: 'corroborated',
+      note: '4.83 m/s, +/-8% (4.44-5.21 m/s), i.e. 190 in/s +/-15 in/s. An independent query returned the zeroy '
+        + 'CoD Modding & Mapping Wiki "A Study on FPS" page, which states max forward ground speed is 190 units/s '
+        + 'and that strafe is 20% lower and backward 30% lower ("190*0.8=159"); the 190 was corroborated a second '
+        + 'time in a zeroy-targeted follow-up. CoD unit = 1 inch, so 190 x 0.0254 = 4.826 m/s. IMPORTANT SCOPE '
+        + 'CAVEAT: the same 190 appears as an SMG/Trench-Gun CLASS speed rating in the CoD Wiki, so 190 is the '
+        + 'fast/base class value, NOT a single global constant across all loadouts. Compare '
+        + 'base_movement_speed_ar_bp50_mw3 (5.1 m/s) and handling.xm4_base_movement_speed (4.37 m/s) — three '
+        + 'titles, three numbers, all kept.',
+    }),
+    strafe_speed_scale: Object.freeze({
+      value: 0.8,
+      unit: 'multiplier of base walk speed',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Legacy IW-engine Call of Duty (player_strafeSpeedScale dvar)',
+      source: 'https://wiki.zeroy.com/index.php/Call_of_Duty_:_A_Study_on_FPS',
+      confidence: 'corroborated',
+      note: '0.8 (0.75-0.85). Double-corroborated: (1) dvar lists give player_strafeSpeedScale = 0.8; (2) zeroy '
+        + 'independently states "strafe speed is 20% lower than forward speed - 190*0.8=159". At g_speed 190 that '
+        + 'is 159 in/s = 4.04 m/s. This is the GROUND (non-sprint) strafe scale; the sprint equivalent is the '
+        + 'separate sprint_strafe_speed_scale = 0.667. Was not in the first pass batch at all but is needed '
+        + 'alongside backpedal_speed_scale for a complete ground velocity model.',
+    }),
+    backpedal_speed_scale: Object.freeze({
+      value: 0.7,
+      unit: 'multiplier of base walk speed',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Legacy IW-engine Call of Duty (player_backSpeedScale dvar)',
+      source: 'https://www.se7ensins.com/forums/threads/cod-dvar-master-list.82819/',
+      confidence: 'corroborated',
+      note: '0.7 (0.65-0.75), from two independent sources: (1) a dvar-list query returned player_backSpeedScale = '
+        + '0.7; (2) the zeroy "Study on FPS" page states backwards speed is 30% lower than forward, which is '
+        + 'exactly 0.7. The double corroboration upgrades this from the first pass single shaky hit to solid. At '
+        + 'g_speed 190 that is 133 in/s = 3.38 m/s.',
+    }),
+    sprint_speed_scale: Object.freeze({
+      value: 1.5,
+      unit: 'multiplier of base walk speed',
+      tol: Object.freeze({ abs: 0.10 }),
+      sourced: 'external',
+      title: 'Legacy IW-engine Call of Duty (player_sprintSpeedScale dvar)',
+      source: 'https://www.se7ensins.com/forums/threads/cod-dvar-master-list.82819/',
+      confidence: 'corroborated',
+      note: '1.5 (1.4-1.6). player_sprintSpeedScale = 1.5 returned again in an independent dvar-list query, and '
+        + 'the MODERN data cross-checks it: 7.1 m/s tac sprint / 4.83 m/s base walk = 1.47, and the pre-nerf '
+        + '7.7 / 4.83 = 1.59 — both bracket 1.5. Legacy arithmetic: 190 x 1.5 = 285 in/s = 7.24 m/s. Two eras '
+        + 'agreeing on a ratio while disagreeing on absolutes is the most useful kind of corroboration here.',
+    }),
+    sprint_strafe_speed_scale: Object.freeze({
+      value: 0.667,
+      unit: 'multiplier of SPRINT speed (not of base walk)',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Legacy IW-engine Call of Duty (player_sprintStrafeSpeedScale dvar, CoD4/MW2 era)',
+      source: 'https://www.se7ensins.com/forums/threads/cod-dvar-master-list.82819/',
+      confidence: 'corroborated',
+      note: '0.667 (0.62-0.72). Reproduced with a differently-phrased dvar query. NOTE THE BASE: it multiplies the '
+        + 'SPRINT speed, not base walk — lateral sprint is 2/3 of forward sprint. It is a legacy IW-engine dvar and '
+        + 'is moddable, so treat 0.667 as the shipped default rather than a hard physical constant.',
+    }),
+    sprint_speed_ar_bp50_mw3: Object.freeze({
+      value: 5.8,
+      unit: 'm/s',
+      tol: Object.freeze({ pct: 0.15 }),
+      sourced: 'external',
+      title: 'MWIII / Warzone Season 4 — BP50 assault rifle, post-nerf sprint speed',
+      source: 'https://www.dexerto.com/call-of-duty/modern-warfare-3-season-4-patch-notes-2747955/',
+      confidence: 'corroborated',
+      note: '5.8 m/s (4.9-6.7). Reproduced exactly: "The BP50\'s sprint speed was decreased from 6.2m/s to 5.8m/s '
+        + '(-6%)". ATTRIBUTION CORRECTION to the first pass: 5.8 m/s is the BP50 WEAPON-SPECIFIC post-nerf sprint '
+        + 'speed, NOT a general player sprint speed — hence the weapon-scoped key name. The same entry also gives '
+        + 'base movement 5.5 -> 5.1 m/s and crouch 2.6 -> 2.4 m/s for that weapon. Use 5.8 as an AR-class sprint '
+        + 'speed; a generic player sprint is probably somewhat higher.',
+    }),
+    base_movement_speed_ar_bp50_mw3: Object.freeze({
+      value: 5.1,
+      unit: 'm/s',
+      tol: Object.freeze({ pct: 0.12 }),
+      sourced: 'external',
+      title: 'MWIII / Warzone Season 4 — BP50 assault rifle, post-nerf base movement speed',
+      source: 'https://www.dexerto.com/call-of-duty/modern-warfare-3-season-4-patch-notes-2747955/',
+      confidence: 'corroborated',
+      note: '5.1 m/s (4.5-5.7). Surfaced while verifying sprint speed: the BP50 entry lists movement speed '
+        + 'decreased from 5.5 m/s to 5.1 m/s (-7%). Useful as a MODERN-TITLE CROSS-CHECK on '
+        + 'base_walk_speed_legacy_iw: 5.1 vs the legacy g_speed-derived 4.83 m/s, i.e. modern CoD walk speed is '
+        + 'roughly 5-6% higher than the CoD4-era 190 in/s. CORRECTION: the first pass quoted this pair as '
+        + '"5.0 -> 4.8" inside its tactical_sprint note; the second pass returned 5.5 -> 5.1, so that sub-line was '
+        + 'wrong even though the tac-sprint numbers in the same entry were right.',
+    }),
+    tactical_sprint_speed_mw3: Object.freeze({
+      value: 7.1,
+      unit: 'm/s',
+      tol: Object.freeze({ pct: 0.12 }),
+      sourced: 'external',
+      title: 'MWIII / Warzone Season 4 — tactical sprint (attribution disputed, see note)',
+      source: 'https://www.callofduty.com/ca/en/patchnotes/2024/05/call-of-duty-modern-warfare-iii-season-4-patch-notes',
+      confidence: 'corroborated',
+      note: '7.1 m/s (6.3-8.0); the pre-nerf 7.7 m/s is the upper anchor. The 7.7 -> 7.1 (-8%) pair reproduced '
+        + 'verbatim. ATTRIBUTION CAVEAT, kept deliberately: the verifying search rendered that pair as a WEAPON-KIT '
+        + 'entry (JAK Revenger Kit) rather than a global movement change, while it rendered 7.0 -> 6.8 as the '
+        + 'broader tactical-sprint change; secondary aggregators disagree about which line is "general". So treat '
+        + '6.8-7.7 m/s as the credible tac-sprint band and 7.1 as a defensible mid value. Ratio sanity check: '
+        + '7.1 / 4.83 base walk = 1.47, essentially the legacy player_sprintSpeedScale of 1.5.',
+    }),
+    tactical_sprint_speed_ar_bp50_mw3: Object.freeze({
+      value: 6.8,
+      unit: 'm/s',
+      tol: Object.freeze({ pct: 0.10 }),
+      sourced: 'external',
+      title: 'MWIII / Warzone Season 4 — BP50 assault rifle, post-nerf tactical sprint',
+      source: 'https://www.dexerto.com/call-of-duty/modern-warfare-3-season-4-patch-notes-2747955/',
+      confidence: 'corroborated',
+      note: '6.8 m/s (6.1-7.5). Directly reproduced: "the BP50\'s tactical sprint speed was decreased from 7m/s to '
+        + '6.8m/s (-3%)". Same numbers, same weapon, same direction as the first pass claim. The BP50 is an assault '
+        + 'rifle, so this is a legitimate AR-CLASS tac-sprint anchor and the better key to test an AR against than '
+        + 'the disputed general figure.',
+    }),
+    crouch_speed_mw3: Object.freeze({
+      value: 2.4,
+      unit: 'm/s',
+      tol: Object.freeze({ pct: 0.12 }),
+      sourced: 'external',
+      title: 'MWIII / Warzone Season 4 — crouch movement speed (general change)',
+      source: 'https://www.callofduty.com/ca/en/patchnotes/2024/05/call-of-duty-modern-warfare-iii-season-4-patch-notes',
+      confidence: 'corroborated',
+      note: '2.4 m/s (2.1-2.7). THE MOST SOLID VALUE IN THIS BATCH: reproduced twice within the Season 4 searches '
+        + '— once as a GENERAL movement change ("Decreased crouch movement speed from 2.6m/s to 2.4m/s (-8%)") and '
+        + 'once inside the BP50 weapon entry with identical 2.6 -> 2.4 numbers. Ratio check: 2.4 / 4.83 = 0.50, '
+        + 'i.e. crouch is about half of base walk, a plausible engine-level scale.',
+    }),
+    ads_movement_speed_mw3: Object.freeze({
+      value: 3.1,
+      unit: 'm/s',
+      tol: Object.freeze({ pct: 0.12 }),
+      sourced: 'external',
+      title: 'MWIII / Warzone Season 4 — ADS movement speed (rendered as the JAK Revenger Kit entry)',
+      source: 'https://www.callofduty.com/ca/en/patchnotes/2024/05/call-of-duty-modern-warfare-iii-season-4-patch-notes',
+      confidence: 'corroborated',
+      note: '3.1 m/s (2.7-3.5). Reproduced exactly: "Decreased ADS movement speed from 3.3m/s to 3.1m/s (-6%)". '
+        + 'The verifying result attributed it to the kit entry rather than a global change, so it is a weapon/kit '
+        + 'level value; still a valid ADS-strafe anchor. It CONFIRMS discarding the stray "5.1 m/s" ADS reading '
+        + 'from the first pass — nothing near 5.1 appeared for ADS on either pass (5.1 is a BASE movement figure, '
+        + 'see base_movement_speed_ar_bp50_mw3, which is probably where the error came from). Ratio check: '
+        + '3.1 / 4.83 = 0.64 of base walk, consistent with typical CoD ADS penalties and with the BO6-derived '
+        + 'handling.ads_movement_speed_fraction band of 0.57-0.67.',
+    }),
+    air_control: Object.freeze({
+      value: 'near-zero physics-based air acceleration: mid-air direction change is scripted/input-driven '
+        + '(jump-slide, dive rotation, wall-jump redirect), NOT continuous strafe acceleration. While airborne a '
+        + 'CoD player can yaw the camera freely but CANNOT gain speed by strafing into the turn — no strafe-jump '
+        + 'or bunnyhop speed gain — and lateral velocity authority mid-air is a small fraction of ground '
+        + 'authority: target well under 10% of ground acceleration per tick.',
+      unit: 'qualitative',
+      tol: null,
+      sourced: 'external',
+      title: 'Call of Duty movement model, contrasted with Quake III / Source / Titanfall air strafing',
+      source: 'https://arenafps.fandom.com/wiki/Air_Strafing',
+      confidence: 'corroborated',
+      note: 'NO NUMERIC sv_airaccelerate / g_airAccelerate default exists for CoD in anything either pass could '
+        + 'reach. A dedicated query returned only Counter-Strike values (sv_airaccelerate 10, CS:GO/CS2 12), which '
+        + 'MUST NOT be borrowed for CoD — that borrowing is the specific failure mode this entry exists to '
+        + 'prevent. What IS corroborated is the BEHAVIOURAL claim, from the Arena FPS Wiki air-strafing entry plus '
+        + 'CoD movement guides: air strafing as a momentum-gaining mechanic is documented for Quake III, '
+        + 'Titanfall/Apex and Source, and CoD is explicitly contrasted as using "simpler directional redirects tied '
+        + 'to button inputs rather than continuous acceleration mechanics". tol is null because the claim is '
+        + 'qualitative; the value string above IS the testable spec — assert (a) no speed gain from any '
+        + 'strafe-plus-turn input sequence while airborne, and (b) mid-air lateral acceleration < 10% of ground.',
+    }),
+  }),
+
+  /**
+   * MOVEMENT PHYSICS — second verification pass. Jump/gravity figures are LEGACY IW-engine dvar
+   * defaults in game units (1 unit = 1 inch); slide figures are BO6 Season 03 patch notes; the tick
+   * rate is core 6v6 multiplayer, NOT Warzone.
+   */
+  physics: Object.freeze({
+    gravity: Object.freeze({
+      value: 20.32,
+      unit: 'm/s^2',
+      tol: Object.freeze({ pct: 0.02 }),
+      sourced: 'external',
+      title: 'IW-engine Call of Duty titles (g_gravity / phys_gravity 800 units/s^2)',
+      source: 'https://wiki.zeroy.com/index.php/Call_of_Duty_7:_Dvars_List',
+      confidence: 'corroborated',
+      note: '20.32 m/s^2, +/-2% (19.9-20.7), i.e. 800 game units/s^2 +/-15 units. An independent dvar-list query '
+        + 'returned the gravity default as 800 (surfaced as phys_gravity -800 / g_gravity 800) across CoD4, WaW, '
+        + 'MW2 and BO dvar dumps. Conversion: 800 x 0.0254 = 20.32 m/s^2, about 2.07x real g. CoD is NOT '
+        + 'earth-gravity: using 9.81 will make every jump arc twice as floaty as the reference.',
+    }),
+    jump_height: Object.freeze({
+      value: 0.991,
+      unit: 'm',
+      tol: Object.freeze({ pct: 0.05 }),
+      sourced: 'external',
+      title: 'IW/Treyarch Call of Duty (jump_height dvar default 39 units)',
+      source: 'https://www.se7ensins.com/forums/threads/jump-height-value.345866/',
+      confidence: 'corroborated',
+      note: '0.991 m, +/-5% (0.94-1.04 m), i.e. 39 units +/-2. Independent search of CoD dvar/modding sources '
+        + 'returned "the usual value for jump_height is 39" as the stock default (Se7enSins jump-height threads, '
+        + 'UGX modding, zeroy CoD7 dvar list). 39 x 0.0254 = 0.9906 m apex ABOVE THE FEET. Scope caveat: this is '
+        + 'the engine dvar default for the IW/Treyarch line, not a measured BO6 value.',
+    }),
+    jump_initial_velocity: Object.freeze({
+      value: 6.345,
+      unit: 'm/s',
+      tol: Object.freeze({ pct: 0.05 }),
+      sourced: 'external',
+      title: 'IW/Treyarch Call of Duty — derived from jump_height 39 and gravity 800',
+      source: 'https://wiki.zeroy.com/index.php/Call_of_Duty_7:_Dvars_List',
+      confidence: 'derived',
+      note: '6.345 m/s, +/-5% (6.03-6.66), i.e. 250 units/s +/-12. NOT QUOTED ANYWHERE — pure arithmetic on the '
+        + 'two dvars that did reproduce, re-derived independently: v0 = sqrt(2*g*h) = sqrt(2*800*39) = sqrt(62400) '
+        + '= 249.80 units/s = 6.345 m/s. "Corroborated" would be the wrong label: both INPUTS reproduced and the '
+        + 'derivation checks out, but no source states 6.35 m/s.',
+    }),
+    jump_airtime: Object.freeze({
+      value: 0.625,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.030 }),
+      sourced: 'external',
+      title: 'IW/Treyarch Call of Duty — ballistic phase only, ground to ground',
+      source: 'https://wiki.zeroy.com/index.php/Call_of_Duty_:_A_Study_on_FPS',
+      confidence: 'derived',
+      note: '0.625 s +/-30 ms (0.595-0.655 s). Re-derived: t = 2*v0/g = 2*249.80/800 = 0.6245 s total. Independent '
+        + 'of the unit conversion (units cancel), so it depends only on the reproduced 39/800 pair. CAVEAT: real '
+        + 'CoD airtime is slightly LONGER than the point-mass value because landing is detected at a foot offset '
+        + 'and there is a brief landing-recovery state — treat 0.625 s as the BALLISTIC PHASE ONLY and do not '
+        + 'assert it against an input-to-input-ready measurement.',
+    }),
+    jump_apex_time: Object.freeze({
+      value: 0.312,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.015 }),
+      sourced: 'external',
+      title: 'IW/Treyarch Call of Duty — time from leaving ground to apex',
+      source: 'https://wiki.zeroy.com/index.php/Call_of_Duty_:_A_Study_on_FPS',
+      confidence: 'derived',
+      note: '0.312 s +/-15 ms, exactly half of jump_airtime (v0/g = 249.80/800 = 0.3122 s). Recorded as its own '
+        + 'key because a harness can measure apex far more reliably than ground-to-ground contact, which is '
+        + 'contaminated by the landing-recovery state described in jump_airtime.',
+    }),
+    multiplayer_server_tick_rate: Object.freeze({
+      value: 60,
+      unit: 'Hz',
+      tol: Object.freeze({ pct: 0.15 }),
+      sourced: 'external',
+      title: 'Call of Duty core 6v6 multiplayer, MW2019 through BO6 (NOT Warzone)',
+      source: 'https://steamcommunity.com/app/1938090/discussions/0/5350867208715596167/',
+      confidence: 'corroborated',
+      note: '60 Hz, +/-15% (50-70 Hz): both the 60 Hz nominal and 62 Hz beta measurements pass. An independently '
+        + 'phrased query returned "Warzone runs up to ~20Hz tick rate, multiplayer up to 60hz tick rate, with '
+        + 'variable tick rate depending on population/server load", plus a separate report that BO6 beta servers '
+        + 'measured 62. DO NOT ACCEPT 20-30 Hz FOR CORE MP — 20 Hz is the Warzone/BR figure and is a genuinely '
+        + 'different mode, not a contradiction (see ballistics.instant_hit_range_formula_divisor, which is built on '
+        + 'the Warzone 20 Hz and must keep using 20). Note the "up to / load-dependent" qualifier: 60 Hz is a '
+        + 'ceiling, not a guarantee.',
+    }),
+    slide_max_speed_scale: Object.freeze({
+      value: 1.55,
+      unit: 'multiplier of movement speed',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Black Ops 6 Season 03 (pre-Season-3 value was 1.60)',
+      source: 'https://www.callofduty.com/patchnotes/2025/03/call-of-duty-black-ops-6-season-03-patch-notes',
+      confidence: 'corroborated',
+      note: '1.55 (1.50-1.60). An independent query against the BO6 Season 03 notes returned the exact line: slide '
+        + 'max speed scale reduced from 1.6 to 1.55, corroborated by MP1ST/Dexerto/GameSpot Season 3 coverage. '
+        + 'Either 1.55 or 1.60 passes if the title/season is not pinned. AMBIGUITY WORTH KEEPING: the patch notes '
+        + 'do NOT say WHICH speed it multiplies (base walk vs sprint), so an implementation must state its choice '
+        + 'and a test must not assume.',
+    }),
+    slide_max_duration: Object.freeze({
+      value: 0.65,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.050 }),
+      sourced: 'external',
+      title: 'Black Ops 6 Season 03 (pre-Season-3 value was 0.70 s)',
+      source: 'https://www.callofduty.com/patchnotes/2025/03/call-of-duty-black-ops-6-season-03-patch-notes',
+      confidence: 'corroborated',
+      note: '0.65 s +/-50 ms (0.60-0.70 s); 0.70 s is the pre-Season-3 value and also passes if the season is '
+        + 'unpinned. The same independent search returned "slide max time reduced from 0.7 to 0.65". 650 ms is the '
+        + 'CAP on an uninterrupted slide, not the typical slide length — slides can be cancelled earlier, so assert '
+        + 'it as a maximum and never as an expected duration.',
+    }),
+    mantle_duration: Object.freeze({
+      value: null,
+      unit: 's (would be; none published)',
+      tol: null,
+      sourced: 'external',
+      title: 'Call of Duty mantle/climb duration — NOT FOUND for any CoD title',
+      source: 'https://www.callofduty.com/patchnotes/2024/11/call-of-duty-bo6-warzone-season-01-patch-notes',
+      confidence: 'single-source',
+      note: 'EXPLICIT NEGATIVE RESULT, recorded so the next pass does not re-spend budget here. Three separate '
+        + 'queries (technical animation-duration phrasing, patch-note phrasing, community-measurement phrasing) '
+        + 'found NO numeric mantle duration for any Call of Duty. DO NOT write an acceptance criterion against a '
+        + 'CoD mantle duration yet — hence value null and tol null. What IS corroborated QUALITATIVELY: mantle '
+        + 'duration is a tunable Treyarch has changed — the 25 Nov 2024 BO6/Warzone update states players "can now '
+        + 'mantle over high ledges or walls at an increased speed", and a later update states "all mantle speeds '
+        + 'have been increased" (PLURAL), which implies several discrete mantle classes (low vault / mid / high '
+        + 'wall) each with its own fixed animation speed, rather than one continuous height-scaled duration. So the '
+        + 'testable structural claim is: MULTIPLE FIXED-LENGTH ANIMATIONS SELECTED BY LEDGE-HEIGHT BRACKET, not a '
+        + 'single length and not a smooth function of height. Getting an actual number requires frame-counting '
+        + 'gameplay video, not search.',
+    }),
+    mantle_duration_genre_proxy: Object.freeze({
+      value: 0.5,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.200 }),
+      sourced: 'proxy-non-cod',
+      title: 'Valve Deadlock mantle — SAME-GENRE PROXY ONLY, NOT Call of Duty',
+      source: 'https://deadlock.wiki/Mantling',
+      confidence: 'single-source',
+      note: '0.5 s, 300-700 ms if used as a placeholder. The only hard mantle number corroborable for ANY modern '
+        + 'shooter: in Deadlock the character pulls up over the ledge for around half a second, during which the '
+        + 'player is NOT ACTIONABLE (fully animation-locked). Offered strictly as a placeholder anchor and as an '
+        + 'argument that the CoD figure is in the few-hundred-ms range with an action lockout. MUST NEVER BE CITED '
+        + 'AS A CALL OF DUTY VALUE — different engine, different game. sourced: proxy-non-cod, so it does not count '
+        + 'as coverage in missing() and is excluded from the external target count.',
+    }),
+  }),
+
+  /**
+   * AUDIO / LATENCY — second verification pass. ALL NON-COD: these are general game-audio
+   * engineering guidance, Web Audio API spec facts, an ITU broadcast standard and a physical
+   * constant. No publisher figure for CoD audio latency exists. Durations in SECONDS as everywhere
+   * else; the millisecond figure is in the note.
+   */
+  audio: Object.freeze({
+    competitive_audio_latency_target: Object.freeze({
+      value: 0.020,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.005 }),
+      sourced: 'external',
+      title: 'General game-audio engineering guidance (non-CoD) — "imperceptible" tier boundary',
+      source: 'https://www.gameslearningsociety.org/wiki/how-many-ms-latency-is-noticeable/',
+      confidence: 'corroborated',
+      note: '20 ms +/-5 ms: accept any target in 15-25 ms as the imperceptible-tier boundary. An independently '
+        + 'phrased query returned the same guidance verbatim from multiple sources ("under 20 ms the delay is '
+        + 'imperceptible to most people", "ideal audio latency should be under 20ms"), corroborated beyond the '
+        + 'original Medium article (Games Learning Society, ultimatepctools, JBL). A DESIGN TARGET for '
+        + 'input-to-sound, not a measured CoD figure.',
+    }),
+    competitive_audio_latency_ceiling: Object.freeze({
+      value: 0.040,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.010 }),
+      sourced: 'external',
+      title: 'General game-audio engineering guidance (non-CoD) — hard ceiling',
+      source: 'https://www.gameslearningsociety.org/wiki/how-many-ms-latency-is-noticeable/',
+      confidence: 'corroborated',
+      note: '40 ms +/-10 ms: a hard ceiling anywhere in 30-50 ms is consistent with the literature. Reproduced '
+        + 'independently: "absolutely never above 40ms" and "above 40 ms many users notice a disconnect between '
+        + 'visual events and sounds", with 20-40 ms stated as the optimal band. The claim that 50-100 ms is only '
+        + 'tolerable for casual play is consistent with the returned "anything under 100ms is acceptable for '
+        + 'gaming" framing. SOFT GUIDANCE, not a hard spec.',
+    }),
+    audio_latency_noticeable_casual_player: Object.freeze({
+      value: 0.025,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.005 }),
+      sourced: 'external',
+      title: 'General game-audio guidance (non-CoD) — casual-player detection',
+      source: 'https://www.gameslearningsociety.org/wiki/how-many-ms-latency-is-noticeable/',
+      confidence: 'corroborated',
+      note: '25 ms +/-5 ms. Exact phrasing reproduced from an independent query: "if your audio latency hits the '
+        + '25ms+ range, even more casual players may notice that something is off". A second source in the same '
+        + 'result set independently gave "anything above 25 milliseconds being easily detectable by human '
+        + 'perception in competitive gaming environments", so 25 ms is corroborated from two directions rather '
+        + 'than being a re-quote of one article.',
+    }),
+    audio_latency_expert_detection_threshold: Object.freeze({
+      value: null,
+      unit: 's',
+      tol: Object.freeze({ min: 0.020, max: 0.025 }),
+      sourced: 'external',
+      title: 'General game-audio guidance (non-CoD) — professional-player detection band',
+      source: 'https://soundhub.io/blog/gaming-headset-vs-headphones-latency/',
+      confidence: 'corroborated',
+      note: 'A BAND (20-25 ms), so value is null and the tolerance IS the band. The band must overlap 15-30 ms; '
+        + 'REJECT any single threshold below 10 ms or above 40 ms. NARROWED BY THE SECOND PASS: the query '
+        + 'reproduced "professional players may detect differences down to 20-25ms, especially in rhythm or FPS '
+        + 'games" and "experienced players detect audio delays above 19-40ms while casual gamers might not notice '
+        + 'delays under 50ms", but the 15 ms lower bound claimed on the first pass was NOT reproduced by any '
+        + 'source, so it was dropped. A competing figure appeared — esports pros "target under 10 ms total audio '
+        + 'latency" — but that is a TARGET, not a detection threshold, so it does not contradict. Popular-press '
+        + 'sourcing throughout; no peer-reviewed psychoacoustic study located.',
+    }),
+    web_audio_outputlatency_wired: Object.freeze({
+      value: null,
+      unit: 's',
+      tol: Object.freeze({ min: 0, max: 0.040 }),
+      sourced: 'external',
+      title: 'Web Audio API AudioContext.outputLatency, wired output (Firefox / Chrome measurements)',
+      source: 'https://www.jamieonkeys.dev/posts/web-audio-api-output-latency/',
+      confidence: 'corroborated',
+      note: 'Claimed band 10-30 ms; encoded as 0-40 s-scaled (0 to 0.040 s) because of the caveat below, which '
+        + 'matters more than the band. Independently reproduced measurements: outputLatency ~0.0154 s (15.4 ms) in '
+        + 'Firefox and ~0.024 s (24 ms) in Chrome, both inside 10-30 ms. CAVEAT THE FIRST PASS ONLY HEDGED AT: '
+        + 'with built-in speakers or wired headphones some platforms return outputLatency of EXACTLY 0, so 10 ms is '
+        + 'NOT A FLOOR and an implementation must not assume a nonzero one. Bluetooth is a different regime '
+        + 'entirely (~0.178 s measured) — see bluetooth_audio_latency_penalty. Platform- and device-dependent, not '
+        + 'a constant.',
+    }),
+    web_audio_baselatency_interactive: Object.freeze({
+      value: null,
+      unit: 's',
+      tol: Object.freeze({ min: 0.002, max: 0.004 }),
+      sourced: 'external',
+      title: 'Web Audio API AudioContext.baseLatency with latencyHint "interactive"',
+      source: 'https://docs.w3cub.com/dom/audiocontext/baselatency',
+      confidence: 'derived',
+      note: 'A BAND (2-4 ms, +/-1.5 ms) that MUST BRACKET 2.67 ms (48 kHz) and 2.90 ms (44.1 kHz). Now DERIVABLE '
+        + 'rather than anecdotal: the Web Audio spec fixes the render quantum at 128 sample frames and baseLatency '
+        + 'is 128 / sampleRate — 128/44100 = 2.90 ms, 128/48000 = 2.67 ms. Search returned exactly this ("128 '
+        + 'sample-frames which corresponds to roughly 3ms at 44.1 kHz", "baseLatency ... calculated as '
+        + '128 / sampleRate x 1000 ms"). TWO CAVEATS: MDN own doc example prints 0.00 s for interactive (rounding, '
+        + 'and some backends report 0), and the "playback" hint jumps to ~0.15 s — so 2-4 ms is HINT-SPECIFIC. The '
+        + 'first pass claim that latencyHint 0 is floored at the hardware buffer is consistent with the spec text.',
+    }),
+    web_audio_render_quantum: Object.freeze({
+      value: 128,
+      unit: 'sample frames',
+      tol: Object.freeze({ abs: 0 }),
+      sourced: 'external',
+      title: 'Web Audio API specification — render quantum',
+      source: 'https://www.w3.org/TR/2018/CR-webaudio-20180918/',
+      confidence: 'corroborated',
+      note: 'EXACT, spec-fixed, no tolerance. Block size is 128 sample frames per spec; every '
+        + 'AudioWorkletProcessor.process() call handles exactly 128 samples. This is what makes baseLatency '
+        + 'COMPUTABLE (128/sampleRate) rather than something to look up, and it is the QUANTISATION FLOOR on any '
+        + 'audio scheduling done from the web audio graph — about 2.67 ms at 48 kHz. No gunshot can be scheduled '
+        + 'more precisely than this, which bounds every other number in this domain.',
+    }),
+    windows_wired_headset_total_audio_latency: Object.freeze({
+      value: null,
+      unit: 's',
+      tol: Object.freeze({ min: 0.020, max: 0.040 }),
+      sourced: 'external',
+      title: 'Typical Windows gaming PC with a wired headset — total end-to-end audio latency (non-CoD)',
+      source: 'https://www.gameslearningsociety.org/wiki/how-many-ms-latency-is-noticeable/',
+      confidence: 'single-source',
+      note: 'A BAND (20-40 ms, +/-15 ms): "the average total audio latency on a typical Windows gaming PC with a '
+        + 'wired headset is around 20-40 ms". THE IMPORTANT IMPLICATION: this measured real-world baseline already '
+        + 'sits AT OR ABOVE the 20 ms target and TOUCHES the 40 ms ceiling from the same literature, so the '
+        + 'engine own audio budget must be well under 20 ms for the end-to-end figure to land in the target tier. '
+        + 'Popular-press source, not instrumented — treat as order-of-magnitude.',
+    }),
+    bluetooth_audio_latency_penalty: Object.freeze({
+      value: null,
+      unit: 's',
+      tol: Object.freeze({ min: 0.100, max: 0.300 }),
+      sourced: 'external',
+      title: 'Bluetooth output path (non-CoD, general)',
+      source: 'https://www.gameslearningsociety.org/wiki/how-many-ms-latency-is-noticeable/',
+      confidence: 'corroborated',
+      note: 'A BAND (100-300 ms, +/-100 ms); any value under 60 ms should be treated as SUSPECT for a generic '
+        + 'Bluetooth path. Surfaced twice from independent angles: "Bluetooth headsets routinely add 100-300 ms, '
+        + 'creating a noticeable audio-visual desync that can affect gameplay", independently corroborated by a Web '
+        + 'Audio measurement of outputLatency = 0.178 s on Bluetooth headphones versus ~0-24 ms wired. Relevant '
+        + 'because it sits FAR ABOVE the 125 ms ITU detectability threshold: a Bluetooth output path will read as '
+        + 'desynchronised no matter what the engine does. THE ENGINE CANNOT BUDGET ITS WAY OUT OF IT — do not fail '
+        + 'a latency test that was run over Bluetooth.',
+    }),
+    av_desync_detectability_audio_lagging: Object.freeze({
+      value: 0.125,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.015 }),
+      sourced: 'external',
+      title: 'ITU-R BT.1359-1 Threshold of Detectability — audio LAGGING video',
+      source: 'https://en.wikipedia.org/wiki/Audio_to_video_synchronization',
+      confidence: 'corroborated',
+      note: '125 ms. The value itself is EXACT (a standardised figure); the +/-15 ms only covers implementation '
+        + 'rounding. BT.1359-1 defines the Threshold of Detectability as +45 ms to -125 ms, positive meaning audio '
+        + 'PRECEDES video — so sound lagging picture is detectable at 125 ms. CAVEAT FOR USE AS A '
+        + 'GUNSHOT/MUZZLE-FLASH CRITERION: the BT.1359 experiments used newsreader clips (speech with visible lip '
+        + 'movement); a transient gunshot with a bright flash is likely a HARSHER stimulus, so 125 ms is a generous '
+        + 'upper bound, NOT a per-frame budget.',
+    }),
+    av_desync_detectability_audio_leading: Object.freeze({
+      value: 0.045,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.015 }),
+      sourced: 'external',
+      title: 'ITU-R BT.1359-1 Threshold of Detectability — audio LEADING video',
+      source: 'https://en.wikipedia.org/wiki/Audio_to_video_synchronization',
+      confidence: 'corroborated',
+      note: '45 ms, the companion half of the +45/-125 ms detectability pair. NOTE THE ASYMMETRY and reproduce it: '
+        + 'audio arriving EARLY is detectable roughly 2.8x sooner than audio arriving late, because early sound is '
+        + 'physically impossible in the real world while late sound is not. So a scheduling implementation should '
+        + 'err on the side of LATE, never early.',
+    }),
+    av_desync_acceptability_audio_leading: Object.freeze({
+      value: 0.090,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.020 }),
+      sourced: 'external',
+      title: 'ITU-R BT.1359-1 Threshold of Acceptability — audio LEADING video',
+      source: 'https://en.wikipedia.org/wiki/Audio_to_video_synchronization',
+      confidence: 'corroborated',
+      note: '90 ms. BT.1359-1 gives Acceptability as +90 ms to -190 ms versus Detectability at +45/-125 ms, i.e. '
+        + 'roughly 1.5x looser. Both pairs are recorded deliberately: DETECTABILITY is the right bar for a '
+        + 'competitive shooter, ACCEPTABILITY is the broadcast-tolerable bar. Same newsreader-stimulus caveat.',
+    }),
+    av_desync_acceptability_audio_lagging: Object.freeze({
+      value: 0.190,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.020 }),
+      sourced: 'external',
+      title: 'ITU-R BT.1359-1 Threshold of Acceptability — audio LAGGING video',
+      source: 'https://en.wikipedia.org/wiki/Audio_to_video_synchronization',
+      confidence: 'corroborated',
+      note: '190 ms, the lagging half of the acceptability pair. Do NOT use this as the shooter target — it is the '
+        + 'broadcast bar. Its value here is as the outer sanity limit: past 190 ms even a passive viewer objects.',
+    }),
+    speed_of_sound_air: Object.freeze({
+      value: 343,
+      unit: 'm/s',
+      tol: Object.freeze({ abs: 2 }),
+      sourced: 'external',
+      title: 'Dry air at 20 C, sea level (physical constant, non-CoD)',
+      source: 'https://ccrma.stanford.edu/~jos/pasp/Speed_Sound_Air.html',
+      confidence: 'corroborated',
+      note: '343 m/s, accept 341-345; REJECT the 330 m/s rounding for scheduling maths (~4% error). Reproduced on a '
+        + 'second differently-phrased attempt as 343.2 m/s in dry air at 20 C, corroborated by Stanford CCRMA and '
+        + 'the Physics Factbook, matching 1125 ft/s. Temperature-dependent — 343 is the 20 C reference, not a '
+        + 'universal constant. FOR COD-UNIT PROPAGATION SCHEDULING: game units are inches, so 343 m/s = 13504 '
+        + 'units/s, i.e. sound travels roughly 13.5 game units per millisecond.',
+    }),
+  }),
+
+  /**
+   * AI BEHAVIOUR — second verification pass. ALL NON-COD: these are general game-AI conventions from
+   * Game AI Pro 2 chapter 5 (Rabin, "Agent Reaction Time") plus human reaction-time literature. No
+   * published CoD bot reaction figure exists. Durations in SECONDS.
+   */
+  ai: Object.freeze({
+    ai_reaction_delay_base: Object.freeze({
+      value: 0.25,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.05 }),
+      sourced: 'external',
+      title: 'Game AI Pro 2 ch.5 (general game-AI convention, NOT a CoD-measured constant)',
+      source: 'https://www.gameaipro.com/GameAIPro2/GameAIPro2_Chapter05_Agent_Reaction_Time_How_Fast_Should_An_AI_React.pdf',
+      confidence: 'corroborated',
+      note: '0.25 s (0.20-0.30). An independent query returned this guidance exactly: "If an enemy AI is aware of '
+        + 'the player\'s location, use a base delay of 0.25 seconds (250 ms)", anchored to the ~250 ms average '
+        + 'human visual reaction time. CONFIRMED AS GENERAL CONVENTION, NOT A COD NUMBER — the first pass caveat '
+        + 'is correct and must be preserved in any report that cites this.',
+    }),
+    ai_reaction_delay_range: Object.freeze({
+      value: null,
+      unit: 's',
+      tol: Object.freeze({ min: 0.20, max: 0.40 }),
+      sourced: 'external',
+      title: 'Game AI Pro 2 ch.5 — recommended reaction-time band (non-CoD)',
+      source: 'https://www.gameaipro.com/GameAIPro2/GameAIPro2_Chapter05_Agent_Reaction_Time_How_Fast_Should_An_AI_React.pdf',
+      confidence: 'corroborated',
+      note: 'A BAND, so value is null and the tolerance IS the band: any implemented delay inside 0.20-0.40 s '
+        + 'passes, outside 0.15-0.50 s fails. Reproduced near-verbatim: "a recommended AI reaction time is '
+        + 'somewhere between 0.2 and 0.4 seconds, possibly longer depending on context". The "possibly longer" '
+        + 'qualifier is why the fail band is wider than the pass band.',
+    }),
+    ai_friend_foe_identification_delay: Object.freeze({
+      value: 0.4,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.075 }),
+      sourced: 'external',
+      title: 'Game AI Pro 2 ch.5 — go/no-go reaction time (non-CoD)',
+      source: 'https://www.gameaipro.com/GameAIPro2/GameAIPro2_Chapter05_Agent_Reaction_Time_How_Fast_Should_An_AI_React.pdf',
+      confidence: 'corroborated',
+      note: '0.4 s (0.325-0.475). Reproduced: "For go/no-go reaction time (making a decision based on additional '
+        + 'information, such as whether to shoot an enemy), this can average around 0.4 seconds." Exactly the '
+        + 'documented EXTENSION of the 0.25 s base when friend/foe identification is required — so the '
+        + 'implementation should apply 0.25 s when target identity is already known and 0.4 s when it is not, '
+        + 'rather than one blended constant.',
+    }),
+    human_reaction_time_average_visual: Object.freeze({
+      value: 0.250,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.050 }),
+      sourced: 'external',
+      title: 'Untrained adults, simple visual reaction-time tests (non-CoD)',
+      source: 'https://www.gameaipro.com/GameAIPro2/GameAIPro2_Chapter05_Agent_Reaction_Time_How_Fast_Should_An_AI_React.pdf',
+      confidence: 'corroborated',
+      note: '250 ms (200-300). Corroborated inside the Game AI Pro result text: "the average human reaction time '
+        + 'for visual stimuli is about 250 ms", explicitly the anchor for the 0.25 s AI base delay. SIMPLE-RT '
+        + '(single stimulus, single response), NOT go/no-go — go/no-go is the ~400 ms figure in '
+        + 'ai_friend_foe_identification_delay. The same result gave ~230 ms for pro fighting-game players, a '
+        + 'consistent ordering.',
+    }),
+    fighting_game_pro_reaction_delay: Object.freeze({
+      value: 0.230,
+      unit: 's',
+      tol: Object.freeze({ abs: 0.030 }),
+      sourced: 'external',
+      title: 'Professional fighting-game players, cited in Game AI Pro / fighting-game AI literature (non-CoD)',
+      source: 'https://www.gameaipro.com/GameAIPro2/GameAIPro2_Chapter05_Agent_Reaction_Time_How_Fast_Should_An_AI_React.pdf',
+      confidence: 'corroborated',
+      note: '230 ms +/-30 ms. An imposed 230 ms action delay is used to make game AI match average PROFESSIONAL '
+        + 'human reaction time. It sits between the 250 ms untrained baseline and the ~150-190 ms FPS elite tail, '
+        + 'so it is a reasonable "skilled but fair" bot delay — a sensible upper difficulty tier, with 0.25 s as '
+        + 'the default tier.',
+    }),
+  }),
+
+  /**
+   * INTERNAL INVARIANTS — not research. Nothing in this domain has or can have an external source,
+   * and nothing here counts toward external/sourced coverage (sourced: 'internal').
+   */
+  integrity: Object.freeze({
+    hitbox_visible_mesh_hittable: Object.freeze({
+      value: 0,
+      unit: 'defects (visible character meshes that cannot be hit)',
+      tol: Object.freeze({ abs: 0 }),
+      sourced: 'internal',
+      title: 'This codebase — hitbox/mesh correspondence invariant',
+      source: 'internal invariant — no external source exists or can exist',
+      confidence: 'internal-invariant',
+      note: 'THERE IS NO EXTERNAL CALL OF DUTY NUMBER FOR THIS AND THERE NEVER WILL BE: no publisher documents '
+        + 'hitbox-to-mesh correspondence, so searching harder cannot help and any figure claiming to be one would '
+        + 'be fabricated. This is therefore stated as an INVARIANT OF THIS CODEBASE instead of a reference value: '
+        + 'every mesh the player can SEE on a character must be HITTABLE. Required defect rate is exactly 0 — a '
+        + 'visible-but-unhittable mesh is a defect BY CONSTRUCTION, because the player aimed at something the '
+        + 'renderer drew and the simulation disagreed; no tolerance is meaningful for that class of bug. Testable '
+        + 'form: enumerate every visible submesh of the character rig, cast a ray at each from a direction where it '
+        + 'is unoccluded, and require a hit registration attributed to that character for every one; count of '
+        + 'failures must be 0. The CONVERSE is deliberately NOT asserted here — hitboxes larger than the visible '
+        + 'mesh are a normal and often intentional netcode/feel choice in shooters, so this invariant covers only '
+        + 'visible-implies-hittable, not hittable-implies-visible. Because sourced is "internal", missing() still '
+        + 'reports hitbox_fidelity as a research blind spot and counts() excludes this from the external target '
+        + 'count. Do not "fix" that by relabelling it external.',
+    }),
   }),
 });
 
@@ -734,10 +1812,23 @@ const SCOPE = Object.freeze({
     'handling.mcw_sprint_to_fire_time',
     'handling.xm4_sprint_to_fire_time',
   ]),
+  // Still empty after the second pass: no acceleration/ramp-up figure (time or distance to reach
+  // full walk or sprint speed) was found for any CoD title on either pass. The speed TARGETS exist
+  // (movement.*), but nothing describes how quickly a player REACHES them.
   movement_acceleration: Object.freeze([]),
-  air_control: Object.freeze([]),
-  slide: Object.freeze([]),
-  mantle: Object.freeze([]),
+  air_control: Object.freeze(['movement.air_control']),
+  slide: Object.freeze([
+    'physics.slide_max_speed_scale',
+    'physics.slide_max_duration',
+  ]),
+  // Both refs are non-covering on purpose: mantle_duration is an explicit NEGATIVE RESULT (value
+  // null) and mantle_duration_genre_proxy is a non-CoD proxy. missing() therefore still reports
+  // 'mantle'. The refs are listed anyway so the recorded negative result is discoverable from the
+  // scope item rather than lost in the physics domain.
+  mantle: Object.freeze([
+    'physics.mantle_duration',
+    'physics.mantle_duration_genre_proxy',
+  ]),
   bullet_velocity: Object.freeze([
     'ballistics.bullet_model_is_projectile_not_hitscan',
     'ballistics.ar_muzzle_velocity_mcw_mw3_2023',
@@ -759,18 +1850,77 @@ const SCOPE = Object.freeze({
     'damage.m4a1_mw2019_near_range_stop',
     'damage.m4a1_mw2019_far_range_stop',
     'damage.m4a1_mw2019_min_damage',
+    'damage.striker45_mw2019_falloff_range_stops',
+    'damage.mcw_mw3_head_damage',
+    'damage.mcw_mw3_upper_torso_damage',
+    'damage.mcw_mw3_lower_torso_damage',
+    'damage.mcw_mw3_mid_damage',
+    'damage.mcw_mw3_min_damage',
+    'damage.mcw_mw3_max_damage_post_buff',
+    'damage.mcw_mw3_near_range_stop',
+    'damage.mcw_mw3_max_damage_range_mid_patch',
+    'damage.m4_mw2_max_damage',
+    'damage.m4a1_mw2019_headshot_multiplier',
+    'damage.mw2019_headshot_multiplier_sniper_rifles',
+    'damage.mw2019_headshot_multiplier_shotguns',
+    'damage.mw2019_m14_headshot_multiplier',
+    'damage.mcw_mw3_headshot_multiplier_launch',
+    'damage.mcw_mw3_headshot_multiplier_post_buff',
+    'damage.mcw_mw3_torso_multiplier_launch',
+    'damage.mcw_mw3_torso_multiplier_post_buff',
   ]),
-  hitbox_fidelity: Object.freeze([]),
+  // The ONLY ref here is an internal invariant (sourced: 'internal'), so missing() still reports
+  // hitbox_fidelity as a research blind spot — correctly. No publisher documents hitbox-to-mesh
+  // correspondence, so external coverage of this item is not achievable, ever.
+  hitbox_fidelity: Object.freeze(['integrity.hitbox_visible_mesh_hittable']),
   ttk_ranges: Object.freeze([
     'damage.m4a1_mw2019_stk_max_range',
     'damage.m4a1_mw2019_stk_min_range',
     'damage.m4a1_mw2019_ttk_max_range',
     'damage.m4a1_mw2019_ttk_min_range',
     'damage.health_mw2019',
+    'damage.health_mw2_2022',
+    'damage.health_mw3',
+    'damage.health_bo6',
+    'damage.mcw_mw3_rpm',
+    'damage.mcw_mw3_shot_interval',
+    'damage.mcw_mw3_ttk',
+    'damage.ar_mw3_typical_ttk',
+    'damage.m4_mw2_ttk_max_range',
+    'damage.bo6_average_assault_rifle_ttk',
+    'damage.bo6_fastest_assault_rifle_ttk',
+    'damage.bo6_fastest_full_auto_assault_rifle_ttk',
+    'damage.bo4_slowest_assault_rifle_ttk',
   ]),
-  ai_reaction: Object.freeze([]),
+  // Non-CoD general game-AI convention (Game AI Pro 2 ch.5) plus human reaction-time literature.
+  // Covered, but the titles say "non-CoD" and any report citing these must repeat that.
+  ai_reaction: Object.freeze([
+    'ai.ai_reaction_delay_base',
+    'ai.ai_reaction_delay_range',
+    'ai.ai_friend_foe_identification_delay',
+    'ai.human_reaction_time_average_visual',
+    'ai.fighting_game_pro_reaction_delay',
+  ]),
+  // Still empty after the second pass: nothing on bot aim error, spread cone, tracking accuracy or
+  // difficulty-scaled hit probability was found for any CoD title. Reaction TIMING is covered above;
+  // reaction ACCURACY is not, and the two must not be conflated.
   ai_accuracy: Object.freeze([]),
-  audio_latency: Object.freeze([]),
+  audio_latency: Object.freeze([
+    'audio.competitive_audio_latency_target',
+    'audio.competitive_audio_latency_ceiling',
+    'audio.audio_latency_noticeable_casual_player',
+    'audio.audio_latency_expert_detection_threshold',
+    'audio.web_audio_outputlatency_wired',
+    'audio.web_audio_baselatency_interactive',
+    'audio.web_audio_render_quantum',
+    'audio.windows_wired_headset_total_audio_latency',
+    'audio.bluetooth_audio_latency_penalty',
+    'audio.av_desync_detectability_audio_lagging',
+    'audio.av_desync_detectability_audio_leading',
+    'audio.av_desync_acceptability_audio_leading',
+    'audio.av_desync_acceptability_audio_lagging',
+    'audio.speed_of_sound_air',
+  ]),
 });
 
 export const SCOPE_ITEMS = Object.freeze(Object.keys(SCOPE));
@@ -836,31 +1986,81 @@ export function describe(domain, key) {
   const val = t.value === null
     ? 'NO TARGET'
     : (typeof t.value === 'number' ? `${t.value} ${t.unit}` : String(t.value).slice(0, 80) + '...');
-  return `${domain}.${key} = ${val} [${tolStr}] (${t.confidence}) — ${t.title} — ${t.source}`;
+  const cls = sourcingClass(t);
+  const clsStr = cls === 'external' ? '' : ` [${cls.toUpperCase()} — NOT an external CoD target]`;
+  return `${domain}.${key} = ${val} [${tolStr}] (${t.confidence})${clsStr} — ${t.title} — ${t.source}`;
+}
+
+/** Sourcing class of a target. First-pass entries carry no `sourced` field and are external. */
+function sourcingClass(t) {
+  return t.sourced ?? 'external';
 }
 
 /**
- * Scope items with NO sourced target at all. Print this alongside results so the suite states its
- * own blind spots instead of implying full coverage. Throws if a SCOPE ref points at a target that
- * does not exist, so coverage cannot be faked by a typo.
+ * Does this target actually COVER a scope item? Only an external source with a value does. This is
+ * the rule that stops the file overstating itself in three specific ways:
+ *   - a recorded NEGATIVE RESULT (value null, e.g. physics.mantle_duration) is not coverage;
+ *   - a NON-COD PROXY (physics.mantle_duration_genre_proxy) is not coverage;
+ *   - an INTERNAL INVARIANT (integrity.hitbox_visible_mesh_hittable) is not coverage from research.
+ * A qualitative string value (e.g. movement.air_control) DOES count — a behavioural spec precise
+ * enough to test is real coverage even with tol: null.
+ */
+function covers(t) {
+  return sourcingClass(t) === 'external' && t.value !== null;
+}
+
+/**
+ * Scope items with NO externally-sourced target at all. Print this alongside results so the suite
+ * states its own blind spots instead of implying full coverage. Throws if a SCOPE ref points at a
+ * target that does not exist, so coverage cannot be faked by a typo.
+ *
+ * After the second verification pass the list is: movement_acceleration and ai_accuracy (genuinely
+ * nothing found), mantle (searched three ways, confirmed no published CoD figure; only a negative
+ * result and a non-CoD proxy are recorded), and hitbox_fidelity (an internal invariant only — no
+ * external source exists or can exist, so this one can never leave the list).
  */
 export function missing() {
   const out = [];
   for (const item of SCOPE_ITEMS) {
     const refs = SCOPE[item];
+    let covered = 0;
     for (const ref of refs) {
       const [domain, key] = ref.split('.');
-      get(domain, key); // throws on a dangling ref
+      const t = get(domain, key); // throws on a dangling ref
+      if (covers(t)) covered += 1;
     }
-    if (refs.length === 0) out.push(item);
+    if (covered === 0) out.push(item);
   }
   return out;
 }
 
-/** Sourced-target count per domain, for coverage reporting. */
+/**
+ * Per-domain target counts, broken down by sourcing class so an internal invariant or a non-CoD
+ * proxy cannot be mistaken for external research coverage. Returns
+ * { [domain]: { total, external, proxy, internal, noValue, qualitative } } where:
+ *   external    — externally sourced AND carrying a value (the honest "sourced target" count);
+ *   proxy       — non-CoD placeholder anchors (excluded from external);
+ *   internal    — invariants of this codebase (excluded from external);
+ *   noValue     — value === null: recorded absences and band-only targets;
+ *   qualitative — tol === null: assert the behaviour, not a number.
+ * NOTE: this used to return a plain integer per domain. Callers that want the old number should read
+ * counts()[domain].external, which is the figure worth reporting.
+ */
 export function counts() {
   const out = {};
-  for (const [domain, keys] of Object.entries(TARGETS)) out[domain] = Object.keys(keys).length;
+  for (const [domain, keys] of Object.entries(TARGETS)) {
+    const row = { total: 0, external: 0, proxy: 0, internal: 0, noValue: 0, qualitative: 0 };
+    for (const t of Object.values(keys)) {
+      row.total += 1;
+      const cls = sourcingClass(t);
+      if (cls === 'proxy-non-cod') row.proxy += 1;
+      else if (cls === 'internal') row.internal += 1;
+      if (covers(t)) row.external += 1;
+      if (t.value === null) row.noValue += 1;
+      if (t.tol === null) row.qualitative += 1;
+    }
+    out[domain] = row;
+  }
   return out;
 }
 
