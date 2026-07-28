@@ -181,7 +181,20 @@ export const SPEC = {
   name: 'M4A1',
   magSize: 30,
   reserve: 180,
-  rpm: 780,
+  // damage.m4a1_mw2019_rpm. 780 was authored to taste and belonged to no
+  // weapon: it sat between the sourced XM4 at 750 and M4 at 811 and passed a
+  // check against either by luck, while main.js had already adopted the MW2019
+  // M4A1's damage profile wholesale — 30 HP flat to 37.5 m, 20 HP past 50 m,
+  // four rounds to kill inside the plateau.
+  //
+  // Time-to-kill is shots-to-kill times the interval, so a weapon cannot borrow
+  // one title's damage and another's cadence and land on either title's TTK.
+  // At 780 rpm four rounds took 233 ms against a sourced 264 ms and no tuning of
+  // the damage model could close that, because the gap was entirely the
+  // interval. At 682 the whole weapon is one documented weapon and the two
+  // sourced TTKs, 264 ms inside the max-damage range and 352 ms past the
+  // minimum, follow from figures rather than from a coincidence.
+  rpm: 682,
   damage: 34,
   headshotMultiplier: 2.4,
   range: 220,

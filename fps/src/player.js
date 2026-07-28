@@ -71,7 +71,18 @@ export const TUNING = {
   // against the 0.991 m those dvars imply — a jump 35% short, which is why the
   // 1.15 m ledge in the mantle tests is unreachable by jumping even now.
   gravity: 20.32,
-  jumpVelocity: 6.345,
+  // sqrt(2 * g * h) is 6.345, and that is the velocity that reaches 0.991 m
+  // under continuous integration. The simulation is not continuous: it advances
+  // in fixed 60 Hz steps with semi-implicit Euler, which loses g*dt/2 of
+  // velocity on the first step and so tops out at 0.938 m — a 5.3% short jump
+  // that reads as the dvars being wrong when it is the integrator being
+  // discrete. Solving the discrete arc instead, v0^2/(2g) - v0*dt/2 = h, gives
+  // 6.518 and a measured apex of 0.991 m.
+  //
+  // The correction is tied to TICK in main.js. If the tick rate changes this
+  // needs re-solving, which is why the arithmetic is written down rather than
+  // the result alone.
+  jumpVelocity: 6.518,
   coyoteTime: 0.11,
   jumpBuffer: 0.13,
 

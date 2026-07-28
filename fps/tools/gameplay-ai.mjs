@@ -375,7 +375,12 @@ async function install(sim) {
           const raw = S.damage * (S.falloffScale + (1 - S.falloffScale) * falloff);
           e.health = 5000;
           const before = e.health;
-          g.resolveBullet(o, dir, S.damage, true);
+          // fireRound, not resolveBullet: rounds were given a flight, so the
+          // player's shot path launches a projectile and resolveBullet no longer
+          // exists on Game. This threw outright — TypeError, and the whole suite
+          // died mid-run rather than reporting a red — which is the better of the
+          // two failure modes but still cost 41 checks.
+          g.fireRound(o, dir, true);
           out.push({ zone: hit.zone, delta: before - e.health, raw, d: hit.distance });
         }
       }

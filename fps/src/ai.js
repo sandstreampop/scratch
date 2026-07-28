@@ -468,10 +468,26 @@ export class Enemy {
 
   /* -------------------------------------------------------------- damage -- */
 
-  applyDamage(amount, zone, direction) {
+  /**
+   * `zoneMult` is the multiplier the shooter resolved for the zone this round
+   * landed in, and it is authoritative when supplied.
+   *
+   * Three values were competing here. A 2.6 literal lived in this method,
+   * SPEC.headshotMultiplier sat at 2.4 and was read by nobody, and main.js's
+   * sourced ballistics table says 1.4 — the documented MW2019 figure, where
+   * nothing in the research exceeds 1.5 for any weapon class. Reading the
+   * argument makes that table the single source: a head hit takes 42 HP rather
+   * than 72, so a centred four-round kill can no longer be beaten by two stray
+   * rounds finding the head, which is what made time-to-kill measurably
+   * non-monotonic in range.
+   *
+   * The fallback chain is kept for a caller that has not been taught to pass
+   * one, but it is now the exception rather than the live path.
+   */
+  applyDamage(amount, zone, direction, zoneMult = null) {
     if (!this.alive) return false;
     const head = SPEC.headshotMultiplier ?? 2.6;
-    const mult = zone === 'head' ? head : zone === 'limb' ? 0.72 : 1.0;
+    const mult = zoneMult ?? (zone === 'head' ? head : zone === 'limb' ? 0.72 : 1.0);
     this.health -= amount * mult;
     this._flinchVel -= 7 * (zone === 'head' ? 1.6 : 1);
     this.aware = 1;

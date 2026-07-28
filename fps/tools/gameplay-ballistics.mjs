@@ -642,7 +642,14 @@ export default async function run(sim, report) {
         // quantised measurements — a bisection to a quarter of a metre cannot land
         // on 20 to zero tolerance, and pretending otherwise would be a check that
         // fails for being honest.
-        if (velocityFit) {
+        // Guarded on finiteness, not just on presence. With gravity reverted the
+        // 200 m round misses — the holdover assumes drop — the fit degenerates to
+        // NaN, and report.measure rightly refuses it by throwing. That took the
+        // run down at 15 of 21 checks and silently skipped the drop, penetration,
+        // damage, zone and TTK sections, so a red-green cycle on this suite could
+        // report 21 checks instead of 107 and look like a pass. The file already
+        // learned this lesson at the falloff probe; it needed learning twice.
+        if (velocityFit && Number.isFinite(velocityFit.slope) && bisected > 0) {
           report.measure('instant-hit divisor implied by velocity and the measured boundary',
             velocityFit.slope / bisected, 'Hz',
             `${f2(velocityFit.slope)} m/s over ${f2(bisected)} m; the sourced divisor is exactly 20 `

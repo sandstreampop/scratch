@@ -141,29 +141,45 @@ export default async function run(sim, report) {
    * along.
    *
    * The cone is applied inside playerShoot() after aimDirection(), so the only
-   * place the dispersion of an actual round is visible is the direction handed to
-   * resolveBullet(). Camera direction and bullet direction are read at the same
+   * place the dispersion of an actual round is visible is the direction the round
+   * is launched along. Camera direction and bullet direction are read at the same
    * instant, so view kick is common to both and cancels: what is left is the
    * cone and nothing else. Installed as an own property shadowing the prototype
    * method, so teardown is a delete and cannot leave a half-patched game behind
    * for the next suite.
+   *
+   * The seam is fireRound() and not resolveBullet(). It was resolveBullet until
+   * rounds were given a flight: playerShoot() now launches a projectile and the
+   * hit is resolved later, from inside the round walk, against a direction that
+   * has already been rotated by penetration and pulled down by gravity. Tapping
+   * there measured zero bullets outright — three dispersion checks reported "0
+   * bullets recorded" while the weapon was firing normally, which is the
+   * instrument going silent rather than the game going quiet, and is precisely
+   * the failure this project keeps having to catch. It would also have been
+   * worse if it had half-worked: a tap downstream of gravity measures drop as
+   * dispersion.
    */
   async function tapBullets() {
     await sim.eval(() => {
       const g = window.__GAME;
       window.__SHOTS = [];
       const proto = Object.getPrototypeOf(g);
-      g.resolveBullet = function (origin, dir, damage, fromPlayer) {
+      if (typeof proto.fireRound !== 'function') {
+        // Better a loud failure than a silent zero: the whole dispersion section
+        // is meaningless if this seam has moved again.
+        throw new Error('tapBullets: Game.fireRound is gone — the shot path moved, find the new seam');
+      }
+      g.fireRound = function (origin, dir, fromPlayer) {
         if (fromPlayer) {
           const cam = g.camera.getWorldDirection(new window.__THREE.Vector3());
           const d = Math.min(1, Math.max(-1, cam.dot(dir)));
           window.__SHOTS.push({ t: g.elapsed, dev: Math.acos(d), ammo: g.weapon.ammo });
         }
-        return proto.resolveBullet.call(this, origin, dir, damage, fromPlayer);
+        return proto.fireRound.call(this, origin, dir, fromPlayer);
       };
     });
   }
-  const untapBullets = () => sim.eval(() => { delete window.__GAME.resolveBullet; });
+  const untapBullets = () => sim.eval(() => { delete window.__GAME.fireRound; });
   const takeShots = () => sim.eval(() => {
     const s = window.__SHOTS ?? [];
     window.__SHOTS = [];
@@ -212,10 +228,12 @@ export default async function run(sim, report) {
         : `${cShip.rounds} rounds, mean interval ${ms(cShip.interval)}`);
 
     if (Number.isFinite(cShip.rpm)) {
-      report.against('sustained rate of fire at the shipping step', cShip.rpm, 'handling', 'xm4_fire_rate');
-      report.against('sustained rate of fire against the M4 figure', cShip.rpm, 'handling', 'm4_fire_rate');
-      report.against('mean shot interval', cShip.interval, 'handling', 'm4_shot_interval');
-    }
+      // The weapon is the MW2019 M4A1 throughout: main.js took that title's damage
+      // profile and shots-to-kill, and SPEC.rpm now takes its 682 rpm, so cadence
+      // is asserted against the same weapon rather than against the XM4 and the
+      // MW2 M4 — two other guns whose figures the old 780 happened to sit between.
+      report.against('sustained rate of fire', cShip.rpm, 'damage', 'm4a1_mw2019_rpm');
+                }
     if (Number.isFinite(cFine.rpm) && Number.isFinite(cShip.rpm)) {
       const apart = Math.abs(cFine.rpm - cShip.rpm) / cShip.rpm;
       report.check('rate of fire does not depend on the simulation step',
