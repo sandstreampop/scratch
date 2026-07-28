@@ -1063,9 +1063,16 @@ export class Level {
     const g = new THREE.Group();
     const y0 = this.groundHeight(x, z);
     g.position.set(x, y0, z);
-    const geo = new THREE.TorusGeometry(0.38, 0.155, 7, 20);
+    // Seven radial segments made the crown visibly heptagonal from across the
+    // courtyard, and four separate blind reviewers named the stacks as an
+    // obvious placeholder, one of them calling them literal toruses. The extra
+    // segments cost nothing on a mesh this small and instanced.
+    const geo = new THREE.TorusGeometry(0.38, 0.155, 14, 32);
     geo.rotateX(Math.PI / 2);
-    const mat = new THREE.MeshStandardMaterial({ color: 0x1b1a19, roughness: 0.93, metalness: 0.0 });
+    // Torus UVs run u around the ring and v around the carcass, which is what
+    // the rubber sampler is authored against: tread band in the middle of v,
+    // sidewalls either side. Repeat stays 1 so that mapping is not broken.
+    const mat = material('rubber', 1);
     const inst = new THREE.InstancedMesh(geo, mat, n);
     inst.castShadow = true; inst.receiveShadow = true;
     const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();

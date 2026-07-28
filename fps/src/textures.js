@@ -503,6 +503,63 @@ const SAMPLERS = {
     c.ao = 0.58 + thread * 0.42 - dirty * 0.10 - (1 - slack) * 0.12;
   },
 
+  /**
+   * Worn tyre rubber — tread blocks, sidewall relief, sun-perished shoulders.
+   *
+   * The stacks were a flat 0x1b1a19 with no maps at all, which four
+   * independent blind reviewers each picked out by name; one called them
+   * "literal toruses". Rubber is the easiest material in the level to give
+   * away, because it is the only one with a strong regular geometric pattern
+   * moulded into it, and a black ellipsoid with no pattern reads as licorice.
+   *
+   * The v axis runs around the carcass, so the tread band sits in a fixed
+   * range of v and the sidewalls either side of it. That lets one sampler
+   * carry both surfaces, which a torus needs since it has no seam to split at.
+   */
+  rubber(u, v, c, s) {
+    // Where on the carcass we are: 0 at the outer crown, 1 at the bead.
+    const across = Math.abs(v - 0.5) * 2;
+    const crown = 1 - smoothstep(0.30, 0.62, across);
+
+    // Directional tread blocks, chevroned and offset row to row.
+    const ROWS = 26;
+    const ru = u * ROWS;
+    const row = Math.floor(ru);
+    const skew = (row % 2) * 0.5;
+    const bu = Math.abs(((ru + skew) % 1) - 0.5);
+    const groove = smoothstep(0.30, 0.42, bu);
+    // A circumferential groove either side of centre, as most road tyres have.
+    const rib = smoothstep(0.035, 0.075, Math.abs(across - 0.34));
+    const tread = clamp(groove * rib, 0, 1);
+
+    // Sidewall lettering and the moulded ring it sits on: too small to read,
+    // but it catches a grazing sun and that is what says "tyre" at ten metres.
+    const ring = smoothstep(0.02, 0.05, Math.abs(across - 0.74));
+    const letters = smoothstep(0.55, 0.85, fbm(u * 9, (across - 0.74) * 30, 2, 6) * 0.5 + 0.5)
+      * (1 - ring) * (across > 0.6 ? 1 : 0);
+
+    const grain = micro(u, v, 110, 3, s) * 0.5 + 0.5;
+    const scuff = warped(u * 3, v, 4, 5) * 0.5 + 0.5;
+    // Perished, chalky patches where the sun has got at the sidewall.
+    const perish = smoothstep(0.52, 0.88, fbm(u * 2 + 0.4, v + 0.7, 4, 4) * 0.5 + 0.5)
+      * (0.35 + across * 0.65);
+
+    c.h = 0.34 + tread * 0.44 * crown + letters * 0.16 + grain * 0.06 - perish * 0.08;
+
+    // Carbon black is dark but not the 0.011 linear the flat colour was using;
+    // real tyre rubber sits nearer 0.035 and lifts further where it is dusty.
+    const l = 0.052 + grain * 0.012 + tread * 0.008 * crown;
+    c.r = l * 1.000; c.g = l * 0.972; c.b = l * 0.944;
+    // Dust does most of the visual work on a tyre lying in sand.
+    const dust = clamp(scuff * 0.55 + perish * 0.5, 0, 1);
+    c.r = lerp(c.r, 0.212, dust * 0.42); c.g = lerp(c.g, 0.184, dust * 0.42); c.b = lerp(c.b, 0.146, dust * 0.42);
+
+    // Crown polished by the road, sidewall matte, perished patches chalkiest.
+    c.rough = clamp(0.94 - crown * 0.16 - tread * 0.05 + perish * 0.05, 0, 1);
+    c.metal = 0;
+    c.ao = 1 - (1 - tread) * 0.30 * crown - perish * 0.10;
+  },
+
   /** Weathered timber plank — grain, splits, knots, nail staining. */
   wood(u, v, c, s) {
     const planks = 5;
@@ -650,6 +707,7 @@ const RESOLUTION = {
   sand: 1024, dirt: 1024, plaster: 1024, concrete: 1024,
   rust: 512, painted: 512, burlap: 512, wood: 512,
   canvas: 512, gunmetal: 512, polymer: 512, corrugated: 512,
+  rubber: 512,
 };
 
 // Chosen so the steepest texel of each surface lands near the slope the real
@@ -660,6 +718,8 @@ const NORMAL_STRENGTH = {
   sand: 0.85, dirt: 1.1, plaster: 0.75, concrete: 0.8,
   rust: 1.15, painted: 0.7, burlap: 2.2, wood: 1.15,
   canvas: 1.0, gunmetal: 0.6, polymer: 1.0, corrugated: 2.6,
+  // Moulded tread is deep relief; this is the whole point of the material.
+  rubber: 2.4,
 };
 
 const cache = new Map();
@@ -706,6 +766,7 @@ export function maps(name) {
 const MACRO = {
   sand: 0.17, dirt: 0.17, plaster: 0.15, concrete: 0.13,
   rust: 0.12, painted: 0.12, burlap: 0.12, wood: 0.11, corrugated: 0.11,
+  rubber: 0.10,
 };
 
 // Value noise on world position. Nothing here is authored per-texel, so it is
