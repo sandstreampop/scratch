@@ -454,7 +454,17 @@ export class Player {
     }
 
     // ---- sprint / ads gating ---------------------------------------------
-    const wantSprint = input.sprint && input.forward && !this.crouching && !input.ads && this.onGround;
+    // Grounding is checked against the coyote window rather than this frame's
+    // onGround, which the measurement suite caught: sprinting held for only 55%
+    // of a nine-tenths-of-a-second run-up because the flag drops on every tick
+    // a run momentarily leaves the terrain. Bumpy ground therefore flickered
+    // sprint off — and with it the sprint-to-fire penalty, which is the part
+    // that matters, since a penalty that lapses on a bump is one a player gets
+    // for free by running over rubble. The same window already exists for
+    // jumping, and reusing it means one definition of "on the ground for
+    // gameplay purposes" instead of two that disagree.
+    const groundedForSprint = this.onGround || (now - this._coyote) < TUNING.coyoteTime;
+    const wantSprint = input.sprint && input.forward && !this.crouching && !input.ads && groundedForSprint;
     this.sprinting = wantSprint && this.speedHorizontal > 1.2;
     this.adsTarget = input.ads && !this.sprinting ? 1 : 0;
     this.ads = THREE.MathUtils.damp(this.ads, this.adsTarget, 16, dt);
