@@ -1,0 +1,82 @@
+name: fetch-reference-frames
+
+# The sandbox this game is developed in has no outbound network access to image
+# hosts, so a like-for-like visual comparison against a shipped title cannot be
+# set up there. The runner does have access. This fetches official promotional
+# screenshots through Steam's public app API and hands them back as a build
+# artifact.
+#
+# Artifact, deliberately, not a commit. These are Activision's copyrighted
+# promotional images, fetched for a side-by-side quality review; an artifact
+# expires and is scoped to the repository, whereas committing them would
+# republish them from a public repo. Nothing here ends up in the game.
+
+on:
+  workflow_dispatch:
+    inputs:
+      appids:
+        description: 'Comma-separated Steam appids to pull screenshots from'
+        required: false
+        default: '1938090,2000950'
+      per_app:
+        description: 'How many screenshots per title'
+        required: false
+        default: '6'
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Pull official screenshots
+        env:
+          APPIDS: ${{ inputs.appids }}
+          PER_APP: ${{ inputs.per_app }}
+        run: |
+          set -euo pipefail
+          mkdir -p reference
+          IFS=',' read -ra IDS <<< "$APPIDS"
+          for id in "${IDS[@]}"; do
+            id="$(echo "$id" | tr -d '[:space:]')"
+            echo "::group::appid $id"
+            # The store API returns the same screenshot set the store page shows.
+            curl -sS --max-time 30 \
+              "https://store.steampowered.com/api/appdetails?appids=${id}&l=english" \
+              -o "meta_${id}.json" || { echo "metadata fetch failed"; continue; }
+
+            name=$(jq -r --arg id "$id" '.[$id].data.name // "unknown"' "meta_${id}.json")
+            echo "title: $name"
+
+            # path_full is the full-resolution capture; path_thumbnail is not
+            # worth comparing anything against.
+            jq -r --arg id "$id" \
+              '.[$id].data.screenshots[]?.path_full' "meta_${id}.json" \
+              | head -n "$PER_APP" > "urls_${id}.txt" || true
+
+            n=0
+            while IFS= read -r url; do
+              [ -z "$url" ] && continue
+              n=$((n+1))
+              out="reference/${id}_$(printf '%02d' "$n").jpg"
+              curl -sS --max-time 60 -L "$url" -o "$out" || { echo "  miss: $url"; continue; }
+              echo "  $out  $(stat -c%s "$out") bytes"
+            done < "urls_${id}.txt"
+
+            printf '%s\t%s\n' "$id" "$name" >> reference/TITLES.tsv
+            echo "::endgroup::"
+          done
+
+          echo "--- collected ---"
+          ls -la reference/ || true
+          test -n "$(ls -A reference/ 2>/dev/null)" || { echo "nothing fetched"; exit 1; }
+
+      - name: Upload reference frames
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-frames
+          path: reference/
+          retention-days: 1
+          if-no-files-found: error
