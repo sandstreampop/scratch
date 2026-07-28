@@ -848,11 +848,38 @@ function applyMacro(mat, amount) {
     diffuseColor.rgb *= vec3( 1.0 + tone * uMacro * 0.84, 1.0 + tone * uMacro, 1.0 + tone * uMacro * 1.20 );
     roughnessFactor = clamp( roughnessFactor + gloss * uMacro * 0.85, 0.06, 1.0 );
 
+    // Mid frequency: the band between texel detail and silhouette.
+    //
+    // The two octaves above have wavelengths of seventeen and six metres, and
+    // the tiling maps below carry centimetres. Nothing occupied the half-metre
+    // to three-metre range in between — the scale of a damp patch, a scuffed
+    // panel, a run of staining — and that is the band that survives when the
+    // maps have mipped to flat. Twelve blind reviewers across three panels
+    // each named "every surface returns one albedo with one roughness" as the
+    // single biggest tell, and this is the frequency they were missing.
+    float mC = macroNoise( vMacroPos * 0.42 + 3.7 );
+    float mD = macroNoise( vMacroPos * 1.15 + 27.1 );
+    float mid = ( mC - 0.5 ) * 1.24 + ( mD - 0.5 ) * 0.76;
+    diffuseColor.rgb *= 1.0 + mid * uMacro * 1.35;
+    roughnessFactor = clamp( roughnessFactor + mid * uMacro * 1.55, 0.06, 1.0 );
+
     vec3 macroN = normalize( ( vec4( nonPerturbedNormal, 0.0 ) * viewMatrix ).xyz );
     float film = ( 1.0 - abs( macroN.y ) )
       * ( 1.0 - smoothstep( 0.04, 0.62 + mB * 0.55, vMacroPos.y ) ) * 0.34;
     diffuseColor.rgb *= mix( vec3( 1.0 ), vec3( 1.20, 1.10, 0.92 ), film );
     roughnessFactor = clamp( roughnessFactor + film * 0.22, 0.06, 1.0 );
+
+    // Contact grime, which is not the same thing as the dust film above it.
+    // Dust settles and lightens; the crevice where a surface meets the ground
+    // collects dirt and loses sky, so it darkens. Every reviewer in every
+    // panel said nothing reads as touching the ground. Screen-space occlusion
+    // now covers that on the top two tiers, but this is world-space, so it
+    // survives mipping, needs no depth prepass, and is the only grounding cue
+    // a phone gets.
+    float contact = ( 1.0 - smoothstep( 0.0, 0.42 + mD * 0.30, vMacroPos.y ) )
+      * ( 0.62 + 0.38 * mC );
+    diffuseColor.rgb *= mix( vec3( 1.0 ), vec3( 0.58, 0.55, 0.51 ), contact * 0.42 );
+    roughnessFactor = clamp( roughnessFactor + contact * 0.16, 0.06, 1.0 );
   }`);
   };
   // Every macro material compiles to the same program; the strength travels
