@@ -1,10 +1,29 @@
 // First-person character controller.
 //
-// Movement model is tuned against modern military shooters rather than a
-// physics sim: high ground acceleration so input feels instant, real inertia
-// in the air, capped strafe speed, and a hard separation between the collision
-// body (an AABB, axis-resolved) and the camera (which floats on springs so
-// bob, sway and recoil never push the player through a wall).
+// Movement model is tuned against modern military shooters rather than a physics
+// sim: high ground acceleration so input feels instant, almost no air
+// acceleration so a jump is a commitment, per-heading speed penalties, and a hard
+// separation between the collision body (an AABB, axis-resolved) and the camera
+// (which floats on springs so bob, sway and recoil never push the player through
+// a wall).
+//
+// Three things in here were measured wrong for a long time and the shapes that
+// fixed them are load-bearing, so they are named:
+//
+//   Directional speed penalties ride on maxSpeed, never on the wish vector.
+//   Scaling a contribution and then normalising the sum discards the scale
+//   exactly; that is how a backpedal ran at 4.986 m/s against a 4.547 m/s walk
+//   while declaring a 0.78 penalty.
+//
+//   The acceleration clamp is on the wish AXIS, so it cannot bound |v| on its
+//   own — see capSpeed(). A sprint measured 7.295 m/s against a 7.15 m/s cap not
+//   in a straight line but through a turn.
+//
+//   Everything integrates at whatever dt it is handed, which makes free fall over
+//   0.5 s differ by 2.4% between 240 Hz and 60 Hz. That is NOT fixable here: the
+//   controller cannot tell that its dt is wrong. The fix is a fixed-tick
+//   accumulator in Game.step/Game.loop in main.js, and gameplay-movement.mjs
+//   keeps its frame-rate-independence checks red and pointed at it.
 
 import * as THREE from 'three';
 
@@ -18,20 +37,74 @@ export const TUNING = {
   stepHeight: 0.42,
 
   walkSpeed: 4.55,
-  sprintSpeed: 7.15,
+  // 1.5 x walkSpeed exactly. Was 7.15, which is 1.571x — outside the 1.4-1.6
+  // band for player_sprintSpeedScale and, more to the point, above the
+  // 1.55 x walk that a slide is allowed to reach, which left no room for a
+  // slide to be a boost over a sprint at all. 6.83 also lands on the measured
+  // AR-class tactical sprint (BP50, 6.8 m/s) rather than the disputed general
+  // figure, which is the right class for the one rifle this game ships.
+  sprintSpeed: 6.825,
   crouchSpeed: 2.35,
   adsSpeed: 2.90,
-  backpedalScale: 0.78,
+  // player_backSpeedScale / player_strafeSpeedScale. Both were being discarded:
+  // the wish vector was scaled and then normalised, so a pure backpedal came out
+  // a unit vector and ran at full walkSpeed — measurably FASTER than forward
+  // (4.986 against 4.547) because backpedal was the only contributor. The scales
+  // now ride on maxSpeed, where normalisation cannot reach them.
+  backpedalScale: 0.70,
+  strafeScale: 0.80,
 
   groundAccel: 62,
-  airAccel: 14,
+  // Was 14, which is 41% of the measured ground lateral authority and gave a
+  // standing jump 4.20 m/s of side velocity — 92% of a ground strafe, i.e. total
+  // air control and a working strafe-jump. The sourced spec asks for well under
+  // 10% of ground authority; 1.0 measures at ~5%, which is a nudge rather than a
+  // second set of legs. Ruled out setting it to 0: a CoD jump can be steered
+  // slightly, and 0 makes a mistimed jump unrecoverable in a way the reference
+  // is not.
+  airAccel: 1.0,
   friction: 9.5,
   airDrag: 0.18,
 
-  gravity: 19.6,
-  jumpVelocity: 5.05,
+  // g_gravity 800 units/s^2 and jump_height 39 units, i.e. the dvar pair the
+  // whole IW-engine jump arc is defined by. Was 19.6 / 5.05, an apex of 0.640 m
+  // against the 0.991 m those dvars imply — a jump 35% short, which is why the
+  // 1.15 m ledge in the mantle tests is unreachable by jumping even now.
+  gravity: 20.32,
+  jumpVelocity: 6.345,
   coyoteTime: 0.11,
   jumpBuffer: 0.13,
+
+  // Slide. physics.slide_max_duration (0.65 s) and physics.slide_max_speed_scale
+  // (1.55) are sourced; the patch notes do not say which speed the 1.55
+  // multiplies, so this states its choice: base WALK speed, giving 7.05 m/s,
+  // just above the 6.83 sprint. Read as 1.55 x sprint it would be 10.6 m/s,
+  // half again as fast as tactical sprint, and nothing sourced supports that.
+  slideSpeedScale: 1.55,
+  slideMaxDuration: 0.65,
+  // Chosen so the boost is still above crouch speed when the duration cap ends
+  // the slide: exp(-1.3 * 0.65) x 7.05 = 3.03 m/s. Ordinary friction here
+  // (drop = max(v,3) * 9.5 * dt) erases a 7 m/s boost in ~100 ms, so the sourced
+  // 0.65 s cap would never be the thing that ends a slide and the duration would
+  // be a property of the friction constant instead.
+  slideFriction: 1.3,
+  // Long enough that a released-and-repressed crouch cannot chain slides back to
+  // back; short enough not to feel like a cooldown.
+  slideCooldown: 0.45,
+
+  // Mantle. physics.mantle_duration is an explicit negative result — no CoD
+  // figure exists for any title — so these two are bounded by measured
+  // quantities rather than invented: the low bracket is under the measured
+  // ballistic rise a jump would cost (physics.jump_apex_time, 0.312 s), or
+  // vaulting a knee-high wall would be strictly worse than jumping it, and the
+  // high bracket is under the slide's 0.65 s, the longest movement lockout
+  // anything sourced sanctions. Two brackets rather than a height-scaled
+  // duration because targets.mjs reads the BO6 "all mantle speeds have been
+  // increased" (plural) as several discrete fixed-length animations.
+  mantleLowMaxHeight: 0.90,
+  mantleMaxHeight: 1.60,
+  mantleLowDuration: 0.26,
+  mantleHighDuration: 0.40,
 
   mouseSensitivity: 0.0021,
   adsSensitivityScale: 0.62,
@@ -66,6 +139,11 @@ export class Player {
 
     this._coyote = 0;
     this._jumpBuffered = -99;
+    this._prevCrouch = false;
+    this._sliding = false;
+    this._slideStart = -99;
+    this._slideEnd = -99;
+    this._mantle = null;
     this._bobPhase = 0;
     this._bobAmount = 0;
     this._landDip = 0;
@@ -89,6 +167,7 @@ export class Player {
     this._tmp = new THREE.Vector3();
     this._forward = new THREE.Vector3();
     this._right = new THREE.Vector3();
+    this._tmpMantle = new THREE.Vector3();
 
     this.footstepCallback = null;
     this.landCallback = null;
@@ -139,6 +218,31 @@ export class Player {
     this.health = Math.max(0, this.health - amount);
     this.lastDamageTime = this._now ?? 0;
     if (this.health <= 0) this.alive = false;
+  }
+
+  /**
+   * Clamps horizontal speed after an acceleration step.
+   *
+   * The acceleration clamp is on the WISH AXIS — it limits the component along
+   * the direction being asked for, not the magnitude — so a direction change adds
+   * a full step at right angles to whatever is already there and comes out above
+   * the cap. That is where a 7.295 m/s sprint against a 7.15 m/s cap came from:
+   * not the straight-line top speed, which settles on the cap exactly, but what a
+   * turn does to it.
+   *
+   * The ceiling is max(cap, whatever we already had) rather than cap, so speed
+   * that is legitimately above the cap — a slide boost, or an ADS blend lowering
+   * the cap underneath the body — decays through friction as before instead of
+   * being teleported down. The invariant this buys is the one worth having:
+   * accelerating can never RAISE speed past the cap.
+   */
+  capSpeed(cap, before) {
+    const after = Math.hypot(this.velocity.x, this.velocity.z);
+    const ceil = Math.max(cap, before);
+    if (after > ceil && after > 1e-9) {
+      const s = ceil / after;
+      this.velocity.x *= s; this.velocity.z *= s;
+    }
   }
 
   /* -------------------------------------------------------------- solve -- */
@@ -205,8 +309,77 @@ export class Player {
 
   /* ------------------------------------------------------------- update -- */
 
+  /**
+   * Finds a ledge the body could be pulled on top of, ahead along (dx, dz).
+   *
+   * Behavioural, not geometric bookkeeping: the ledge is read out of the same
+   * collider list the movement solver uses, so anything the body can be stopped
+   * by is a thing it can be lifted over, and nothing needs to be tagged.
+   */
+  findLedge(dx, dz) {
+    // Probed at radius + 0.06, so the ledge has to be within a hair of the body:
+    // a longer reach starts mantling ledges the player is walking past.
+    const px = this.position.x + dx * (TUNING.radius + 0.06);
+    const pz = this.position.z + dz * (TUNING.radius + 0.06);
+    const lo = this.position.y + TUNING.stepHeight;   // below this, step-up owns it
+    const hi = this.position.y + TUNING.mantleMaxHeight;
+    let top = -Infinity;
+    for (const c of this.level.colliders) {
+      if (px < c.min.x || px > c.max.x || pz < c.min.z || pz > c.max.z) continue;
+      if (c.max.y <= lo || c.max.y > hi) continue;
+      if (c.max.y > top) top = c.max.y;
+    }
+    if (top === -Infinity) return null;
+
+    // The pull-up lands a full body diameter in, so the AABB ends up entirely on
+    // the ledge rather than half over the lip.
+    const reach = TUNING.radius * 2 + 0.06;
+    const to = this._tmpMantle.set(this.position.x + dx * reach, top + 0.002, this.position.z + dz * reach);
+    // Both ends of the path have to be clear: the animation rises in place first
+    // and only then moves in, so those are the only two poses it passes through.
+    const up = new THREE.Vector3(this.position.x, top + 0.002, this.position.z);
+    if (this.blocked(up, this.height) || this.blocked(to, this.height)) return null;
+    return { to: to.clone(), height: top - this.position.y };
+  }
+
+  /**
+   * Advances an in-progress mantle and returns true while it owns the frame.
+   *
+   * Vertical first, horizontal second, with no overlap: any easing that moves the
+   * body in over the lip while it is still rising puts the AABB inside the ledge
+   * for a few frames, which is a collision failure dressed up as an animation.
+   */
+  stepMantle(dt, now) {
+    const m = this._mantle;
+    const k = Math.min(1, (now - m.t0) / m.dur);
+    const kh = Math.max(0, (k - 0.5) * 2);
+    const smooth = kh * kh * (3 - 2 * kh);
+    this.position.x = m.from.x + (m.to.x - m.from.x) * smooth;
+    this.position.z = m.from.z + (m.to.z - m.from.z) * smooth;
+    this.position.y = m.from.y + (m.to.y - m.from.y) * Math.min(1, k * 2);
+    this.velocity.set(0, 0, 0);
+    this.onGround = false;
+    if (k >= 1) {
+      this.position.copy(m.to);
+      this._mantle = null;
+      this.onGround = true;
+      this._coyote = now;
+    }
+    this.height = THREE.MathUtils.damp(this.height, this.targetHeight, 14, dt);
+    if (this.alive && now - this.lastDamageTime > TUNING.regenDelay && this.health < TUNING.maxHealth) {
+      this.health = Math.min(TUNING.maxHealth, this.health + TUNING.regenRate * dt);
+    }
+    this.updateView(dt, false);
+    return true;
+  }
+
   update(dt, input, now) {
     this._now = now;
+
+    // A mantle is animation-locked, as it is in the reference: the body is off
+    // the movement solver entirely until it is standing on the ledge, which is
+    // what makes the lockout duration a thing a player can learn.
+    if (this._mantle) { this.stepMantle(dt, now); return; }
 
     // ---- stance -----------------------------------------------------------
     const wantCrouch = input.crouch;
@@ -224,13 +397,61 @@ export class Player {
     this._forward.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
     this._right.set(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
 
+    // Built in the player's own frame first. The per-axis speed penalties cannot
+    // live in the wish vector: scaling a contribution and then normalising the
+    // sum discards the scale exactly, which is what made a backpedal (the only
+    // contributor, therefore a unit vector after normalise) run at full walk
+    // speed. The direction stays a unit vector and the penalty rides on
+    // maxSpeed via dirScale below.
+    let wf = 0, wr = 0;
+    if (input.forward) wf += 1;
+    if (input.back) wf -= 1;
+    if (input.left) wr -= 1;
+    if (input.right) wr += 1;
+    const wlen = Math.hypot(wf, wr);
+    const moving = wlen > 1e-6;
+    let dirScale = 1;
     const wish = this._tmp.set(0, 0, 0);
-    if (input.forward) wish.add(this._forward);
-    if (input.back) wish.addScaledVector(this._forward, -TUNING.backpedalScale);
-    if (input.left) wish.addScaledVector(this._right, -1);
-    if (input.right) wish.add(this._right);
-    const moving = wish.lengthSq() > 1e-6;
-    if (moving) wish.normalize();
+    if (moving) {
+      wf /= wlen; wr /= wlen;
+      wish.addScaledVector(this._forward, wf).addScaledVector(this._right, wr);
+      // Elliptical speed limit: semi-axis 1 ahead, backpedalScale behind,
+      // strafeScale sideways. An ellipse rather than a per-axis min so that a
+      // diagonal is not the fastest heading in the game, which is what a naive
+      // max(scales) would make it.
+      const aF = wf >= 0 ? 1 : TUNING.backpedalScale;
+      dirScale = 1 / Math.hypot(wf / aF, wr / TUNING.strafeScale);
+    }
+
+    // ---- slide ------------------------------------------------------------
+    // Read against the PREVIOUS tick's sprint flag on purpose: the stance block
+    // above has already set `crouching`, and `wantSprint` requires !crouching, so
+    // asking "am I sprinting" after it is always false and a slide could never
+    // start. "Was sprinting when crouch went down" is also the condition a player
+    // would describe.
+    const crouchPressed = !!input.crouch && !this._prevCrouch;
+    this._prevCrouch = !!input.crouch;
+    const slideCap = TUNING.walkSpeed * TUNING.slideSpeedScale;
+    if (this._sliding) {
+      if (now - this._slideStart >= TUNING.slideMaxDuration || !input.crouch
+        || !this.onGround || this.speedHorizontal <= TUNING.crouchSpeed) {
+        this._sliding = false;
+        this._slideEnd = now;
+      }
+    } else if (crouchPressed && this.sprinting && this.onGround
+      && this.speedHorizontal > TUNING.walkSpeed
+      && now - this._slideEnd > TUNING.slideCooldown) {
+      this._sliding = true;
+      this._slideStart = now;
+      // Proportional to entry speed, not a fixed impulse: a fixed one makes a
+      // chain of slides from a standing start a faster way to travel than
+      // sprinting, since every press resets the body to the cap. Scaled this way
+      // a full-sprint entry lands exactly on the sourced 1.55x and a half-speed
+      // entry gains 3%.
+      const sp = this.speedHorizontal;
+      const to = Math.min(slideCap, sp * (slideCap / TUNING.sprintSpeed));
+      if (to > sp) { const s = to / sp; this.velocity.x *= s; this.velocity.z *= s; }
+    }
 
     // ---- sprint / ads gating ---------------------------------------------
     const wantSprint = input.sprint && input.forward && !this.crouching && !input.ads && this.onGround;
@@ -242,6 +463,26 @@ export class Player {
     if (this.crouching) maxSpeed = TUNING.crouchSpeed;
     else if (wantSprint) maxSpeed = TUNING.sprintSpeed;
     maxSpeed = THREE.MathUtils.lerp(maxSpeed, Math.min(maxSpeed, TUNING.adsSpeed), this.ads);
+    maxSpeed *= dirScale;
+    if (this._sliding) maxSpeed = slideCap;
+
+    // ---- mantle acquisition ----------------------------------------------
+    // Only from the ground, only when pressing into it, and never out of a slide:
+    // the sourced material describes mantling as a deliberate approach to a
+    // ledge, and a slide that ends by climbing a wall is a different mechanic.
+    if (!this._mantle && this.onGround && !this._sliding && moving && wf > 0.3) {
+      const led = this.findLedge(wish.x, wish.z);
+      if (led) {
+        this._mantle = {
+          t0: now,
+          dur: led.height <= TUNING.mantleLowMaxHeight ? TUNING.mantleLowDuration : TUNING.mantleHighDuration,
+          from: this.position.clone(),
+          to: led.to,
+        };
+        this.stepMantle(dt, now);
+        return;
+      }
+    }
 
     // ---- acceleration -----------------------------------------------------
     const vel = this.velocity;
@@ -249,20 +490,32 @@ export class Player {
       // Friction first, applied to the horizontal component only.
       const speed = Math.hypot(vel.x, vel.z);
       if (speed > 0.001) {
-        const drop = Math.max(speed, 3.0) * TUNING.friction * dt;
+        // A slide decays on a much gentler curve and without the max(v, 3) floor,
+        // which exists to snap a walk to a stop and would erase the boost in
+        // ~100 ms — leaving the sourced 0.65 s cap unable to be the thing that
+        // ends a slide.
+        const drop = this._sliding
+          ? speed * TUNING.slideFriction * dt
+          : Math.max(speed, 3.0) * TUNING.friction * dt;
         const scale = Math.max(0, speed - drop) / speed;
         vel.x *= scale; vel.z *= scale;
       }
-      if (moving) {
+      // No steering acceleration during a slide: it is committed, which is what
+      // makes it a decision rather than a free speed buff.
+      if (moving && !this._sliding) {
+        const before = Math.hypot(vel.x, vel.z);
         const current = vel.x * wish.x + vel.z * wish.z;
         const add = Math.min(maxSpeed - current, TUNING.groundAccel * dt * maxSpeed / TUNING.walkSpeed);
         if (add > 0) { vel.x += wish.x * add; vel.z += wish.z * add; }
+        this.capSpeed(maxSpeed, before);
       }
     } else {
       if (moving) {
+        const before = Math.hypot(vel.x, vel.z);
         const current = vel.x * wish.x + vel.z * wish.z;
         const add = Math.min(Math.max(0, maxSpeed - current), TUNING.airAccel * dt);
         vel.x += wish.x * add; vel.z += wish.z * add;
+        this.capSpeed(maxSpeed, before);
       }
       const d = 1 - TUNING.airDrag * dt;
       vel.x *= d; vel.z *= d;

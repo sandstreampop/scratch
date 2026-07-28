@@ -317,7 +317,11 @@ export async function openSim({
         else if (p.__realDamage) { p.damage = p.__realDamage; }
 
         const w = g.weapon;
-        w.ammo = cfg.ammo ?? w.constructor.name ? (cfg.ammo ?? 30) : 30;
+        // `cfg.ammo ?? w.constructor.name ? … : …` parsed as ((0 ?? name) ? …)
+        // and 0 is falsy, so `ammo: 0` — the only way to ask for an empty
+        // magazine, and the whole of the empty-reload measurement — silently
+        // handed back a full one.
+        w.ammo = cfg.ammo ?? 30;
         w.reserve = 180;
         w.reloading = false;
         w.spread = 0;

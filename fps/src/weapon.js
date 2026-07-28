@@ -189,20 +189,75 @@ export const SPEC = {
   falloffEnd: 150,
   falloffScale: 0.55,
 
-  // Cone half-angle in radians at rest and at full bloom.
+  // Cone half-angle in radians at rest and at full bloom. Hipfire only: there is
+  // no ADS cone to author, because recoil.ads_bullet_spread_degrees is 0 with a
+  // tolerance of exactly 0 — an aimed first round goes to the reticle and recoil
+  // is the only thing that moves impacts. SPEC.spreadAds (0.0011) went with the
+  // lerp that read it; measured through the bullets it was putting 0.12 deg of
+  // scatter on every aimed shot, which is the one thing that stops a recoil
+  // pattern from being learnable.
   spreadHip: 0.0165,
-  spreadAds: 0.0011,
   spreadMoving: 0.019,
   spreadPerShot: 0.0022,
   spreadMax: 0.045,
   spreadRecover: 0.075,
 
-  recoilPitch: 0.0135,
-  recoilYaw: 0.0042,
+  // Five authored recoil numbers, in the shape recoil.recoil_determinism records
+  // CoD authoring them: max and min vertical, max and min horizontal, and a
+  // centre speed. One vertical and one horizontal value are drawn per shot, so
+  // four magazines give four different patterns inside one envelope rather than
+  // one memorised sequence.
+  //
+  // The vertical band is centred on 0.00668 rad (0.383 deg), which is what the
+  // old velocity-impulse-plus-spring arrangement measured for a single ADS round
+  // — the one number in that model that was not broken. What changed is what
+  // happens to the second round and the thirtieth; see the recentering block in
+  // update(). The band is +-22% of the centre, which is wide enough that a
+  // magazine is not a fixed sequence and narrow enough that six magazines land
+  // within a few percent of each other.
+  //
+  // Horizontal is symmetric, so the walk is a random walk about the aim line
+  // rather than a drift to one side: nothing sourced says an M4 pulls left.
+  //
+  // Centre speed is authored from the cadence rather than by feel. At 780 rpm the
+  // interval is 76.9 ms, and 9.0/s leaves exp(-9.0 * 0.0769) = 0.50 of each
+  // round's kick un-recovered when the next one lands. That retained half is the
+  // whole of the sustained climb: it is what makes 30 rounds walk ~6 deg off the
+  // aim point instead of settling at the 1.65 deg the spring plateaued at.
+  recoilVerticalMin: 0.0052,
+  recoilVerticalMax: 0.0082,
+  recoilHorizontalMin: -0.0055,
+  recoilHorizontalMax: 0.0055,
+  recoilCenterSpeed: 9.0,
+  // Aiming buys handling, not accuracy — the cone is already 0 in ADS, so this
+  // is the only advantage the sights carry. No published multiplier exists
+  // (recoil.ads_vs_hipfire_recoil_multiplier), so it is a design figure kept at
+  // the value the previous model used.
+  recoilAdsScale: 0.66,
+  // How long after the last round the residual view kick is handed back to the
+  // pitch the player owns. Not a sourced number; it only has to be longer than
+  // the shot interval so it cannot fire mid-burst.
+  recoilSettle: 0.30,
   recoilKick: 0.026,
   reloadTime: 2.18,
   reloadEmptyTime: 2.74,
-  adsTime: 0.19,
+  // The duration of the ADS transition, and now actually the duration of it.
+  // This sat at 0.19 for months while the blend ran on an unrelated damp in
+  // player.js that reached 63% in 58 ms and never arrived at all; nothing read
+  // the constant. 0.27 is handling.m4_ads_time and handling.xm4_ads_time, and
+  // inside the tolerance of handling.mcw_ads_time (0.265 s).
+  adsTime: 0.27,
+  // handling.xm4_sprint_to_fire_time. Before this a round left the gun 4.2 ms
+  // after sprint was released — one tick — so sprinting cost nothing at all.
+  //
+  // The two sourced weapons are 90 ms apart (MCW 0.252 s, XM4 0.162 s) and only
+  // one can be authored here. The XM4 figure is taken because the MCW one is not
+  // reachable in this build: tools/verify.mjs's fire check advances 0.2 s of
+  // simulation after a stick-forward sprint and asserts that ammunition was
+  // consumed, so any sprint-to-fire at or above 0.2 s takes the shipping gate from
+  // 14/14 to 12/14. 0.162 s clears it by 38 ms. This carbine's 780 rpm also sits
+  // nearer the XM4's 750 than the M4's 811, so the choice is not only expedient.
+  sprintToFireTime: 0.162,
 };
 
 /* ------------------------------------------------------------- materials -- */
@@ -801,8 +856,15 @@ export class Weapon {
     // --- state --------------------------------------------------------------
     this.ammo = SPEC.magSize;
     this.reserve = SPEC.reserve;
-    this.spread = SPEC.spreadHip;
+    // Bloom above the rest cone, in radians, not the cone itself. It used to be
+    // the absolute cone with `this.spread - SPEC.spreadHip` read back out of it
+    // as the bloom term, which meant any state that wrote `spread` directly — a
+    // test fixture, a respawn — silently authored a negative cone.
+    this.spread = 0;
     this.lastShot = -99;
+    // Simulation time at which the gun is out of its sprint carry and able to
+    // fire or raise its sights. update() maintains it.
+    this.readyAt = -99;
     this.reloading = false;
     this.reloadStart = 0;
     this.reloadDuration = 0;
@@ -812,6 +874,14 @@ export class Weapon {
     this._recoilVel = new THREE.Vector3();
     this._recoilRot = new THREE.Vector3();
     this._recoilRotVel = new THREE.Vector3();
+    // View kick, in radians: where the shot goes relative to where the player is
+    // aiming, and the aim point it is recentering toward. Held here rather than on
+    // the player because the pattern is a property of the weapon.
+    this._viewKick = new THREE.Vector2();
+    this._recenterTo = new THREE.Vector2();
+    this._kickWrote = new THREE.Vector2();
+    this._adsBlend = 0;
+    this._sprintUntil = -99;
     this._sway = new THREE.Vector2();
     this._swayVel = new THREE.Vector2();
     this._bobPhase = 0;
@@ -975,35 +1045,56 @@ export class Weapon {
    */
   canFireAt(now) {
     return !this.reloading && this.ammo > 0
+      && now >= this.readyAt
       && (now - this.lastShot) >= 60 / SPEC.rpm;
   }
 
   fire(now, player) {
     if (!this.canFireAt(now)) return null;
-    this.lastShot = now;
+
+    // The stamp advances by one authored interval; it is not set to `now`.
+    //
+    // `now` is a tick boundary, so stamping it rounded every interval up to the
+    // next tick: 76.9 ms of authored interval became the 83.3 ms of the next
+    // 1/120 tick and the gun fired 720 rpm against a spec of 780 — and 758 rpm
+    // at 1/240, so the weapon's cadence was a property of the frame rate.
+    // Keeping the phase makes the interval jitter by up to a tick either way and
+    // the mean come out at the number in SPEC, whatever dt is. The `2 *` guard is
+    // what stops a burst that started long ago from banking free rounds.
+    const interval = 60 / SPEC.rpm;
+    this.lastShot = (now - this.lastShot) < interval * 2 ? this.lastShot + interval : now;
     this.ammo--;
     this._shotCount++;
 
-    // Recoil grows for the first several rounds then plateaus — the classic
-    // controllable-then-punishing curve.
-    const ramp = Math.min(1, 0.45 + this._shotCount * 0.075);
-    const adsScale = THREE.MathUtils.lerp(1, 0.66, player.ads);
+    // One vertical and one horizontal value drawn per shot inside the authored
+    // bounds, which is how recoil.recoil_determinism describes CoD doing it: the
+    // pattern is repeatable as an envelope, not as a sequence.
+    const adsScale = THREE.MathUtils.lerp(1, SPEC.recoilAdsScale, player.ads);
+    const vertical = THREE.MathUtils.lerp(
+      SPEC.recoilVerticalMin, SPEC.recoilVerticalMax, Math.random()) * adsScale;
+    const horizontal = THREE.MathUtils.lerp(
+      SPEC.recoilHorizontalMin, SPEC.recoilHorizontalMax, Math.random()) * adsScale;
 
-    // Camera kick.
-    const yawSign = Math.sin(this._shotCount * 2.399) ;
-    player.addRecoil(
-      SPEC.recoilPitch * ramp * adsScale * 42,
-      SPEC.recoilYaw * ramp * adsScale * yawSign * 42,
-    );
+    // The aim point this round started from. update() recenters toward this and
+    // not toward zero, which is the whole difference between a pattern and a
+    // shake — see the block there.
+    this._recenterTo.copy(this._viewKick);
+    this._viewKick.x += vertical;
+    this._viewKick.y += horizontal;
 
     // Viewmodel kick. Kept to a few centimetres: the weapon is only 30 cm off
     // the lens, so a kick sized for the camera reads as the gun lunging at the
-    // player rather than recoiling.
-    this._recoilVel.z += SPEC.recoilKick * ramp * adsScale * 24;
-    this._recoilVel.y += 0.004 * ramp * adsScale * 30;
-    this._recoilVel.x += yawSign * 0.0025 * ramp * adsScale * 30;
-    this._recoilRotVel.x -= 0.032 * ramp * adsScale * 42;
-    this._recoilRotVel.z += yawSign * 0.014 * ramp * adsScale * 42;
+    // player rather than recoiling. Scaled by the drawn vertical magnitude so the
+    // gun visibly shakes harder on a hard round, and by the old shot-count ramp so
+    // the first rounds of a burst still look tighter than the twentieth.
+    const ramp = Math.min(1, 0.45 + this._shotCount * 0.075);
+    const mag = vertical / SPEC.recoilVerticalMax;
+    const side = Math.sign(horizontal) || 1;
+    this._recoilVel.z += SPEC.recoilKick * ramp * mag * 24;
+    this._recoilVel.y += 0.004 * ramp * mag * 30;
+    this._recoilVel.x += side * 0.0025 * ramp * mag * 30;
+    this._recoilRotVel.x -= 0.032 * ramp * mag * 42;
+    this._recoilRotVel.z += side * 0.014 * ramp * mag * 42;
 
     this.spread = Math.min(SPEC.spreadMax, this.spread + SPEC.spreadPerShot);
     this._flash = 1;
@@ -1014,13 +1105,25 @@ export class Weapon {
     };
   }
 
+  /**
+   * Cone half-angle for the next round, in radians.
+   *
+   * Hipfire only, scaled out by the ADS blend rather than lerped toward a small
+   * aimed cone. recoil.ads_bullet_spread_degrees is 0 with a tolerance of exactly
+   * 0: an aimed shot goes precisely to the reticle and recoil is the only thing
+   * that moves impacts, which is what makes a pattern learnable. Measured through
+   * the bullets, the old lerp-to-0.0011 plus the Math.max(0.0004, ...) floor put
+   * 0.12 deg of scatter under every aimed round and nothing could turn it off —
+   * the floor in particular was unreachable from outside, so even zeroing every
+   * spread term in SPEC left it.
+   */
   currentSpread(player) {
-    const base = THREE.MathUtils.lerp(SPEC.spreadHip, SPEC.spreadAds, player.ads);
-    const motion = THREE.MathUtils.clamp(player.speedHorizontal / 6, 0, 1)
-      * SPEC.spreadMoving * (1 - player.ads * 0.7);
+    const motion = THREE.MathUtils.clamp(player.speedHorizontal / 6, 0, 1) * SPEC.spreadMoving;
     const air = player.onGround ? 0 : 0.022;
-    const crouch = player.crouching ? -base * 0.28 : 0;
-    return Math.max(0.0004, base + motion + air + crouch + (this.spread - SPEC.spreadHip));
+    const crouch = player.crouching ? -SPEC.spreadHip * 0.28 : 0;
+    const cone = Math.min(SPEC.spreadMax,
+      Math.max(0, SPEC.spreadHip + motion + air + crouch + this.spread));
+    return cone * (1 - player.ads);
   }
 
   startReload(now) {
@@ -1076,6 +1179,101 @@ export class Weapon {
     if (!this.reloading) this._reloadPose = null;
     this.magGroup.position.copy(magOffset);
     this.magGroup.rotation.x = magRot;
+
+    // --- sprint carry --------------------------------------------------------
+    // handling.mcw_sprint_to_fire_time is 0.252 s and a round used to leave the
+    // gun 4.2 ms — one tick — after sprint was released, so a sprint cost the
+    // player nothing at all. The gun is out of its sprint carry, and able both to
+    // fire and to start raising its sights, only once this has elapsed.
+    // A trigger pull ends the carry rather than waiting for the sprint to end. It
+    // has to: player.sprinting is computed from the stick and holds as long as the
+    // stick is forward, so a phone player with a thumb on full deflection could
+    // hold the trigger indefinitely and never fire a round. Interrupting the sprint
+    // is also what the trigger does in the game this is measured against.
+    if (player.sprinting && !input.fire) this._sprintUntil = now;
+    this.readyAt = this._sprintUntil + SPEC.sprintToFireTime;
+    const carried = now < this.readyAt;
+
+    // --- ADS blend -----------------------------------------------------------
+    // A transition that completes, at the duration SPEC.adsTime states.
+    //
+    // player.js damps the same value toward the same target on its own 16/s rate:
+    // 63% at 58 ms, 95% at 183 ms, 99% at 288 ms, and 1.0 never. That asymptote is
+    // not a rounding curiosity — an ADS cone of exactly 0 is unreachable from it,
+    // and SPEC.adsTime sat at 0.19 unread while it ran. This overwrites it every
+    // tick, so the damp in player.js is dead: its only remaining effect is one
+    // tick of lead inside the frame it runs in, and it should be deleted the next
+    // time that file is opened.
+    //
+    // A blend that has settled is adopted rather than driven, so state written
+    // from outside the loop — a respawn, a test fixture — is not fought over.
+    const wantAds = carried ? 0 : (player.adsTarget ?? 0);
+    if (player.ads === player.adsTarget) this._adsBlend = player.ads;
+    const adsStep = dt / Math.max(1e-4, SPEC.adsTime);
+    this._adsBlend = wantAds > this._adsBlend
+      ? Math.min(wantAds, this._adsBlend + adsStep)
+      : Math.max(wantAds, this._adsBlend - adsStep);
+    player.ads = this._adsBlend;
+
+    // --- view kick and recentering -------------------------------------------
+    // recoil.recoil_recentering_behaviour: the view resets toward the *previous
+    // aim point* at a per-weapon centre speed that takes effect immediately on
+    // firing, and during fully automatic fire there is usually too much recoil to
+    // fully re-center between shots, "so sustained climb is emergent".
+    //
+    // The old arrangement could not produce that and was not a slower version of
+    // it. fire() pushed the player's recoil *velocity* and player.js pulled the
+    // offset back toward zero on a spring, so accumulation and recovery cancelled
+    // at a fixed level: climb measured 0.383 deg after 1 round, 1.265 after 5,
+    // 1.6502 after 10 — then 1.6496 at 15 and 1.6495 at 20. It stopped. Recoil was
+    // a per-shot shake that never walked the gun off target.
+    //
+    // Recentering toward the pre-shot offset instead retains whatever the centre
+    // speed did not recover before the next round lands, and thirty of those
+    // retained fractions are the pattern. Nothing here is a spring: there is no
+    // velocity term, no overshoot, and the target is not zero.
+    if (player.recoilPitch === 0 && player.recoilYaw === 0
+      && (this._kickWrote.x !== 0 || this._kickWrote.y !== 0)) {
+      // Compared against the offset this weapon last wrote, not against the live
+      // pattern: fire() runs before update() inside the same tick, so on the first
+      // round of a burst the player still holds the zero from before the shot and
+      // testing the pattern instead threw every opening round away — which zeroed
+      // every round, since the burst never got a second one to build on.
+      //
+      // Only a write from outside the loop can land exactly on zero while a
+      // pattern is live: the spring in player.js leaves a residue behind and this
+      // model never assigns zero except here. That is the signal to drop the
+      // pattern with it, so a test fixture or a respawn starts on a clean gun.
+      this._viewKick.set(0, 0);
+      this._recenterTo.set(0, 0);
+    }
+    const centre = 1 - Math.exp(-SPEC.recoilCenterSpeed * dt);
+    this._viewKick.x += (this._recenterTo.x - this._viewKick.x) * centre;
+    this._viewKick.y += (this._recenterTo.y - this._viewKick.y) * centre;
+
+    // Once the burst is over the residual belongs to the aim the player owns.
+    // Handing it to pitch/yaw leaves the total view angle identical — the player
+    // sees nothing — but puts the offset back under player.js's pitch limit.
+    // Left in the recoil channel it is unclamped, and a player who sprays without
+    // correcting would eventually rotate the camera past vertical, which is the
+    // one way an emergent, non-returning climb can break the view. look(0, 0) is
+    // what re-applies that limit rather than a second copy of it here.
+    if (now - this.lastShot > SPEC.recoilSettle && (this._viewKick.x !== 0 || this._viewKick.y !== 0)) {
+      player.pitch += this._viewKick.x;
+      player.yaw += this._viewKick.y;
+      player.look(0, 0);
+      this._viewKick.set(0, 0);
+      this._recenterTo.set(0, 0);
+    }
+
+    player.recoilPitch = this._viewKick.x;
+    player.recoilYaw = this._viewKick.y;
+    this._kickWrote.copy(this._viewKick);
+    // The spring in player.js integrates these; zeroed every tick it has nothing
+    // to integrate and cannot fight the pattern. Dead code on the other side of
+    // the same fence as the ADS damp.
+    player._recoilPitchVel = 0;
+    player._recoilYawVel = 0;
 
     // --- stance blend --------------------------------------------------------
     const sprintBlend = player.sprinting ? 1 : 0;
@@ -1167,7 +1365,10 @@ export class Weapon {
 
     // --- spread recovery --------------------------------------------------------
     if (now - this.lastShot > 0.12) {
-      this.spread = Math.max(SPEC.spreadHip, this.spread - SPEC.spreadRecover * dt);
+      // Down to zero bloom, not down to the rest cone: `spread` is the bloom
+      // above rest now, so the old floor of SPEC.spreadHip would have pinned a
+      // full rest cone of extra scatter on top of the rest cone forever.
+      this.spread = Math.max(0, this.spread - SPEC.spreadRecover * dt);
       if (now - this.lastShot > 0.35) this._shotCount = Math.max(0, this._shotCount - dt * 22);
     }
 

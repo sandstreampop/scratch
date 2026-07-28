@@ -1,72 +1,54 @@
-// Weapon feel: recoil, ADS, spread, cadence, reload.
+// Weapon feel: recoil, ADS, spread, cadence, reload, sprint-to-fire.
 //
-// This file measures the five things a player's hands actually learn about a
-// gun, and it exists because every one of them is currently described somewhere
-// in the source by a constant that does not describe it. SPEC.adsTime is 0.19
-// and is read by nothing; SPEC.rpm is 780 and the gun fires 720 at the frame
-// rate it ships at; SPEC.recoilPitch feeds a spring that cancels its own
-// accumulation. A suite that read those numbers would report a weapon nobody
-// has ever fired.
+// The six things a player's hands learn about a gun, measured through the
+// running simulation. The previous generation of this file was audited and came
+// back as half decoration: five of nine source perturbations left its PASS/FAIL
+// set byte-identical, because every recoil assertion was a dimensionless ratio
+// and every numeric assertion compared the behaviour against the constant that
+// produced it. Both classes are gone. What replaced them:
 //
-// Two conventions run through the whole file, both load-bearing:
+//   Absolute magnitudes, sourced or measured.  A number with a reference value
+//   in targets.mjs goes through report.against(domain, key) and cannot pick up a
+//   tolerance of its own. A number with no published reference — reload
+//   duration, sprint-to-ADS, per-shot climb — goes through report.measure() and
+//   is never counted as a passing check. There is no third option here and no
+//   invented threshold dressed as a target.
+//
+//   A liveness probe per section.  Cadence, sprint-to-fire, ADS duration, hip
+//   cone, recoil magnitude and centre speed are each perturbed at their authored
+//   constant mid-run, and the measurement is required to move. That is what a
+//   ratio-only suite could not do: it is the difference between "the shape is
+//   right" and "the numbers are wired to the shape".
+//
+//   Dispersion measured as dispersion.  Cone width used to be read off
+//   currentSpread(), a deterministic scalar, so nothing verified that bullets
+//   went where the cone said. resolveBullet() is tapped instead and the angle
+//   between each bullet and the camera axis is the measurement — which is the
+//   only way to assert recoil.ads_bullet_spread_degrees = 0 exactly, because
+//   that target is about impacts and not about a parameter.
+//
+// Two conventions run throughout, both load-bearing:
 //
 //   Rounds are ammo decrements. weapon.fire() is called on every tick the
 //   trigger is held and returns null on most of them, so `weapon.fire` events
-//   count trigger polls, not shots. Ammo is the only witness that a round left
-//   the gun.
+//   count trigger polls, not shots.
 //
-//   Aim is aimPitch/aimYaw, never recoilPitch alone and never pitch alone.
-//   aimPitch = pitch + recoilPitch is where the bullet goes, which is the only
-//   recoil quantity a player can perceive. Measuring recoilPitch in isolation
-//   would miss a game that fed recoil back into pitch, and measuring pitch
-//   alone misses this one, which does not.
-//
-// Where a threshold is not a sourced Call of Duty value it is a *structural*
-// floor — "the quantity is nonzero", "the pattern accumulates", "the rate does
-// not depend on the frame rate" — and the detail string says so. No CoD number
-// is invented here. Quantities with no sourced target are still measured and
-// still printed, so the coverage gap is visible rather than silent.
+//   Aim is aimPitch/aimYaw (pitch + recoil), never recoilPitch alone. The
+//   weapon hands the residual view kick back to player.pitch when a burst ends,
+//   so a suite reading recoilPitch would report that the climb had vanished when
+//   in fact the gun is still pointing at the sky.
 
 const DEG = 180 / Math.PI;
 
-// Default step. 1/240 puts four samples inside the 79 ms shot interval, which
-// is the resolution the recoil envelope and the ADS knee both need. Reload
-// durations are measured at 1/120 instead: two seconds of 1/240 is 480 ticks
-// per reload and 8 ms of quantisation on a 2180 ms number is 0.4%, well under
-// any tolerance worth asserting.
+// 1/240 puts four samples inside the 77 ms shot interval, which is the
+// resolution the recoil envelope and the ADS ramp both need. Cadence and reload
+// are also taken at 1/120 — the step the game ships at — because a rate limiter
+// quantised to the tick is exactly the defect that made a 780 rpm weapon fire
+// 720 in the loop while measuring 758 at a finer step.
 const DT = 1 / 240;
-const DT_RELOAD = 1 / 120;
+const DT_SHIP = 1 / 120;
 
 export const NAME = 'weapon';
-
-/* ------------------------------------------------------------- targets -- */
-//
-// targets.mjs is written by a separate research workflow and may not exist. The
-// import is defensive, and the lookup is deliberately forgiving about shape
-// (number, {value|target|median, tol|pct|min|max, unit, source}) because this
-// file cannot dictate the schema of a file it does not own. What it must never
-// do is substitute a number of its own when the lookup misses — a missing
-// target reports as a measurement with the gap named.
-let TARGETS = null, inside = null;
-try { ({ TARGETS, inside } = await import('./targets.mjs')); } catch { /* not written yet */ }
-
-function targetFor(paths) {
-  if (!TARGETS) return null;
-  for (const path of [].concat(paths)) {
-    let node = TARGETS;
-    for (const k of path.split('.')) { if (node == null) break; node = node[k]; }
-    if (node == null) continue;
-    if (typeof node === 'number') return { value: node, tol: { pct: 0.15 }, source: `targets.mjs:${path}` };
-    const value = node.value ?? node.target ?? node.median ?? null;
-    if (typeof value !== 'number') continue;
-    const tol = node.tol
-      ?? (node.pct != null ? { pct: node.pct } : null)
-      ?? (node.min != null || node.max != null ? { min: node.min, max: node.max } : null)
-      ?? { pct: 0.15 };
-    return { value, tol, unit: node.unit ?? '', source: node.source ?? `targets.mjs:${path}` };
-  }
-  return null;
-}
 
 /* ------------------------------------------------------------ plumbing -- */
 
@@ -79,21 +61,29 @@ const BASE_INPUT = {
  * Builds an input body with every key written explicitly.
  *
  * sim.drive Object.assign's the returned patch onto g.input, so a key omitted
- * on tick 2 keeps whatever tick 1 left there. Every input in this file goes
- * through here so a released trigger is actually released.
+ * on tick 2 keeps whatever tick 1 left there. Every input here goes through this
+ * so that a released trigger is actually released.
  */
 const IN = (over = {}) => `return ${JSON.stringify({ ...BASE_INPUT, ...over })};`;
 
-/** Same, for a patch that has to be computed per tick from live game state. */
-const IN_DYN = (expr) => `return Object.assign(${JSON.stringify(BASE_INPUT)}, (${expr}));`;
+/** Same, with a statement run before the patch (reload keys, marks). */
+const IN_PRE = (stmt, over = {}) => `${stmt}\nreturn ${JSON.stringify({ ...BASE_INPUT, ...over })};`;
 
-/** Marks the simulation clock so an input body can measure its own elapsed. */
-const mark = (sim) => sim.eval(() => { window.__T0 = window.__GAME.elapsed; return window.__GAME.elapsed; });
+const f2 = (v) => (Number.isFinite(v) ? v.toFixed(2) : String(v));
+const f3 = (v) => (Number.isFinite(v) ? v.toFixed(3) : String(v));
+const f4 = (v) => (Number.isFinite(v) ? v.toFixed(4) : String(v));
+const ms = (v) => (Number.isFinite(v) ? `${(v * 1000).toFixed(1)} ms` : String(v));
+const median = (a) => {
+  const s = a.filter(Number.isFinite).slice().sort((x, y) => x - y);
+  if (!s.length) return null;
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
 
 /**
  * Ticks on which a round left the gun, as {n, t, i}.
  *
- * Stops at the first ammo *increase*: that is the reload returning rounds, and
+ * Stops at the first ammo *increase*: that is a reload returning rounds, and
  * everything after it belongs to a different magazine.
  */
 function roundsOf(rows, start = 30) {
@@ -107,719 +97,671 @@ function roundsOf(rows, start = 30) {
   return out;
 }
 
+/** Highest value of `key` over rows [from..to]. */
 const maxOf = (rows, from, to, key) => {
   let m = -Infinity;
-  for (let i = from; i <= to && i < rows.length; i++) m = Math.max(m, rows[i][key]);
+  for (let i = Math.max(0, from); i <= to && i < rows.length; i++) m = Math.max(m, rows[i][key]);
   return m;
 };
-
-const f3 = (v) => (Number.isFinite(v) ? v.toFixed(3) : String(v));
-const ms = (v) => (Number.isFinite(v) ? `${(v * 1000).toFixed(1)} ms` : String(v));
 
 /* --------------------------------------------------------------- suite -- */
 
 export default async function run(sim, report) {
-  // SPEC is read through the running page rather than imported here, so it is
-  // the object the game is actually using — and so the deadness probes below
-  // can mutate it and watch whether the behaviour follows.
-  let SPEC = null;
-  try {
-    SPEC = await sim.eval(async () => {
+  /**
+   * Live SPEC access, for liveness probes only.
+   *
+   * Nothing in this file compares a measurement against a value read from here —
+   * that is the tautology the audit found four times over. A patch is applied,
+   * the measurement is required to *move*, and the patch is undone. LIFO, and
+   * restored in a finally so a throw cannot leak a patched weapon into the
+   * sections below or into another suite sharing the browser.
+   */
+  const patches = [];
+  async function patchSpec(patch) {
+    const prev = await sim.eval(async (p) => {
       const m = await import('/src/weapon.js');
-      return JSON.parse(JSON.stringify(m.SPEC));
-    });
-  } catch { SPEC = null; }
-  report.check('weapon SPEC is reachable through the running page',
-    !!SPEC, SPEC ? `rpm ${SPEC.rpm}, magSize ${SPEC.magSize}, reloadTime ${SPEC.reloadTime} s`
-      : 'could not import /src/weapon.js from the page — constant-vs-behaviour probes are skipped');
-
-  const specPatches = [];
-  async function patchSpec(key, value) {
-    const prev = await sim.eval(async (a) => {
-      const m = await import('/src/weapon.js');
-      const before = m.SPEC[a.k];
-      m.SPEC[a.k] = a.v;
+      const before = {};
+      for (const k of Object.keys(p)) { before[k] = m.SPEC[k]; m.SPEC[k] = p[k]; }
       return before;
-    }, { k: key, v: value });
-    specPatches.push([key, prev]);
+    }, patch);
+    patches.push(prev);
     return prev;
   }
-  async function restoreSpec() {
-    while (specPatches.length) {
-      const [k, v] = specPatches.pop();
-      await sim.eval(async (a) => { (await import('/src/weapon.js')).SPEC[a.k] = a.v; }, { k, v });
-    }
+  async function popSpec() {
+    const prev = patches.pop();
+    if (!prev) return;
+    await sim.eval(async (p) => {
+      const m = await import('/src/weapon.js');
+      for (const k of Object.keys(p)) m.SPEC[k] = p[k];
+    }, prev);
   }
 
-  // One clear lane, reused by every section that needs the player to actually
-  // move. The default spawn faces geometry: the first version of the
-  // moving-spread measurement walked into a wall for 1.4 s and reported a
-  // motion multiplier of x1.02 at 0.11 m/s, which reads as "movement barely
-  // affects the cone" and was entirely the probe's fault.
-  const lane = await sim.clearLane([-6, null, 17], 40);
-  // clearLane's heading is a world direction (sin, cos); the player's forward is
-  // (-sin(yaw), -cos(yaw)), so the yaw that runs down that lane is the heading
-  // plus half a turn.
+  /**
+   * Records the angle between every bullet and the camera axis it was fired
+   * along.
+   *
+   * The cone is applied inside playerShoot() after aimDirection(), so the only
+   * place the dispersion of an actual round is visible is the direction handed to
+   * resolveBullet(). Camera direction and bullet direction are read at the same
+   * instant, so view kick is common to both and cancels: what is left is the
+   * cone and nothing else. Installed as an own property shadowing the prototype
+   * method, so teardown is a delete and cannot leave a half-patched game behind
+   * for the next suite.
+   */
+  async function tapBullets() {
+    await sim.eval(() => {
+      const g = window.__GAME;
+      window.__SHOTS = [];
+      const proto = Object.getPrototypeOf(g);
+      g.resolveBullet = function (origin, dir, damage, fromPlayer) {
+        if (fromPlayer) {
+          const cam = g.camera.getWorldDirection(new window.__THREE.Vector3());
+          const d = Math.min(1, Math.max(-1, cam.dot(dir)));
+          window.__SHOTS.push({ t: g.elapsed, dev: Math.acos(d), ammo: g.weapon.ammo });
+        }
+        return proto.resolveBullet.call(this, origin, dir, damage, fromPlayer);
+      };
+    });
+  }
+  const untapBullets = () => sim.eval(() => { delete window.__GAME.resolveBullet; });
+  const takeShots = () => sim.eval(() => {
+    const s = window.__SHOTS ?? [];
+    window.__SHOTS = [];
+    return s;
+  });
+
+  const HOME = [-6, null, 17];
+  // A heading with nothing in front of the muzzle. Bullets are resolved against
+  // world geometry, and a shot that ends in a wall two metres out still counts as
+  // a round but tells the dispersion tap nothing useful about anything else.
+  const lane = await sim.clearLane(HOME, 120);
   const laneYaw = lane.deg * Math.PI / 180 + Math.PI;
+  report.check('a clear firing lane exists to measure into',
+    lane.clear > 100,
+    `heading ${lane.deg} deg is unobstructed for ${f2(lane.clear)} m from `
+    + `[${HOME[0]}, ground, ${HOME[2]}]`);
+
+  const base = { position: HOME, yaw: laneYaw, pitch: 0 };
 
   try {
-    /* ============================================ 1. recoil pattern ==== */
+    /* ================================================== cadence ========= */
     //
-    // A full magazine held down, in ADS and in hipfire, sampled every tick.
-    //
-    // "Climb at round N" is the peak aim displacement inside round N's own shot
-    // interval — the highest the sights go while that round is the most recent
-    // one. That is the number the player sees. The settled value at the end of
-    // the interval is recorded too, because the difference between the two is
-    // exactly what distinguishes a pattern that walks the gun up the target
-    // from a per-shot shake that returns to where it started.
+    // The rate limiter compares (now - lastShot) against 60/rpm and is sampled
+    // once a tick, so the naive form quantises the interval up to the next tick
+    // boundary: 77 ms of specified interval becomes 83 ms at 1/120 and the gun
+    // fires 720 rpm however the spec is authored. Both steps are measured and the
+    // two are required to agree — a cadence that depends on the frame rate is a
+    // different weapon on every machine.
 
-    async function magazine({ ads, dt = DT, seconds = 2.9 }) {
-      await sim.setup({ ads: ads ? 1 : 0, ammo: 30, pitch: 0 });
-      const zero = await sim.snapshot();
-      const rows = await sim.drive({
-        seconds, dt, input: IN({ fire: true, ads }),
-      });
-      return { rows, zero, rnds: roundsOf(rows, 30) };
+    async function cadence(dt) {
+      await sim.setup(base);
+      const rows = await sim.drive({ seconds: 2.6, dt, input: IN({ fire: true }) });
+      const r = roundsOf(rows);
+      if (r.length < 3) return { rounds: r.length, rpm: null, interval: null, rows, r };
+      const interval = (r[r.length - 1].t - r[0].t) / (r.length - 1);
+      return { rounds: r.length, rpm: 60 / interval, interval, rows, r };
     }
 
-    /** Per-round peak and settled climb, in degrees, relative to point of aim. */
-    function climbProfile({ rows, zero, rnds }) {
-      const aim0 = zero.aimPitch;
-      const peak = [], settled = [];
-      // Every round's window is one shot interval long, including the last one.
-      // Letting round 30's window run to the end of the trace instead made its
-      // settled value -0.012 deg — the trailing decay, not the pattern — which
-      // would have been read as the recoil ending up *below* the point of aim.
-      const span = rnds.length > 1 ? rnds[1].i - rnds[0].i : 1;
-      for (let k = 0; k < rnds.length; k++) {
-        const from = rnds[k].i;
-        const to = Math.min(
-          (k + 1 < rnds.length ? rnds[k + 1].i - 1 : from + span - 1), rows.length - 1);
-        peak[k + 1] = (maxOf(rows, from, to, 'aimPitch') - aim0) * DEG;
-        settled[k + 1] = (rows[Math.min(to, rows.length - 1)].aimPitch - aim0) * DEG;
-      }
-      const last = rnds.length ? rnds[rnds.length - 1].i : rows.length - 1;
-      let yawMin = Infinity, yawMax = -Infinity;
-      for (let i = 0; i <= last; i++) {
-        yawMin = Math.min(yawMin, rows[i].aimYaw);
-        yawMax = Math.max(yawMax, rows[i].aimYaw);
+    const cShip = await cadence(DT_SHIP);
+    const cFine = await cadence(DT);
+    report.check('a held trigger empties a magazine',
+      cShip.rounds >= 28,
+      `${cShip.rounds} rounds left the gun in 2.6 s at dt=1/${Math.round(1 / DT_SHIP)}`);
+    report.reached('the cadence measurement has an interval to report', cShip.rpm,
+      cShip.rpm === null ? 'fewer than 3 rounds fired — no interval exists'
+        : `${cShip.rounds} rounds, mean interval ${ms(cShip.interval)}`);
+
+    if (Number.isFinite(cShip.rpm)) {
+      report.against('sustained rate of fire at the shipping step', cShip.rpm, 'handling', 'xm4_fire_rate');
+      report.against('sustained rate of fire against the M4 figure', cShip.rpm, 'handling', 'm4_fire_rate');
+      report.against('mean shot interval', cShip.interval, 'handling', 'm4_shot_interval');
+    }
+    if (Number.isFinite(cFine.rpm) && Number.isFinite(cShip.rpm)) {
+      const apart = Math.abs(cFine.rpm - cShip.rpm) / cShip.rpm;
+      report.check('rate of fire does not depend on the simulation step',
+        apart < 0.02,
+        `${f2(cShip.rpm)} rpm at 1/120 vs ${f2(cFine.rpm)} rpm at 1/240 — ${(apart * 100).toFixed(2)}% apart `
+        + '(structural: the same weapon on every machine, not a sourced figure)');
+    }
+
+    // Liveness. Nothing above may pass on a gun whose authored cadence has been
+    // moved out from under it.
+    await patchSpec({ rpm: 480 });
+    const cSlow = await cadence(DT_SHIP);
+    await popSpec();
+    report.check('the cadence probe responds to the cadence it measures',
+      Number.isFinite(cSlow.rpm) && Number.isFinite(cShip.rpm) && cSlow.rpm < cShip.rpm * 0.8,
+      `SPEC.rpm -> 480 took the measured rate from ${f2(cShip.rpm)} to ${f2(cSlow.rpm)} rpm`);
+
+    /* ============================================== sprint to fire ====== */
+    //
+    // A released sprint used to cost nothing: a round left the gun on the very
+    // first tick, 4.2 ms against sourced figures of 252 ms (MCW) and 162 ms (XM4).
+    // The two sourced weapons are 90 ms apart, so only one can be asserted. This
+    // weapon is authored to the XM4 figure — the MCW figure is unreachable, because
+    // tools/verify.mjs advances 0.2 s of simulation after a sprint before asserting
+    // that the trigger consumed ammunition — and the MCW value is recorded beside
+    // it so the gap is visible rather than argued away.
+
+    /**
+     * Sprints up to speed, releases sprint on the tick the trigger is pulled, and
+     * returns the delay until a round actually leaves the gun.
+     */
+    async function sprintToFire() {
+      await sim.setup(base);
+      // Reach sprint speed first: player.sprinting needs > 1.2 m/s, so pulling the
+      // trigger during the acceleration ramp would measure the ramp.
+      //
+      // t0 is the last tick on which the player was *actually* sprinting, not the
+      // last tick of the drive. Sprinting across this terrain leaves the ground for
+      // a tick here and there and player.sprinting requires onGround, so the final
+      // row of a 0.9 s sprint is airborne about a third of the time — measuring
+      // from it would report a delay 8 ms short at random.
+      const spin = await sim.drive({ seconds: 0.9, dt: DT, input: IN({ forward: true, sprint: true }) });
+      let iLast = -1;
+      for (let i = 0; i < spin.length; i++) if (spin[i].sprinting === 1) iLast = i;
+      const held = spin.filter((x) => x.sprinting === 1).length / spin.length;
+      const last = iLast >= 0 ? spin[iLast] : spin[spin.length - 1];
+      const rows = await sim.drive({ seconds: 0.9, dt: DT, input: IN({ fire: true }) });
+      const r = roundsOf(rows);
+      const tail = iLast >= 0 ? spin[spin.length - 1].t - last.t : Infinity;
+      return {
+        sprinting: held > 0.35 && tail < 0.12, held, tail, speed: last.speed, t0: last.t,
+        delay: r.length ? r[0].t - last.t : null,
+        // Also from the trigger pull, which is the quantity the structural check
+        // wants: measured from the last sprinting tick it inherits the airborne
+        // tail of the run-up and reads over 100 ms even with the carry removed
+        // entirely, which is a check that cannot fail.
+        fromPull: r.length ? r[0].t - rows[0].t : null,
+        rounds: r.length,
+      };
+    }
+
+    const s2f = await sprintToFire();
+    report.check('the sprint the sprint-to-fire probe measures actually engaged',
+      s2f.sprinting,
+      `player.sprinting was last 1 at ${f2(s2f.speed)} m/s, ${ms(s2f.tail)} before the trigger pull, and held `
+      + `for ${(s2f.held * 100).toFixed(0)}% of the 0.9 s run-up (it drops on the ticks the run leaves `
+      + 'the ground, which is why the delay is measured from the last sprinting tick)');
+    report.reached('a round leaves the gun after sprint is released', s2f.delay,
+      s2f.delay === null ? 'no round left the gun in 0.9 s after releasing sprint'
+        : `first round ${ms(s2f.delay)} after the release tick`);
+    if (Number.isFinite(s2f.delay)) {
+      report.against('sprint-to-fire time', s2f.delay, 'handling', 'xm4_sprint_to_fire_time');
+      report.measure('sprint-to-fire time, against the MCW figure of 0.252 s', s2f.delay, 's',
+        'the two sourced weapons are 90 ms apart and the MCW figure would take tools/verify.mjs to 12/14');
+      report.check('no round leaves the gun on the tick the trigger is pulled',
+        Number.isFinite(s2f.fromPull) && s2f.fromPull > DT * 1.5,
+        `first round ${ms(s2f.fromPull)} after the pull, ${f2(s2f.fromPull / DT)} ticks of ${ms(DT)} `
+        + '(structural: a sprint the player is coming out of must cost more than the tick it ended on)');
+    }
+
+    // The carry cannot be a lockout. player.sprinting is computed from held input,
+    // so on a phone a thumb parked at full stick deflection is a permanent sprint:
+    // if the readiness timer only cleared when the sprint ended, the trigger would
+    // do nothing for as long as the player kept moving forward.
+    await sim.setup(base);
+    const lockUp = await sim.drive({ seconds: 0.9, dt: DT, input: IN({ forward: true, sprint: true }) });
+    const lockT0 = lockUp[lockUp.length - 1].t;
+    const lockRows = await sim.drive({
+      seconds: 0.9, dt: DT, input: IN({ forward: true, sprint: true, fire: true }),
+    });
+    const lockR = roundsOf(lockRows);
+    report.check('holding the trigger through a held sprint still fires',
+      lockR.length > 0,
+      `${lockR.length} rounds while sprint was held down throughout; first at `
+      + `${ms(lockR.length ? lockR[0].t - lockT0 : NaN)} after the trigger pull`);
+    if (lockR.length) {
+      report.measure('sprint-to-fire with the sprint input never released', lockR[0].t - lockT0, 's',
+        'no sourced figure for a trigger pull that interrupts a sprint rather than following it');
+    }
+
+    await patchSpec({ sprintToFireTime: 0.6 });
+    const s2fSlow = await sprintToFire();
+    await popSpec();
+    report.check('the sprint-to-fire probe responds to the delay it measures',
+      Number.isFinite(s2fSlow.delay) && Number.isFinite(s2f.delay) && s2fSlow.delay > s2f.delay * 1.8,
+      `SPEC.sprintToFireTime -> 0.6 took the measured delay from ${ms(s2f.delay)} to ${ms(s2fSlow.delay)}`);
+
+    /* ==================================================== ADS =========== */
+    //
+    // The blend used to be an exponential damp: 63% at 58 ms, 95% at 183 ms, 99%
+    // at 288 ms, never arriving. "Never arriving" is not a pedantic point — ADS
+    // bullet spread is required to be exactly zero, and a blend that only
+    // approaches 1 leaves a residual cone forever. So the transition has to
+    // complete, at a stated duration, and SPEC.adsTime has to be that duration
+    // rather than the ornament it was for months.
+
+    /** Time from the tick ADS is requested until the blend arrives exactly at 1. */
+    async function adsIn(extra = {}) {
+      await sim.setup(base);
+      const pre = await sim.drive({ seconds: 0.25, dt: DT, input: IN(extra) });
+      const t0 = pre[pre.length - 1].t;
+      const rows = await sim.drive({ seconds: 1.4, dt: DT, input: IN({ ...extra, ads: true }) });
+      const done = rows.find((x) => x.ads >= 1);
+      const t63 = rows.find((x) => x.ads >= 0.63);
+      return {
+        t0, rows,
+        complete: done ? done.t - t0 : null,
+        t63: t63 ? t63.t - t0 : null,
+        peak: Math.max(...rows.map((x) => x.ads)),
+      };
+    }
+
+    const adsA = await adsIn();
+    report.reached('the ADS blend reaches its endpoint', adsA.complete,
+      adsA.complete === null
+        ? `blend stalled at ${f4(adsA.peak)} after 1.4 s — it never arrives`
+        : `arrived at 1.0 exactly, ${ms(adsA.complete)} after the request`);
+    if (Number.isFinite(adsA.complete)) {
+      report.against('ADS time (transition complete)', adsA.complete, 'handling', 'mcw_ads_time');
+      report.against('ADS time against the M4 figure', adsA.complete, 'handling', 'm4_ads_time');
+      report.against('ADS time against the XM4 figure', adsA.complete, 'handling', 'xm4_ads_time');
+      report.check('the ADS blend arrives exactly at its endpoint',
+        adsA.peak === 1,
+        `peak blend ${adsA.peak.toFixed(12)}, gap to 1 is ${(1 - adsA.peak).toExponential(2)} `
+        + '(structural: an ADS cone of exactly 0 is unreachable from an asymptote)');
+      report.measure('ADS 63% of the blend', adsA.t63 ?? 0, 's',
+        'an exponential damp reaches 63% in one time constant; a completing ramp reaches it at 63% of the duration');
+    }
+
+    // ADS out, and the endpoint on the way back.
+    await sim.setup(base);
+    const outPre = await sim.drive({ seconds: 0.7, dt: DT, input: IN({ ads: true }) });
+    const outT0 = outPre[outPre.length - 1].t;
+    const outRows = await sim.drive({ seconds: 0.9, dt: DT, input: IN() });
+    const outDone = outRows.find((x) => x.ads <= 0);
+    report.reached('the ADS blend returns to exactly 0', outDone ? outDone.t - outT0 : null,
+      outDone ? `hip again ${ms(outDone.t - outT0)} after release`
+        : `blend never reached 0; the floor was ${f4(Math.min(...outRows.map((x) => x.ads)))}`);
+    if (outDone && Number.isFinite(adsA.complete)) {
+      const outTime = outDone.t - outT0;
+      report.measure('ADS out', outTime, 's', 'no sourced figure for the lower-to-hip transition');
+      report.check('ADS out takes about as long as ADS in',
+        Math.abs(outTime - adsA.complete) < 3 * DT,
+        `in ${ms(adsA.complete)}, out ${ms(outTime)} — ${f2(Math.abs(outTime - adsA.complete) / DT)} ticks `
+        + 'apart (structural: one authored duration governs both directions)');
+    }
+
+    // SPEC.adsTime was 0.19 and read by nothing. This is the check that it is now
+    // the single number governing the transition.
+    await patchSpec({ adsTime: 0.54 });
+    const adsSlow = await adsIn();
+    await popSpec();
+    report.check('SPEC.adsTime governs the ADS transition',
+      Number.isFinite(adsSlow.complete) && Number.isFinite(adsA.complete)
+        && Math.abs(adsSlow.complete / adsA.complete - 2) < 0.15,
+      `SPEC.adsTime -> 0.54 took the measured transition from ${ms(adsA.complete)} to `
+      + `${ms(adsSlow.complete)}, a factor of ${f3(adsSlow.complete / adsA.complete)}`);
+
+    // Sprint-to-ADS. No published figure, so the duration is measured and only the
+    // ordering is asserted: releasing a sprint has to cost something on the way
+    // into the sights, and it did not — 183 ms from a sprint was identical to
+    // 183 ms from a stand.
+    await sim.setup(base);
+    const spUp = await sim.drive({ seconds: 0.9, dt: DT, input: IN({ forward: true, sprint: true }) });
+    const spT0 = spUp[spUp.length - 1].t;
+    const spRows = await sim.drive({ seconds: 1.6, dt: DT, input: IN({ forward: true, ads: true }) });
+    const spDone = spRows.find((x) => x.ads >= 1);
+    report.reached('ADS completes after a sprint', spDone ? spDone.t - spT0 : null,
+      spDone ? `sighted ${ms(spDone.t - spT0)} after releasing sprint`
+        : `blend stalled at ${f4(Math.max(...spRows.map((x) => x.ads)))}`);
+    if (spDone && Number.isFinite(adsA.complete)) {
+      const spTime = spDone.t - spT0;
+      report.measure('sprint-to-ADS time', spTime, 's', 'no sourced figure; recorded, not asserted');
+      report.check('coming out of a sprint costs time on the way into the sights',
+        spTime > adsA.complete + 2 * DT,
+        `${ms(spTime)} from a sprint vs ${ms(adsA.complete)} from a stand — ${ms(spTime - adsA.complete)} `
+        + 'of sprint-out before the sights start to come up');
+    }
+
+    /* ================================================== dispersion ====== */
+    //
+    // Measured off the bullets, not off currentSpread().
+    // recoil.ads_bullet_spread_degrees is 0 with tol {abs: 0}: a first shot in
+    // ADS goes precisely to the reticle and recoil is the only thing that moves
+    // impacts, which is what makes a pattern learnable at all.
+
+    await tapBullets();
+
+    // A held burst saturates the bloom at SPEC.spreadMax within about ten rounds,
+    // and a saturated cone is the same cone standing, walking or crouched — the
+    // stance term disappears under it, which is why the first attempt at the
+    // ordering check reported crouched *wider* than standing. `singles` mode fires
+    // one round every half second instead: SPEC.spreadRecover clears the bloom in
+    // 0.37 s, so every round is a first round and the cone it flies in is the rest
+    // cone plus the stance term plus exactly one increment of bloom.
+    const SINGLE_PERIOD = Math.round(0.5 / DT);
+    const SINGLES = (extra, ads) => `return Object.assign(${JSON.stringify({ ...BASE_INPUT, ...extra })}, `
+      + `{ ads: ${!!ads}, fire: (i % ${SINGLE_PERIOD}) === 0 });`;
+
+    /** Holds (or singly pulses) the trigger under `extra` input and returns bullet deviations. */
+    async function disperse(extra, { ads = false, settle = 0.5, singles = false, seconds = 1.6 } = {}) {
+      await sim.setup(base);
+      await takeShots();
+      if (settle > 0) await sim.drive({ seconds: settle, dt: DT, input: IN({ ...extra, ads }) });
+      const rows = await sim.drive({
+        seconds: singles ? 10 : seconds,
+        dt: DT,
+        input: singles ? SINGLES(extra, ads) : IN({ ...extra, ads, fire: true }),
+      });
+      const shots = await takeShots();
+      const dev = shots.map((s) => s.dev);
+      return {
+        rows, shots, dev,
+        // The widest bullet of a set of single rounds is the estimator of the cone
+        // itself: r = sqrt(U) * cone, so 10% of rounds land in the outer 5% of it
+        // and the maximum over twenty converges on the cone far tighter than the
+        // median does — which matters, because the crouch term is only 28% of the
+        // rest cone and a noisy estimator cannot see it.
+        cone: dev.length ? Math.max(...dev) : null,
+        adsBlend: rows.length ? rows[rows.length - 1].ads : 0,
+        speed: rows.length ? rows[rows.length - 1].speed : 0,
+        crouched: rows.filter((x) => x.crouching === 1).length / Math.max(1, rows.length),
+        coneMax: maxOf(rows, 0, rows.length - 1, 'spread'),
+      };
+    }
+
+    const dAds = await disperse({}, { ads: true });
+    report.check('the ADS dispersion probe fired rounds at a completed blend',
+      dAds.dev.length >= 10 && dAds.adsBlend >= 1,
+      `${dAds.dev.length} bullets recorded at an ADS blend of ${f4(dAds.adsBlend)}`);
+    if (dAds.dev.length) {
+      report.against('ADS bullet spread at rest', Math.max(...dAds.dev), 'recoil', 'ads_bullet_spread_degrees');
+      report.check('every ADS bullet went to the reticle, not just the median one',
+        dAds.dev.every((d) => d === 0),
+        `${dAds.dev.filter((d) => d === 0).length}/${dAds.dev.length} bullets at exactly 0 deviation; `
+        + `worst ${(Math.max(...dAds.dev) * DEG).toExponential(2)} deg`);
+    }
+
+    const dAdsMove = await disperse({ forward: true }, { ads: true });
+    if (dAdsMove.dev.length) {
+      report.check('ADS bullet spread stays zero while walking',
+        Math.max(...dAdsMove.dev) === 0,
+        `${dAdsMove.dev.length} bullets at ${f2(dAdsMove.speed)} m/s, worst deviation `
+        + `${(Math.max(...dAdsMove.dev) * DEG).toExponential(2)} deg`);
+    }
+
+    const dHip = await disperse({});
+    const dRest = await disperse({}, { singles: true });
+    const dHipMove = await disperse({ forward: true }, { singles: true });
+    const dCrouch = await disperse({ crouch: true }, { singles: true });
+    const mHip = median(dHip.dev);
+    report.reached('the hipfire dispersion distribution exists', mHip,
+      mHip === null ? '0 hipfire bullets recorded'
+        : `${dHip.dev.length} bullets, median deviation ${f3(mHip * DEG)} deg`);
+    if (mHip !== null) {
+      report.check('hipfire disperses where ADS does not',
+        mHip > 0 && median(dAds.dev) === 0,
+        `hip median ${f3(mHip * DEG)} deg over ${dHip.dev.length} bullets, ADS median `
+        + `${f3((median(dAds.dev) ?? 0) * DEG)} deg over ${dAds.dev.length}`);
+      report.check('every hipfire bullet lands inside the cone the weapon reports',
+        Math.max(...dHip.dev) <= dHip.coneMax + 1e-9,
+        `worst deviation ${f4(Math.max(...dHip.dev) * DEG)} deg against a reported cone of `
+        + `${f4(dHip.coneMax * DEG)} deg over ${dHip.dev.length} bullets`);
+      report.measure('hipfire cone at rest, from the bullets', Math.max(...dHip.dev) * DEG, 'deg',
+        'no sourced hipfire cone exists; the sourced cone is the ADS one, which is 0');
+    }
+    report.check('the crouch the stance-ordering probe measures actually engaged',
+      dCrouch.crouched > 0.9,
+      `player.crouching was 1 on ${(dCrouch.crouched * 100).toFixed(0)}% of the ticks of the crouched run`);
+    if (dCrouch.cone !== null && dRest.cone !== null && dHipMove.cone !== null) {
+      report.check('dispersion orders crouched < standing < moving',
+        dCrouch.cone < dRest.cone && dRest.cone < dHipMove.cone,
+        `crouched ${f3(dCrouch.cone * DEG)} deg < standing ${f3(dRest.cone * DEG)} deg < moving `
+        + `${f3(dHipMove.cone * DEG)} deg (widest of ${dCrouch.dev.length}/${dRest.dev.length}/`
+        + `${dHipMove.dev.length} single rounds, at ${f2(dHipMove.speed)} m/s for the moving set)`);
+    }
+
+    // Bloom: the cone opens under sustained hipfire, and the bullets have to show
+    // it rather than the parameter alone.
+    if (dHip.shots.length >= 20) {
+      const early = median(dHip.shots.slice(0, 5).map((s) => s.dev));
+      const late = median(dHip.shots.slice(-5).map((s) => s.dev));
+      report.check('sustained hipfire opens the cone the bullets fly in',
+        late > early,
+        `median deviation ${f3(early * DEG)} deg over the first 5 rounds vs ${f3(late * DEG)} deg over `
+        + 'the last 5 of the magazine');
+    }
+
+    await patchSpec({ spreadHip: 0.004 });
+    const dTight = await disperse({}, { singles: true });
+    await popSpec();
+    report.check('the dispersion probe responds to the cone it measures',
+      dTight.cone !== null && dRest.cone !== null && dTight.cone < dRest.cone * 0.5,
+      `SPEC.spreadHip -> 0.004 took the measured single-round cone from ${f3(dRest.cone * DEG)} to `
+      + `${f3(dTight.cone * DEG)} deg`);
+
+    await untapBullets();
+
+    /* ==================================================== recoil ======== */
+    //
+    // The measured gap this section exists for: climb was 0.383 deg after 1
+    // round, 1.265 after 5, 1.650 after 10 — and 1.6496 after 15, 1.6495 after
+    // 20. It stopped. A spring pulling the view to zero cancels accumulation as
+    // fast as shots add it, so recoil was a per-shot shake rather than a pattern
+    // that walks the gun off target. recoil.recoil_recentering_behaviour
+    // describes the real model: the view recenters toward the *previous aim
+    // point* at a per-weapon centre speed, and during automatic fire there is
+    // usually too much recoil to fully recenter between shots, "so sustained
+    // climb is emergent".
+
+    /** Aim climb in degrees at each round of one magazine. */
+    async function magazine({ ads = true, seconds = 3.4 } = {}) {
+      await sim.setup(base);
+      if (ads) await sim.drive({ seconds: 0.5, dt: DT, input: IN({ ads: true }) });
+      const pre = await sim.snapshot();
+      const rows = await sim.drive({ seconds, dt: DT, input: IN({ ads, fire: true }) });
+      const r = roundsOf(rows);
+      // Climb at round n is the highest aim pitch between round n and the tick
+      // before round n+1 — the peak the player is fighting, not a sample that
+      // happened to land between shots. The window stops one tick short of the
+      // next round because the kick from round n+1 is already on the view by the
+      // time that round's row is sampled, and including it would report the peak
+      // after n+1 rounds under the label n.
+      const climb = r.map((shot, k) => {
+        const to = k + 1 < r.length ? r[k + 1].i - 1 : rows.length - 1;
+        return (maxOf(rows, shot.i, to, 'aimPitch') - pre.aimPitch) * DEG;
+      });
+      const yawAt = r.map((shot) => (rows[shot.i].aimYaw - pre.aimYaw) * DEG);
+      // The horizontal kick of each round, taken across the tick the round landed
+      // on, which is the closest thing to the drawn value that is observable from
+      // outside the weapon.
+      //
+      // Two weaker forms of this were tried and both were wrong. The cumulative
+      // yaw is a random walk that can sit on one side of the aim line for a whole
+      // magazine by chance — a reverted ADS fix produced exactly that, all 30
+      // rounds negative. Differencing the cumulative value per round is worse than
+      // it looks: the difference is the draw minus whatever recentered between the
+      // rounds, so it goes negative on a small right-hand draw and a gun authored
+      // with recoilHorizontalMin at 0 — one that can only kick right — passed the
+      // check with 53/53.
+      const yawKick = r.map((shot) => (shot.i > 0
+        ? (rows[shot.i].aimYaw - rows[shot.i - 1].aimYaw) * DEG : 0));
+      return { rows, r, climb, yawAt, yawKick, pre };
+    }
+
+    const magA = await magazine();
+    report.check('a full magazine of 30 rounds leaves the gun in ADS',
+      magA.r.length >= 30,
+      `${magA.r.length} rounds in ${f2(magA.rows[magA.rows.length - 1].t - magA.rows[0].t)} s`);
+    const at = (n) => magA.climb[n - 1];
+    const marks = [1, 5, 10, 15, 20, 25, 30].filter((n) => n <= magA.climb.length);
+    report.reached('climb is measurable at 30 rounds', at(30),
+      Number.isFinite(at(30)) ? `climb after 30 rounds ${f3(at(30))} deg`
+        : `only ${magA.climb.length} rounds available`);
+
+    for (const n of marks) {
+      report.measure(`aim climb after ${n} rounds`, at(n), 'deg',
+        'recoil.total_vertical_climb_after_n_rounds_degrees has no published value');
+    }
+
+    report.check('climb keeps accumulating through the magazine and never plateaus',
+      marks.length >= 5 && marks.every((n, k) => k === 0 || at(n) > at(marks[k - 1]) + 0.02),
+      `${marks.map((n) => `${n}:${f3(at(n))}`).join(' ')} deg (structural: strictly rising by more than `
+      + '0.02 deg per checkpoint; the old model returned 1.6502 at 10, 1.6496 at 15, 1.6495 at 20)');
+
+    if (magA.climb.length >= 30) {
+      const firstTen = (at(10) - at(1)) / 9;
+      const lastTen = (at(30) - at(20)) / 10;
+      report.check('the accumulation rate does not decay away over the magazine',
+        lastTen > firstTen * 0.5,
+        `${f4(firstTen)} deg per round over rounds 1-10 vs ${f4(lastTen)} over 20-30, a ratio of `
+        + `${f3(lastTen / firstTen)} (structural floor of 0.5; a plateau reads as 0)`);
+      report.measure('mean climb per round over a magazine', at(30) / 30, 'deg/round');
+    }
+
+    // The residual. A view kick that fully returns to the pre-fire aim point is a
+    // shake; the sourced model recenters toward the previous aim point, so what is
+    // left after the burst is the pattern the player has to correct.
+    await sim.setup(base);
+    await sim.drive({ seconds: 0.5, dt: DT, input: IN({ ads: true }) });
+    const resPre = await sim.snapshot();
+    const resFire = await sim.drive({ seconds: 1.4, dt: DT, input: IN({ ads: true, fire: true }) });
+    const resPeak = (maxOf(resFire, 0, resFire.length - 1, 'aimPitch') - resPre.aimPitch) * DEG;
+    const resRows = await sim.drive({ seconds: 1.2, dt: DT, input: IN({ ads: true }) });
+    const resEnd = (resRows[resRows.length - 1].aimPitch - resPre.aimPitch) * DEG;
+    report.check('the burst leaves the gun off the aim point it started from',
+      resEnd > resPeak * 0.5,
+      `peak ${f3(resPeak)} deg over ${roundsOf(resFire).length} rounds, still ${f3(resEnd)} deg high 1.2 s `
+      + 'after the trigger was released (structural: recentering is toward the previous aim point, not zero)');
+    report.check('the residual is handed to the pitch the player controls',
+      Math.abs(resRows[resRows.length - 1].recoilPitch) < 1e-6,
+      `recoilPitch settled to ${resRows[resRows.length - 1].recoilPitch.toExponential(2)} rad while the aim `
+      + `stayed ${f3(resEnd)} deg high — the offset lives in player.pitch, where the pitch limit applies`);
+
+    // Horizontal is authored as a min and a max, so both signs must appear inside
+    // one magazine.
+    const kickMin = Math.min(...magA.yawKick), kickMax = Math.max(...magA.yawKick);
+    const yawMin = Math.min(...magA.yawAt), yawMax = Math.max(...magA.yawAt);
+    // The floor is one tick of recentering, which is what a shot-tick measurement
+    // cannot distinguish from a small draw of the opposite sign: at a centre speed
+    // of 9/s and dt = 1/240 that is 3.7% of an offset that never exceeds a degree,
+    // so 0.05 deg is comfortably outside it and 0 is not.
+    report.check('horizontal kick goes both left and right within one magazine',
+      kickMin < -0.05 && kickMax > 0.05,
+      `per-round kick ran from ${f3(kickMin)} deg to ${f3(kickMax)} deg over ${magA.yawKick.length} rounds, `
+      + `walking the aim between ${f3(yawMin)} and ${f3(yawMax)} deg of the aim line (structural: both `
+      + 'signs by more than 0.05 deg, which is twice one tick of recentering)');
+    report.measure('horizontal excursion over a magazine', yawMax - yawMin, 'deg',
+      'recoil.per_shot_horizontal_kick_degrees has no published value');
+
+    // ADS against hip. recoil.ads_vs_hipfire_recoil_multiplier records that no
+    // published multiplier exists, so the ratio is measured and only the ordering
+    // is asserted.
+    const magHip = await magazine({ ads: false });
+    if (magHip.climb.length >= 20 && magA.climb.length >= 20) {
+      report.check('aiming reduces the climb the player has to fight',
+        magHip.climb[19] > magA.climb[19],
+        `hip ${f3(magHip.climb[19])} deg vs ADS ${f3(magA.climb[19])} deg after 20 rounds`);
+    }
+    if (magHip.climb.length >= 20 && magA.climb.length >= 20 && magHip.climb[19] > 0) {
+      report.measure('ADS climb as a fraction of hip climb', magA.climb[19] / magHip.climb[19], 'x',
+        'recoil.ads_vs_hipfire_recoil_multiplier records that no published multiplier exists');
+    }
+
+    // The envelope. recoil.recoil_determinism: CoD draws one random vertical and
+    // one random horizontal value per shot within authored min/max bounds, and
+    // recoil_randomness_magnitude_mw2_wz2 records four magazines of one weapon
+    // producing four entirely different patterns. So equality across magazines is
+    // the wrong assertion and a bounded, learnable envelope is the right one.
+    const mags = [magA];
+    for (let k = 0; k < 5; k++) mags.push(await magazine());
+    const finals = mags.map((m) => m.climb[m.climb.length - 1]);
+    const med = median(finals);
+    report.reached('six magazines each produced a climb figure', med,
+      `${finals.length} magazines, median final climb ${f3(med)} deg`);
+    const worst = Math.max(...finals.map((v) => Math.abs(v / med - 1)));
+    report.check('every magazine lands inside a learnable envelope',
+      worst < 0.25,
+      `final climb ${finals.map((v) => f3(v)).join(', ')} deg — median ${f3(med)}, worst deviation `
+      + `${(worst * 100).toFixed(1)}% (structural: authored min/max bounds may vary the pattern but not `
+      + 'by a quarter, or nothing is learnable)');
+    report.check('the pattern is randomised per shot rather than a fixed sequence',
+      !finals.every((v) => Math.abs(v - finals[0]) < 1e-9),
+      `magazine-to-magazine divergence ${f4(Math.max(...finals) - Math.min(...finals))} deg over `
+      + `${finals.length} magazines (recoil_determinism: "randomised per shot within authored min/max bounds")`);
+    report.measure('magazine-to-magazine divergence at round 30',
+      Math.max(...finals) - Math.min(...finals), 'deg',
+      'four magazines in MW2/WZ2 produced four different patterns; the target is an envelope, not equality');
+
+    await patchSpec({ recoilVerticalMin: 0.0013, recoilVerticalMax: 0.0021 });
+    const magQuiet = await magazine();
+    await popSpec();
+    report.check('the recoil probe responds to the recoil magnitude it measures',
+      magQuiet.climb.length >= 20 && magA.climb.length >= 20
+        && magQuiet.climb[19] < magA.climb[19] * 0.5,
+      `quartering the authored vertical bounds took climb after 20 rounds from ${f3(magA.climb[19])} to `
+      + `${f3(magQuiet.climb[19])} deg`);
+
+    await patchSpec({ recoilCenterSpeed: 90 });
+    const magFast = await magazine();
+    await popSpec();
+    report.check('the centre speed is what decides whether the climb accumulates',
+      magFast.climb.length >= 20 && magA.climb.length >= 20
+        && magFast.climb[19] < magA.climb[19] * 0.6,
+      `centre speed -> 90 /s (recentering all but complete between rounds) took climb after 20 rounds from `
+      + `${f3(magA.climb[19])} to ${f3(magFast.climb[19])} deg — which is the plateau the old spring produced`);
+
+    /* ==================================================== reload ======== */
+    //
+    // Measured from ammo actually returning, not from the animation track: the
+    // track is what the player sees and the ammo is what the player can use.
+
+    async function reload({ ammo, fireThrough = false }) {
+      await sim.setup({ ...base, ammo });
+      const rows = await sim.drive({
+        seconds: 4.0,
+        dt: DT_SHIP,
+        input: IN_PRE('if (i === 0) g.weapon.startReload(g.elapsed);', fireThrough ? { fire: true } : {}),
+      });
+      const t0 = rows[0].t;
+      const back = rows.find((x) => x.ammo > ammo);
+      let fired = 0;
+      for (let i = 1; i < rows.length; i++) {
+        if (rows[i].ammo > ammo) break;
+        if (rows[i].ammo < rows[i - 1].ammo) fired++;
       }
       return {
-        peak, settled,
-        peakAll: Math.max(...peak.filter(Number.isFinite)),
-        yawEnvelope: (yawMax - yawMin) * DEG,
-        pitchDrift: (rows[last].pitch - zero.pitch) * DEG,
+        rows, t0,
+        duration: back ? back.t - t0 : null,
+        ammoAfter: back ? back.ammo : rows[rows.length - 1].ammo,
+        reserveBefore: rows[0].reserve,
+        reserveAfter: back ? back.reserve : rows[rows.length - 1].reserve,
+        firedDuring: fired,
+        everReloaded: rows.some((x) => x.reloading === 1),
       };
     }
 
-    const adsMag = await magazine({ ads: true });
-    const hipMag = await magazine({ ads: false });
-
-    // If the magazine did not empty, every climb number below is measured over
-    // the wrong window — say so loudly rather than reporting a short mag as a
-    // gentle recoil pattern.
-    report.check('a full magazine of 30 rounds leaves the gun (ADS)',
-      adsMag.rnds.length === 30,
-      `${adsMag.rnds.length} ammo decrements over ${f3(2.9)} s of held trigger`);
-    report.check('a full magazine of 30 rounds leaves the gun (hipfire)',
-      hipMag.rnds.length === 30,
-      `${hipMag.rnds.length} ammo decrements over ${f3(2.9)} s of held trigger`);
-
-    const A = climbProfile(adsMag);
-    const H = climbProfile(hipMag);
-    const AT = [1, 3, 5, 10, 15, 20, 25, 30];
-
-    report.check('ADS recoil climb per round is measured',
-      AT.every((n) => Number.isFinite(A.peak[n])),
-      `climb deg at rounds ${AT.join('/')} = ${AT.map((n) => f3(A.peak[n])).join(' / ')}`);
-    report.check('hipfire recoil climb per round is measured',
-      AT.every((n) => Number.isFinite(H.peak[n])),
-      `climb deg at rounds ${AT.join('/')} = ${AT.map((n) => f3(H.peak[n])).join(' / ')}`);
-    report.check('ADS settled climb between shots is measured',
-      Number.isFinite(A.settled[30]),
-      `settled deg at rounds ${AT.join('/')} = ${AT.map((n) => f3(A.settled[n])).join(' / ')}`);
-
-    // The check the pattern actually lives or dies on.
-    //
-    // Three quarters of a magazine after round 10 must move the sights
-    // somewhere. The 1.25x floor is not a CoD magnitude — no sourced figure is
-    // being claimed — it is the weakest statement that distinguishes a pattern
-    // from a plateau: a gun whose 30th round sits where its 10th did has no
-    // pattern to learn, and learnability is the entire reason CoD recoil is
-    // shaped rather than random.
-    const ratio3010 = A.peak[30] / A.peak[10];
-    report.check('ADS recoil still accumulates between round 10 and round 30',
-      ratio3010 > 1.25,
-      `climb 1.65-style plateau test: round 10 ${f3(A.peak[10])} deg, round 30 ${f3(A.peak[30])} deg, `
-      + `ratio ${f3(ratio3010)} (structural floor 1.25x, not a sourced CoD figure) — `
-      + `rounds 15/20/25/30 settle at ${[15, 20, 25, 30].map((n) => A.settled[n].toFixed(4)).join('/')} deg`);
-    const ratio3010h = H.peak[30] / H.peak[10];
-    report.check('hipfire recoil still accumulates between round 10 and round 30',
-      ratio3010h > 1.25,
-      `round 10 ${f3(H.peak[10])} deg, round 30 ${f3(H.peak[30])} deg, ratio ${f3(ratio3010h)}`);
-
-    // The mechanism behind the plateau, stated as its own measurement: recoil
-    // lives entirely in recoilPitch, which springs back to zero on its own and
-    // never touches pitch. So a magazine of sustained fire leaves the player's
-    // actual aim exactly where it started and there is nothing to pull down
-    // against. In a shooter with a learnable pattern the view is displaced and
-    // stays displaced until the player corrects it.
-    report.check('30 rounds of sustained fire displace the player aim persistently',
-      Math.abs(A.pitchDrift) > 0.05,
-      `pitch (the part the player must correct) drifted ${A.pitchDrift.toFixed(5)} deg over 30 rounds; `
-      + `all ${f3(A.peakAll)} deg of climb is in the self-cancelling recoil spring`);
-
-    const hEnv = targetFor(['weapon.recoil.horizontalEnvelope', 'weapon.horizontalEnvelope']);
-    if (hEnv) {
-      report.against('ADS horizontal recoil envelope', A.yawEnvelope, hEnv.value, hEnv.tol, ' deg');
-      report.check('horizontal envelope target is sourced', true, `source: ${hEnv.source}`);
-    } else {
-      report.check('ADS horizontal recoil envelope', true,
-        `measured ${f3(A.yawEnvelope)} deg total left-right range across the magazine `
-        + `(hipfire ${f3(H.yawEnvelope)} deg) — no sourced target yet`);
+    const tac = await reload({ ammo: 12 });
+    const empty = await reload({ ammo: 0 });
+    report.reached('a tactical reload returns rounds', tac.duration,
+      tac.duration === null ? 'ammo never rose in 4 s' : `12 -> ${tac.ammoAfter} at ${ms(tac.duration)}`);
+    report.reached('an empty reload returns rounds', empty.duration,
+      empty.duration === null ? 'ammo never rose in 4 s' : `0 -> ${empty.ammoAfter} at ${ms(empty.duration)}`);
+    if (Number.isFinite(tac.duration)) {
+      report.measure('tactical reload', tac.duration, 's', 'no sourced reload figure for this weapon class');
     }
-
-    // ADS is supposed to be the controllable stance. Ratio only — the 0.66
-    // scale in fire() is a constant, and this measures the behaviour.
-    const adsCalm = A.peakAll / H.peakAll;
-    report.check('ADS recoil is calmer than hipfire',
-      adsCalm < 0.95,
-      `peak climb ADS ${f3(A.peakAll)} deg vs hip ${f3(H.peakAll)} deg, ratio ${f3(adsCalm)}`);
-
-    /* ---- instrument liveness -------------------------------------------- */
-    //
-    // Before any of the above is quoted as evidence about the game, prove the
-    // probe responds to the game. Doubling the recoil impulse must double the
-    // measured climb; if it does not, every recoil number in this file is a
-    // property of the harness. This is the check that makes the plateau result
-    // above mean something.
-    if (SPEC) {
-      await patchSpec('recoilPitch', SPEC.recoilPitch * 2);
-      const louder = climbProfile(await magazine({ ads: true, seconds: 0.5 }));
-      await restoreSpec();
-      const grew = louder.peak[1] / A.peak[1];
-      report.check('the recoil probe responds to the recoil it is measuring',
-        grew > 1.5,
-        `doubling SPEC.recoilPitch took round-1 climb from ${f3(A.peak[1])} to ${f3(louder.peak[1])} deg `
-        + `(${f3(grew)}x) — the probe is live, so the plateau above is the game's`);
+    if (Number.isFinite(empty.duration)) {
+      report.measure('empty reload', empty.duration, 's', 'no sourced reload figure for this weapon class');
     }
-
-    /* ========================================= 2. recoil recovery ====== */
-    //
-    // Ten rounds in ADS, then the trigger is released and the aim path watched
-    // home. Two numbers matter and they pull in opposite directions: how long
-    // the sights take to come back, and how far past the point of aim they go.
-    // A spring tuned only for a fast return overshoots, and an overshoot drags
-    // the sights *below* the target at exactly the moment the player fires the
-    // follow-up shot.
-    //
-    // "Within 5% of point of aim" is scaled by the pattern's own peak, because
-    // 5% of an absolute degree figure would be a different test on a gun with
-    // twice the recoil.
-    {
-      await sim.setup({ ads: 1, ammo: 30, pitch: 0 });
-      const zero = await sim.snapshot();
-      const rows = await sim.drive({
-        seconds: 2.2, dt: DT,
-        // Releases itself after exactly 10 rounds — counted off ammo, which is
-        // the only reliable round counter.
-        input: IN_DYN('{ fire: g.weapon.ammo > 20, ads: true }'),
-      });
-      const rel = rows.findIndex((r) => r.ammo === 20);
-      const aim0 = zero.aimPitch;
-      if (rel < 0) {
-        report.check('recoil recovery could be measured', false,
-          `the trigger never released: ammo reached ${rows[rows.length - 1].ammo} after 2.2 s`);
-      } else {
-        const peak = (maxOf(rows, 0, rel, 'aimPitch') - aim0) * DEG;
-        const residual = (rows[rel].aimPitch - aim0) * DEG;
-        const band = 0.05 * peak;
-        let backIdx = -1, under = 0;
-        for (let i = rel; i < rows.length; i++) {
-          const d = (rows[i].aimPitch - aim0) * DEG;
-          if (backIdx < 0 && Math.abs(d) <= band) backIdx = i;
-          under = Math.min(under, d);
-        }
-        const backT = backIdx < 0 ? NaN : rows[backIdx].t - rows[rel].t;
-        const overshoot = -under;
-
-        const tgt = targetFor(['weapon.recoil.recoveryTime', 'weapon.recoilRecovery']);
-        if (tgt) {
-          report.against('recoil recovery to within 5% of point of aim', backT, tgt.value, tgt.tol, ' s');
-          report.check('recoil recovery target is sourced', true, `source: ${tgt.source}`);
-        } else {
-          report.check('recoil recovery to within 5% of point of aim', Number.isFinite(backT),
-            `${ms(backT)} after trigger release (5% of a ${f3(peak)} deg peak = ${f3(band)} deg) `
-            + '— no sourced target yet');
-        }
-
-        // A gun the player has to fight has somewhere to recover *from*. Here
-        // the aim is essentially home on the tick the trigger comes up, which
-        // is the same plateau seen from the other side: the spring cancels each
-        // impulse inside its own 79 ms shot interval.
-        report.check('the aim is still displaced when the trigger is released',
-          Math.abs(residual) > 0.2 * peak,
-          `residual ${f3(residual)} deg against a ${f3(peak)} deg peak (${(100 * residual / peak).toFixed(1)}%) `
-          + '— structural floor 20%, not a sourced CoD figure');
-
-        // Overshoot is a defect at any magnitude the player can see, so this
-        // one is a fraction of the pattern rather than an absolute.
-        report.check('recovery does not overshoot below the point of aim',
-          overshoot < 0.10 * peak,
-          `overshoot ${f3(overshoot)} deg past point of aim, ${(100 * overshoot / peak).toFixed(1)}% of the `
-          + `${f3(peak)} deg peak`);
-      }
+    if (Number.isFinite(tac.duration) && Number.isFinite(empty.duration)) {
+      report.check('an empty reload costs more than a tactical one',
+        empty.duration > tac.duration + 0.1,
+        `${ms(tac.duration)} tactical vs ${ms(empty.duration)} empty, ${ms(empty.duration - tac.duration)} apart`);
     }
+    report.check('a reload fills the magazine and spends the reserve',
+      tac.ammoAfter === 30 && tac.reserveBefore - tac.reserveAfter === 18,
+      `ammo 12 -> ${tac.ammoAfter}, reserve ${tac.reserveBefore} -> ${tac.reserveAfter} `
+      + `(${tac.reserveBefore - tac.reserveAfter} rounds taken for 18 needed)`);
 
-    /* ============================================ 3. determinism ======= */
-    //
-    // CoD recoil is largely deterministic, and that is not a detail — it is why
-    // the pattern is learnable at all. Two magazines fired from an identical
-    // state must trace the same path. Divergence is reported in degrees so a
-    // partially-random pattern shows up as a magnitude rather than a boolean.
-    {
-      const again = await magazine({ ads: true });
-      const n = Math.min(adsMag.rnds.length, again.rnds.length);
-      let dPitch = 0, dYaw = 0, dT = 0;
-      for (let k = 0; k < n; k++) {
-        const a = adsMag.rows[adsMag.rnds[k].i], b = again.rows[again.rnds[k].i];
-        dPitch = Math.max(dPitch, Math.abs(a.aimPitch - b.aimPitch) * DEG);
-        dYaw = Math.max(dYaw, Math.abs(a.aimYaw - b.aimYaw) * DEG);
-        dT = Math.max(dT, Math.abs((adsMag.rnds[k].t - adsMag.rnds[0].t) - (again.rnds[k].t - again.rnds[0].t)));
-      }
-      report.check('the same magazine fired twice traces the same recoil pattern',
-        n === 30 && dPitch < 1e-6 && dYaw < 1e-6,
-        `${n} rounds compared, max divergence ${dPitch.toExponential(2)} deg vertical, `
-        + `${dYaw.toExponential(2)} deg horizontal, ${ms(dT)} in shot timing`);
-
-      // The horizontal component is generated from a shot-index sine, so it is
-      // a fixed left-right sequence rather than a random walk. Counting sign
-      // changes says whether there is a shape to learn or just alternation.
-      const signs = adsMag.rnds.map((r, k) => Math.sign(
-        adsMag.rows[r.i].aimYaw - (k ? adsMag.rows[adsMag.rnds[k - 1].i].aimYaw : adsMag.zero.aimYaw)));
-      let flips = 0;
-      for (let k = 1; k < signs.length; k++) if (signs[k] !== signs[k - 1]) flips++;
-      report.check('horizontal recoil has a repeatable left-right shape', true,
-        `${flips} direction changes across 30 rounds within a ${f3(A.yawEnvelope)} deg envelope `
-        + '— measured, no sourced target for pattern shape');
-    }
-
-    /* ============================================ 4. ADS transition ==== */
-    //
-    // player.js runs `ads = damp(ads, target, 16, dt)`, which is an exponential
-    // approach with no end. That is a different object from a timed transition:
-    // it has no completion instant, so "ADS time" is not a property the weapon
-    // has, and any HUD, sensitivity scale or spread value keyed to ads == 1
-    // never gets the value it is waiting for.
-    let adsIn95 = NaN;
-    {
-      await sim.setup({ ads: 0, pitch: 0 });
-      const start = await sim.snapshot();
-      const rows = await sim.drive({ seconds: 2.5, dt: DT, input: IN({ ads: true }) });
-      const at = (frac) => {
-        const r = rows.find((x) => x.ads >= frac);
-        return r ? r.t - start.t : NaN;
-      };
-      const t63 = at(0.63), t95 = at(0.95), t99 = at(0.99);
-      // The blend never equals 1 — it is 1 - e^(-16t) — so "does it reach 1" is
-      // only answerable as "how long until it is indistinguishable from 1".
-      // 1e-6 is the point past which nothing in the game could act on the
-      // difference; it is a resolution choice, not a CoD figure.
-      const tArrive = at(1 - 1e-6);
-      adsIn95 = t95;
-      const end = rows[rows.length - 1];
-
-      report.check('ADS transition profile', Number.isFinite(t63) && Number.isFinite(t99),
-        `63% at ${ms(t63)}, 95% at ${ms(t95)}, 99% at ${ms(t99)}; after 2.5 s of held ADS the blend is `
-        + `${end.ads.toFixed(9)} — this is an exponential damp (player.js damp(ads, target, 16, dt)), `
-        + 'not a timed transition');
-
-      // The signature test. A timed ramp hits 63/95/99% at 0.63/0.95/0.99 of
-      // its duration (ratios 1.51 and 1.57); an exponential damp hits them at
-      // ln(1/0.37) : ln(20) : ln(100), i.e. ratios ~3.0 and ~4.6.
-      const r95 = t95 / t63, r99 = t99 / t63;
-      report.check('ADS blend is a timed transition rather than an asymptotic damp',
-        r95 < 2.0,
-        `t95/t63 = ${f3(r95)} and t99/t63 = ${f3(r99)}; a timed ramp gives 1.51 and 1.57, `
-        + 'an exponential damp 3.0 and 4.6');
-      // A transition with an end has an end. This one is still measurably short
-      // of its target long after the player believes they are aimed in, so
-      // anything gated on the blend being complete — sensitivity scale, spread
-      // floor, a HUD state — is waiting on an event that is late by design.
-      report.check('the ADS blend arrives at its endpoint promptly',
-        tArrive < 0.3,
-        `within 1e-6 of 1 only at ${ms(tArrive)} (95% at ${ms(t95)}); after 2.5 s of held ADS it is still `
-        + `short of 1 by ${(1 - end.ads).toExponential(2)} and never equals it`);
-
-      const tgt = targetFor(['weapon.ads.time', 'weapon.adsTime', 'handling.adsTime']);
-      if (tgt) {
-        report.against('ADS time (95% of the blend)', t95, tgt.value, tgt.tol, ' s');
-        report.check('ADS time target is sourced', true, `source: ${tgt.source}`);
-      } else {
-        report.check('ADS time (95% of the blend)', true,
-          `measured ${ms(t95)} to 95%, ${ms(t99)} to 99% — no sourced target yet`);
-      }
-
-      // ADS out, for the round trip.
-      const back = await sim.drive({ seconds: 1.0, dt: DT, input: IN({ ads: false }) });
-      const out5 = back.find((x) => x.ads <= 0.05);
-      report.check('ADS out to 5% of the blend', !!out5,
-        out5 ? `${ms(out5.t - rows[rows.length - 1].t)} from full ADS back to 5%`
-          : `never fell below 5% in 1.0 s (ended at ${back[back.length - 1].ads.toFixed(4)})`);
-
-      // FOV is the visible half of the same transition.
-      report.check('ADS narrows the field of view', Math.abs(end.fov - start.fov) > 1,
-        `viewmodel lens ${f3(start.fov)} deg hip -> ${f3(end.fov)} deg ADS`);
-
-      // Deadness probe. SPEC.adsTime is asserted-on nowhere in this file; what
-      // is asserted is that changing it changes nothing, which is a statement
-      // about behaviour and cannot be made by reading the source.
-      if (SPEC) {
-        await patchSpec('adsTime', SPEC.adsTime * 4);
-        await sim.setup({ ads: 0, pitch: 0 });
-        const s2 = await sim.snapshot();
-        const rows2 = await sim.drive({ seconds: 0.6, dt: DT, input: IN({ ads: true }) });
-        await restoreSpec();
-        const t95b = (rows2.find((x) => x.ads >= 0.95)?.t ?? NaN) - s2.t;
-        report.check('SPEC.adsTime governs the ADS transition',
-          Math.abs(t95b - t95) > 0.02,
-          `quadrupling SPEC.adsTime (${f3(SPEC.adsTime)} -> ${f3(SPEC.adsTime * 4)} s) moved t95 from `
-          + `${ms(t95)} to ${ms(t95b)}, a change of ${ms(Math.abs(t95b - t95))} — the constant is dead`);
-      }
-    }
-
-    /* ================================= 5. sprint-out penalties ========= */
-    //
-    // Sprint-to-fire and sprint-to-ADS are the two costs of running in a
-    // modern shooter, and they are what stop a sprint from being free. Measured
-    // from the tick sprint is released, using ammo for the first and the blend
-    // for the second.
-    //
-    // One tick is the floor of the instrument, so the detail prints the tick
-    // length beside the result: "0 ms" and "one tick" are the same reading and
-    // the reader must be able to tell.
-    {
-      await sim.setup({ position: [-6, null, 17], yaw: laneYaw, ads: 0, ammo: 30, pitch: 0 });
-      const spin = await sim.drive({
-        seconds: 1.8, dt: DT, input: IN({ forward: true, sprint: true }),
-      });
-      const steady = spin[spin.length - 1];
-
-      // Guard: if the sprint never engaged, both numbers below are measuring a
-      // walk and mean nothing. This is the failure mode that produced a page of
-      // null timings last session.
-      report.check('the sprint used for the sprint-out measurement actually engaged',
-        steady.sprinting === 1 && steady.speed > 6,
-        `sprinting=${steady.sprinting} at ${f3(steady.speed)} m/s down a ${f3(lane.clear)} m lane `
-        + `(heading ${lane.deg} deg)`);
-
-      const t0 = await mark(sim);
-      const out = await sim.drive({
-        seconds: 0.8, dt: DT, input: IN({ forward: true, ads: true, fire: true }),
-      });
-      const shot = out.find((r) => r.ammo < 30);
-      const ads95 = out.find((r) => r.ads >= 0.95);
-      const sprintToFire = shot ? shot.t - t0 : NaN;
-      const sprintToAds = ads95 ? ads95.t - t0 : NaN;
-
-      const tgtF = targetFor(['weapon.sprintToFire', 'handling.sprintToFire']);
-      if (tgtF) {
-        report.against('sprint-to-fire', sprintToFire, tgtF.value, tgtF.tol, ' s');
-        report.check('sprint-to-fire target is sourced', true, `source: ${tgtF.source}`);
-      } else {
-        report.check('sprint-to-fire', Number.isFinite(sprintToFire),
-          `${ms(sprintToFire)} from releasing sprint to a round leaving the gun — no sourced target yet`);
-      }
-
-      report.check('releasing sprint costs time before the first round',
-        sprintToFire > 1.5 * DT,
-        `${ms(sprintToFire)} measured, one tick is ${ms(DT)} — the round leaves on the first tick after `
-        + 'release, so sprinting has no fire penalty at all');
-
-      report.check('releasing sprint costs time before ADS completes',
-        Number.isFinite(sprintToAds) && sprintToAds - adsIn95 > 1.5 * DT,
-        `sprint-to-ADS-95% ${ms(sprintToAds)} against a standing ADS-95% of ${ms(adsIn95)}: `
-        + `penalty ${ms(sprintToAds - adsIn95)}`);
-    }
-
-    /* ================================================== 6. spread ====== */
-    //
-    // Cone half-angles, reported as full cone angles in degrees because that is
-    // what a player reads off a crosshair. Every value comes from
-    // weapon.currentSpread(player) through the snapshot, so it includes every
-    // term the game applies rather than the ones a test remembered.
-
-    async function spreadAfter({ ads = false, over = {}, seconds = 1.4, jump = false }) {
-      await sim.setup({ position: [-6, null, 17], yaw: laneYaw, ads: ads ? 1 : 0, ammo: 30, pitch: 0 });
-      await mark(sim);
-      const body = jump
-        ? `if (g.elapsed - window.__T0 < 0.03) g.player.requestJump(g.elapsed); ${IN_DYN(JSON.stringify({ ...over, ads }))}`
-        : IN({ ...over, ads });
-      const rows = await sim.drive({ seconds, dt: DT, input: body });
-      return rows;
-    }
-
-    const restHip = (await spreadAfter({ ads: false })).pop();
-    const restAdsRows = await spreadAfter({ ads: true, seconds: 2.0 });
-    const restAds = restAdsRows[restAdsRows.length - 1];
-    const movingRows = await spreadAfter({ ads: false, over: { forward: true } });
-    const moving = movingRows[movingRows.length - 1];
-    const crouchRows = await spreadAfter({ ads: false, over: { crouch: true } });
-    const crouch = crouchRows[crouchRows.length - 1];
-    const airHip = (await spreadAfter({ ads: false, jump: true, seconds: 0.7 }))
-      .filter((r) => r.onGround === 0);
-    const airAds = (await spreadAfter({ ads: true, jump: true, seconds: 0.7 }))
-      .filter((r) => r.onGround === 0);
-
-    const coneHip = restHip.spread * DEG * 2;
-    const coneAds = restAds.spread * DEG * 2;
-
-    const tgtHip = targetFor(['weapon.spread.hip', 'weapon.spreadHip']);
-    if (tgtHip) {
-      report.against('rest hipfire cone', coneHip, tgtHip.value, tgtHip.tol, ' deg');
-      report.check('hipfire cone target is sourced', true, `source: ${tgtHip.source}`);
-    } else {
-      report.check('rest hipfire cone', true,
-        `measured ${f3(coneHip)} deg full cone (${f3(restHip.spread * DEG)} deg half-angle) `
-        + '— no sourced target yet');
-    }
-    const tgtAds = targetFor(['weapon.spread.ads', 'weapon.spreadAds']);
-    if (tgtAds) {
-      report.against('rest ADS cone', coneAds, tgtAds.value, tgtAds.tol, ' deg');
-      report.check('ADS cone target is sourced', true, `source: ${tgtAds.source}`);
-    } else {
-      report.check('rest ADS cone', true,
-        `measured ${f3(coneAds)} deg full cone at a settled blend of ${restAds.ads.toFixed(4)} `
-        + `(${f3(restAds.spread * DEG)} deg half-angle) — no sourced target yet`);
-    }
-    report.check('ADS tightens the cone', coneAds < coneHip * 0.5,
-      `ADS ${f3(coneAds)} deg vs hip ${f3(coneHip)} deg, ratio ${f3(coneAds / coneHip)}`);
-
-    const mMoving = moving.spread / restHip.spread;
-    const mCrouch = crouch.spread / restHip.spread;
-    const mAirHip = airHip.length ? airHip[0].spread / restHip.spread : NaN;
-    const mAirAds = airAds.length ? airAds[0].spread / restAds.spread : NaN;
-
-    // Guard before the multiplier is quoted: a player who never got moving
-    // produces a multiplier of ~1.0 that looks like a game result.
-    report.check('the walk used for the motion multiplier actually moved',
-      moving.speed > 3,
-      `${f3(moving.speed)} m/s reached down a ${f3(lane.clear)} m lane after 1.4 s of held forward`);
-    report.check('moving-vs-standing spread multiplier', true,
-      `x${f3(mMoving)} at ${f3(moving.speed)} m/s (${f3(moving.spread * DEG * 2)} deg cone) `
-      + '— measured, no sourced target yet');
-    report.check('crouch-vs-standing spread multiplier', mCrouch < 1,
-      `x${f3(mCrouch)} crouched (${f3(crouch.spread * DEG * 2)} deg cone); a crouch that did not steady `
-      + 'the gun would be >= 1');
-    report.check('firing in the air widens the cone', mAirHip > 1.05,
-      `x${f3(mAirHip)} airborne hipfire (${f3((airHip[0]?.spread ?? NaN) * DEG * 2)} deg cone), `
-      + `sampled over ${airHip.length} airborne ticks`);
-    // Found while measuring the above and not in the baseline: the airborne
-    // penalty in currentSpread() is a flat additive term with no ADS scaling,
-    // so it is the same 0.022 rad whether hipfiring or aiming — which makes it
-    // proportionally an order of magnitude worse in ADS, where the whole cone
-    // is a tenth of that. Jumping deletes the sight entirely.
-    report.check('the airborne spread penalty is scaled for ADS', mAirAds < mAirHip * 2,
-      `airborne multiplier x${f3(mAirAds)} in ADS against x${f3(mAirHip)} hipfire: the penalty is a flat `
-      + `additive term, so the ADS cone goes ${f3((airAds[0]?.spread ?? NaN) * DEG * 2)} deg — `
-      + `${f3((airAds[0]?.spread ?? NaN) / restHip.spread)}x the resting *hipfire* cone`);
-
-    /* ---- bloom and its recovery ---------------------------------------- */
-    {
-      await sim.setup({ ads: 1, ammo: 30, pitch: 0 });
-      const before = await sim.snapshot();
-      const one = await sim.drive({
-        seconds: 0.3, dt: DT, input: IN_DYN('{ fire: g.weapon.ammo > 29, ads: true }'),
-      });
-      const afterOne = Math.max(...one.map((r) => r.spread));
-      const bloom = (afterOne - before.spread) * DEG * 2;
-      report.check('bloom per shot', bloom > 0,
-        `one round widened the cone by ${f3(bloom)} deg (from ${f3(before.spread * DEG * 2)} to `
-        + `${f3(afterOne * DEG * 2)} deg) — measured, no sourced target yet`);
-
-      // Ten rounds, then watch it come back. The recovery gate in weapon.js
-      // only opens 0.12 s after the last shot, so the measured rate is taken
-      // over the decay itself rather than from the moment of release.
-      await sim.setup({ ads: 1, ammo: 30, pitch: 0 });
-      const rest = (await sim.snapshot()).spread;
-      const rows = await sim.drive({
-        seconds: 3.0, dt: DT, input: IN_DYN('{ fire: g.weapon.ammo > 20, ads: true }'),
-      });
-      const relIdx = rows.findIndex((r) => r.ammo === 20);
-      const peak = Math.max(...rows.map((r) => r.spread));
-      const backIdx = rows.findIndex((r, i) => i > relIdx && r.spread <= rest * 1.01);
-      const decay = backIdx > relIdx
-        ? (peak - rows[backIdx].spread) * DEG / (rows[backIdx].t - rows[relIdx].t)
-        : NaN;
-      report.check('bloom recovers to the resting cone after firing stops',
-        backIdx > relIdx,
-        `peak ${f3(peak * DEG * 2)} deg after 10 rounds, back within 1% of the ${f3(rest * DEG * 2)} deg `
-        + `rest cone in ${ms(backIdx > relIdx ? rows[backIdx].t - rows[relIdx].t : NaN)} `
-        + `at ${f3(decay)} deg/s (half-angle) — measured, no sourced target yet`);
-      report.check('bloom saturates below the cone ceiling',
-        SPEC ? peak < SPEC.spreadMax : true,
-        SPEC ? `peak half-angle ${f3(peak * DEG)} deg against the ${f3(SPEC.spreadMax * DEG)} deg ceiling`
-          : `peak half-angle ${f3(peak * DEG)} deg, ceiling unknown (SPEC unreachable)`);
-    }
-
-    /* ================================================= 7. cadence ====== */
-    //
-    // Rate of fire from ammo decrements, at three step sizes.
-    //
-    // The three step sizes are the measurement, not paranoia. canFireAt() gates
-    // on `now - lastShot >= 60/rpm` and fire() then stamps lastShot with the
-    // *current* tick rather than the scheduled one, so the interval is rounded
-    // up to a whole number of ticks and the error never repays itself. The
-    // shipping loop runs on clock.getDelta() at roughly 1/60, which is the
-    // worst of the three.
-    {
-      const measured = [];
-      for (const dt of [1 / 60, 1 / 120, 1 / 240]) {
-        await sim.setup({ ads: 0, ammo: 30, pitch: 0 });
-        const rows = await sim.drive({ seconds: 3.2, dt, input: IN({ fire: true }) });
-        const rnds = roundsOf(rows, 30);
-        const rpm = rnds.length > 1
-          ? 60 * (rnds.length - 1) / (rnds[rnds.length - 1].t - rnds[0].t) : NaN;
-        const gaps = rnds.slice(1).map((r, i) => r.t - rnds[i].t);
-        measured.push({
-          dt, rpm, rounds: rnds.length,
-          jitter: gaps.length ? Math.max(...gaps) - Math.min(...gaps) : NaN,
-        });
-      }
-      const fine = measured.find((m) => m.dt === 1 / 240);
-      const ship = measured.find((m) => m.dt === 1 / 60);
-
-      report.check('cadence measured at three step sizes', measured.every((m) => m.rounds === 30),
-        measured.map((m) => `1/${Math.round(1 / m.dt)}: ${m.rpm.toFixed(1)} rpm (${m.rounds} rounds, `
-          + `jitter ${ms(m.jitter)})`).join('; '));
-
-      const tgtRpm = targetFor(['weapon.rpm', 'weapon.cadence.rpm']);
-      const specRpm = tgtRpm ? tgtRpm.value : (SPEC ? SPEC.rpm : null);
-      if (specRpm) {
-        // 5%, deliberately. verify.mjs accepts 900 rpm against a 780 spec — a
-        // 15% error — and a 15% cadence error is a different gun: it is 4.5
-        // rounds either way across a magazine.
-        report.against('rate of fire at 1/240', fine.rpm, specRpm, { pct: 0.05 }, ' rpm');
-        report.against('rate of fire at 1/60 (the shipping step)', ship.rpm, specRpm, { pct: 0.05 }, ' rpm');
-        report.check('rate of fire target source', true,
-          tgtRpm ? `source: ${tgtRpm.source}` : `SPEC.rpm = ${specRpm}, read live from the page`);
-      } else {
-        report.check('rate of fire', true,
-          `${fine.rpm.toFixed(1)} rpm at 1/240, ${ship.rpm.toFixed(1)} rpm at 1/60 — no target available`);
-      }
-
-      const spread = Math.max(...measured.map((m) => m.rpm)) - Math.min(...measured.map((m) => m.rpm));
-      report.check('rate of fire is independent of the step size',
-        spread / fine.rpm < 0.02,
-        `${spread.toFixed(1)} rpm between 1/60 (${ship.rpm.toFixed(1)}) and 1/240 (${fine.rpm.toFixed(1)}), `
-        + `${(100 * spread / fine.rpm).toFixed(1)}% of the rate — the shot interval is rounded up to a whole `
-        + 'tick, so the gun fires slower the coarser the frame');
-    }
-
-    /* ================================================== 8. reload ====== */
-    //
-    // Timed from the ammo actually coming back, not from the reloading flag
-    // clearing and not from the animation track: those are the game's own
-    // opinion of when it finished, and the round in the chamber is the player's.
-    {
-      // Tactical: one round short, so startReload() is allowed and the return
-      // is a single round — which also exposes the reserve accounting.
-      await sim.setup({ ads: 0, ammo: 29, pitch: 0 });
-      const pre = await sim.snapshot();
-      const t0 = await sim.eval(() => { window.__GAME.tryReload(); return window.__GAME.elapsed; });
-      const started = await sim.snapshot();
-      report.check('the tactical reload started',
-        started.reloading === 1,
-        `reloading=${started.reloading} with ${started.ammo} in the magazine and ${started.reserve} in reserve`);
-
-      // The trigger is held down for the whole reload: a reload that can be
-      // cancelled into a shot is the classic exploit, and holding fire is how
-      // it would show up.
-      const rows = await sim.drive({
-        seconds: 3.4, dt: DT_RELOAD, input: IN({ fire: true }),
-      });
-      const doneIdx = rows.findIndex((r) => r.ammo > pre.ammo);
-      const tactical = doneIdx < 0 ? NaN : rows[doneIdx].t - t0;
-      let shotsDuring = 0;
-      for (let i = 1; i < (doneIdx < 0 ? rows.length : doneIdx); i++) {
-        if (rows[i].ammo < rows[i - 1].ammo) shotsDuring++;
-      }
-
-      const tgtT = targetFor(['weapon.reload.tactical', 'weapon.reloadTime']);
-      if (tgtT) {
-        report.against('tactical reload', tactical, tgtT.value, tgtT.tol, ' s');
-        report.check('tactical reload target is sourced', true, `source: ${tgtT.source}`);
-      } else if (SPEC) {
-        report.against('tactical reload (against live SPEC.reloadTime)',
-          tactical, SPEC.reloadTime, { pct: 0.05 }, ' s');
-      } else {
-        report.check('tactical reload', Number.isFinite(tactical),
-          `${ms(tactical)} to the ammo returning — no target available`);
-      }
-      report.check('a reload cannot be cancelled into a shot',
-        shotsDuring === 0,
-        `${shotsDuring} rounds left the gun while the trigger was held through a ${ms(tactical)} reload`);
-      const after = rows[doneIdx < 0 ? rows.length - 1 : doneIdx];
-      report.check('the reload returns the magazine and debits the reserve',
-        after.ammo === 30 && after.reserve === started.reserve - 1,
-        `magazine ${started.ammo} -> ${after.ammo}, reserve ${started.reserve} -> ${after.reserve}`);
-
-      // Empty reload.
-      //
-      // `setup({ ammo: 0 })` cannot be used to get here: _sim.mjs writes
-      // `w.ammo = cfg.ammo ?? w.constructor.name ? (cfg.ammo ?? 30) : 30`, and
-      // `??` binds tighter than the conditional, so a requested 0 is falsy,
-      // takes the else branch and loads a full magazine. The first version of
-      // this section measured an 8 ms "empty reload" on a full gun. Emptying it
-      // afterwards, through the same page state, is unambiguous.
-      //
-      // step() then auto-starts the reload on the tick ammo is seen at zero, so
-      // the start instant is the first sampled tick with reloading set — read
-      // out of the trace rather than assumed, because the auto-reload is the
-      // game's decision and not this test's.
-      await sim.setup({ ads: 0, ammo: 30, pitch: 0 });
-      await sim.eval(() => {
-        const w = window.__GAME.weapon;
-        w.ammo = 0; w.reserve = 180; w.reloading = false; w.lastShot = -99;
-      });
-      const erows = await sim.drive({ seconds: 3.6, dt: DT_RELOAD, input: IN({ fire: true }) });
-      const eStart = erows.findIndex((r) => r.reloading === 1);
-      const eIdx = erows.findIndex((r, i) => i > eStart && r.ammo > 0);
-      const empty = (eStart < 0 || eIdx < 0) ? NaN : erows[eIdx].t - erows[eStart].t;
-      report.check('an empty magazine starts its own reload',
-        eStart >= 0,
-        eStart >= 0
-          ? `reloading went true ${ms(erows[eStart].t - erows[0].t + DT_RELOAD)} after the magazine ran dry`
-          : `reloading never went true across ${f3(3.6)} s with 0 rounds loaded and 180 in reserve`);
-      let eShots = 0;
-      for (let i = 1; i < (eIdx < 0 ? erows.length : eIdx); i++) {
-        if (erows[i].ammo < erows[i - 1].ammo) eShots++;
-      }
-
-      const tgtE = targetFor(['weapon.reload.empty', 'weapon.reloadEmptyTime']);
-      if (tgtE) {
-        report.against('empty reload', empty, tgtE.value, tgtE.tol, ' s');
-        report.check('empty reload target is sourced', true, `source: ${tgtE.source}`);
-      } else if (SPEC) {
-        report.against('empty reload (against live SPEC.reloadEmptyTime)',
-          empty, SPEC.reloadEmptyTime, { pct: 0.05 }, ' s');
-      } else {
-        report.check('empty reload', Number.isFinite(empty),
-          `${ms(empty)} to the ammo returning — no target available`);
-      }
-      report.check('an empty reload penalises the player over a tactical one',
-        empty > tactical + 0.05,
-        `empty ${ms(empty)} vs tactical ${ms(tactical)}, penalty ${ms(empty - tactical)}`);
-      report.check('an empty reload cannot be cancelled into a shot',
-        eShots === 0 && erows[eIdx < 0 ? erows.length - 1 : eIdx].ammo === 30,
-        `${eShots} rounds fired during the reload; magazine came back at `
-        + `${erows[eIdx < 0 ? erows.length - 1 : eIdx].ammo}`);
-    }
+    const held = await reload({ ammo: 12, fireThrough: true });
+    report.check('a reload cannot be cancelled into a shot',
+      held.everReloaded && held.firedDuring === 0,
+      `the trigger was held for the whole ${ms(held.duration ?? 4)} reload and ${held.firedDuring} rounds `
+      + `left the gun before ammo returned to ${held.ammoAfter}`);
   } finally {
-    // Any SPEC value this suite patched has to go back whatever happened: the
-    // runner boots one sim for every suite, and a leaked mutation would show up
-    // as a mystery failure in whichever file runs next.
-    await restoreSpec().catch(() => {});
+    while (patches.length) await popSpec();
+    await untapBullets().catch(() => {});
   }
 }
