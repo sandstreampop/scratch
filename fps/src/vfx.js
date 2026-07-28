@@ -660,7 +660,12 @@ export class VFX {
     const seed = new Float32Array(N);
     for (let i = 0; i < N; i++) {
       pos[i * 3] = (Math.random() - 0.5) * 120;
-      pos[i * 3 + 1] = Math.random() * 16;
+      // Weighted to the ground. A uniform 0-16 m column put motes 13 degrees
+      // above the horizon at eye height, where they draw against the dark
+      // upper sky as bright additive points — a blind reviewer read them as
+      // stars visible while the sun was clearly up. Suspended dust at dawn is
+      // a shallow layer over the ground, not a cloud filling the air column.
+      pos[i * 3 + 1] = Math.pow(Math.random(), 2.4) * 9;
       pos[i * 3 + 2] = (Math.random() - 0.5) * 120;
       seed[i] = Math.random() * 100;
     }
@@ -692,7 +697,7 @@ export class VFX {
           vec3 rel = p - uCam;
           rel = mod(rel + 60.0, 120.0) - 60.0;
           p = uCam + rel;
-          p.y = clamp(p.y, 0.15, 18.0);
+          p.y = clamp(p.y, 0.15, 9.5);
 
           vec4 mv = modelViewMatrix * vec4(p, 1.0);
           float dist = -mv.z;
@@ -701,7 +706,12 @@ export class VFX {
           // Motes only really show when they are between you and the sun.
           vec3 toCam = normalize(uCam - p);
           float back = pow(max(dot(-toCam, -uSun), 0.0), 3.0);
-          vAlpha = (0.018 + back * 0.20) * smoothstep(48.0, 4.0, dist) * smoothstep(0.4, 3.5, dist);
+          // Fade with height as well as distance. Anything still high enough
+          // to sit against sky rather than terrain has no business being a
+          // visible point.
+          float lowLayer = smoothstep(9.0, 2.0, p.y - uCam.y + 1.7);
+          vAlpha = (0.018 + back * 0.20) * smoothstep(48.0, 4.0, dist)
+                 * smoothstep(0.4, 3.5, dist) * lowLayer;
           gl_Position = projectionMatrix * mv;
         }
       `,
