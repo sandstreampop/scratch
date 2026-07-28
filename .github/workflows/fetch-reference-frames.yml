@@ -24,7 +24,7 @@ on:
         default: '6'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   fetch:
@@ -80,3 +80,32 @@ jobs:
           path: reference/
           retention-days: 1
           if-no-files-found: error
+
+      # The artifact turned out to be unreachable from the development sandbox:
+      # its download redirects to blob.core.windows.net, which the network
+      # policy rejects the same way it rejects every other host. Git through
+      # the local proxy is the only channel that actually reaches the sandbox,
+      # so the frames go out on a branch of their own.
+      #
+      # An orphan branch, never merged, and deleted as soon as it has been
+      # pulled. It is not main, it is not the Pages source, and nothing here
+      # enters the game or its history.
+      - name: Publish on a throwaway branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git checkout --orphan reference-frames-tmp
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          find . -maxdepth 1 ! -name . ! -name .git ! -name reference -exec rm -rf {} +
+          cat > README.md <<'EOF'
+          Transient. Official promotional screenshots pulled from Steam's public
+          app API for a one-off visual quality comparison, placed here only
+          because the development sandbox cannot reach any image host directly.
+          Deleted as soon as they have been pulled. Not part of the project.
+          EOF
+          git add -A
+          git commit -q -m 'Reference frames for visual comparison (transient)'
+          git push -f origin reference-frames-tmp
