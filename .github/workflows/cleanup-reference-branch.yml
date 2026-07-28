@@ -1,0 +1,40 @@
+name: cleanup-reference-branch
+
+# Companion to fetch-reference-frames. The reference branch carries third-party
+# promotional screenshots that were only ever meant to exist long enough to be
+# pulled into the development sandbox, and the sandbox's git proxy refuses ref
+# deletions, so the deletion has to happen from the runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to delete'
+        required: false
+        default: 'reference-frames-tmp'
+
+permissions:
+  contents: write
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete the branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          # Refuse to touch anything that is not the transient reference branch.
+          case "$BRANCH" in
+            reference-frames-tmp) ;;
+            *) echo "refusing to delete '$BRANCH'"; exit 1 ;;
+          esac
+          if gh api "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}"
+            echo "deleted ${BRANCH}"
+          else
+            echo "${BRANCH} already gone"
+          fi
