@@ -641,6 +641,17 @@ export class PostStack {
     if (this._validated) return true;
     this._validated = true;
 
+    // ?post=force pins the chain on regardless of what this concludes. The
+    // guard is a safety net for devices that genuinely cannot composite, and a
+    // safety net that fires on a healthy frame is indistinguishable, from the
+    // outside, from one that never fires at all. Being able to see the frame
+    // it rejected is the only way to tell those apart.
+    if (typeof location !== 'undefined'
+      && new URLSearchParams(location.search).get('post') === 'force') {
+      console.warn('post: validation overridden by ?post=force');
+      return true;
+    }
+
     const previous = this.composer.renderToScreen;
     this.composer.renderToScreen = false;
     let threw = null;
@@ -669,7 +680,23 @@ export class PostStack {
     // through the same curve before comparing, or the test reads a working
     // frame as broken and a broken one as fine.
     const expected = srgbTransfer(acesToneMap(reference * this.grade.uniforms.uExposure.value));
-    if (composed >= expected * 0.35) return true;
+
+    // Deliberately a long way loose. This models exposure and the tone curve
+    // and nothing else, but the grade it is judging also applies a contrast
+    // power about mid-grey, a lifted black point, a per-channel gain and a
+    // vignette in linear — every one of which legitimately darkens the
+    // composite relative to this estimate, and none of which indicates a
+    // fault. At a 0.35 factor the guard began firing on perfectly good frames
+    // the moment the grade was retuned, and silently disabled bloom, sun
+    // shafts, the tone curve and antialiasing for an entire review cycle. A
+    // whole look was judged, by four people, on a forward render.
+    //
+    // What this exists to catch is a device that composites black or garbage,
+    // and that case is not marginal — it reads at or near zero. Anything with
+    // a fifth of the expected light in it has an image in it, whatever the
+    // grade did afterwards.
+    const dark = composed < 0.02;
+    if (!dark && composed >= expected * 0.10) return true;
 
     return this.degrade(
       `composed ${composed.toFixed(3)} against an expected ${expected.toFixed(3)}`,

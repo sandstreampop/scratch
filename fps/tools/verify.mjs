@@ -279,6 +279,20 @@ try {
         + (env.healed ? ', healed with analytic fill' : '')
       : 'no measurement taken');
 
+  // The post chain has to be ON. Its self-heal is allowed to switch it off on
+  // a device that genuinely cannot composite, but nothing was watching whether
+  // it fired, and when a grade retune tripped it the game rendered forward —
+  // no bloom, no sun shafts, no tone curve, no antialiasing — through a whole
+  // review cycle before anyone noticed. A fallback nobody can see is a fallback
+  // nobody can distinguish from a fault.
+  const post = await page.evaluate(() => {
+    const p = window.__GAME.post;
+    return { disabled: p.postDisabled, bloom: p.bloom?.enabled, shafts: p.shafts?.enabled };
+  });
+  check('post-processing is live', post.disabled === false,
+    post.disabled ? 'chain self-disabled — see the post: console warning for the numbers'
+      : `bloom ${post.bloom}, shafts ${post.shafts}`);
+
   const before = await page.evaluate(() => {
     const g = window.__GAME;
     return { x: g.player.position.x, z: g.player.position.z, yaw: g.player.yaw, ammo: g.weapon.ammo };

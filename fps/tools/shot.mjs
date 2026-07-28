@@ -44,6 +44,7 @@ async function main() {
   // post.js measures its own output and degrades on its own now; --byte pins
   // the old path when the two need comparing.
   const byte = args.includes('--byte');
+  const forcePost = args.includes('--force-post');
   const named = args.filter((a) => a !== 'smoke' && !a.startsWith('--'));
   const presets = smoke ? ['hero'] : (named.length ? named : PRESETS);
   fs.mkdirSync(SHOTS_DIR, { recursive: true });
@@ -67,7 +68,7 @@ async function main() {
     page.on('requestfailed', (r) => errors.push(`REQFAIL ${r.url()} ${r.failure()?.errorText}`));
     const t0 = Date.now();
     try {
-      const q = `shot=${preset}${byte ? '&buffers=byte' : ''}`;
+      const q = `shot=${preset}${byte ? '&buffers=byte' : ''}${forcePost ? '&post=force' : ''}`;
       await page.goto(`http://127.0.0.1:${port}/index.html?${q}`, { timeout: 60000 });
       await page.waitForFunction('window.__SHOT_READY === true', null, { timeout: 240000, polling: 500 });
       const out = path.join(SHOTS_DIR, `${preset}.png`);
