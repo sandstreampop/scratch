@@ -61,6 +61,22 @@
 // statements and every detail string says so. Everything else with no reference
 // value is a MEAS row, which cannot pass and cannot inflate a pass rate.
 //
+// THE CEILING THIS FILE DID NOT HAVE. Sections 1b and 4b were added after a
+// blind comparison of recorded traces against traces synthesised from
+// targets.mjs found the worst behavioural defect in the game while this suite
+// was 60/60: an enemy who could see the player stopped shooting for up to 9.4 s,
+// because ENGAGE handed over to a REPOSITION state with no firing path in it.
+// Section 4 measured inter-burst gaps and asserted only their FLOOR — and it
+// dropped every gap that followed an abandoned burst, which is precisely the
+// class the silences lived in. So the instrument discarded the evidence and then
+// reported a shape. The new rows assert the ceiling (with the sight line
+// verified open from one round to the next), the same cadence read as a volume
+// of fire per range and per engagement, and that the delay to the first landed
+// round is explained by the rounds fired rather than by silence. Section 1b
+// settles the fourth item the comparison raised — that the reaction band is too
+// narrow — by measuring it over 72 engagements instead of 24 and asserting the
+// extremes against the sourced band; it is inside it, so nothing was retuned.
+//
 // No row is red on purpose any more. Two used to be — the hitscan AI round and
 // the untagged silhouette meshes — and both were closed in the files that owned
 // them, so the rows that named those owners now pass. What is left of that
@@ -937,6 +953,84 @@ export default async function run(sim, report) {
       }
     }
 
+    /* ================== 1b. the SHAPE of the reaction band ============= */
+    //
+    // Added because a blind trace comparison called the reaction band too narrow
+    // — measured 0.250-0.350 s at sd 0.030 against a reference that spread
+    // 0.233-0.383 at sd 0.041 — and because the section above cannot settle that
+    // question. Twenty-four trials put ~2 samples in each tail, so its p10 and
+    // p90 rows move by more than the effect anybody is arguing about; one of the
+    // three judges who raised the item called reaction time indistinguishable
+    // and the judge who raised it flagged his own n as weak.
+    //
+    // So this measures the same quantity over four times the sample and asserts
+    // the extremes — not the deciles — against the one thing that is sourced:
+    // ai.ai_reaction_delay_range, whose tolerance IS the 0.20-0.40 s band from
+    // Game AI Pro 2 ch.5. A band is a statement about every draw, so the correct
+    // assertion on a band is on the smallest and largest draw observed, and that
+    // is an assertion the deciles cannot make: a distribution can keep both
+    // deciles inside the band while a tenth of its draws sit outside it.
+    //
+    // Trials are 0.8 s each rather than the 2.2 s above, because the only event
+    // this block needs is the first round, and the block above has already
+    // asserted that every trial produces one.
+    //
+    // What is NOT asserted here is the standard deviation. There is no sourced
+    // figure for the spread of an AI reaction — targets.mjs publishes a base, a
+    // band and two human-reaction anchors, and nothing about dispersion — so a
+    // gate on sd would be a number this suite invented, which is the exact defect
+    // the reporter and the linter exist to prevent. It is a MEAS row.
+    {
+      const RANGES_R = [12, 18, 24, 30, 36, 42];
+      const REPEATS_R = 12;
+      const wide = [];
+      let unseen = 0, noShot = 0;
+      for (let r = 0; r < REPEATS_R; r++) {
+        for (const d of RANGES_R) {
+          const e = await engage({ d, seconds: 0.8, dt: DT_FINE, state: 'idle', vulnerable: false });
+          if (!e.pre.sees) { unseen++; continue; }
+          if (!e.fires.length) { noShot++; continue; }
+          wide.push(e.fires[0].t - e.t0);
+        }
+      }
+      const want = RANGES_R.length * REPEATS_R;
+      report.check('the reaction band was sampled over enough engagements to have tails',
+        wide.length === want,
+        `${wide.length}/${want} trials usable at ${RANGES_R.join('/')} m — ${unseen} discarded for no line `
+        + `of sight at t0, ${noShot} for no round inside 0.8 s. The section above runs 24; a decile on 24 `
+        + 'samples rests on two of them, which is why the shape claim needed its own sample');
+      const lo = Math.min(...wide), hi = Math.max(...wide);
+      const sd = Math.sqrt(mean(wide.map((v) => (v - mean(wide)) ** 2)));
+      if (report.reached('the wide reaction sample has extremes to report',
+        allOf(lo, hi, sd), `${wide.length} draws, ${new Set(wide.map((v) => v.toFixed(4))).size} distinct values`)) {
+        // Both ends against the sourced band. These are the rows that decide
+        // whether the band is a defect at all: a distribution wholly inside
+        // 0.20-0.40 s is doing what the only sourced statement asks of it,
+        // whatever its sd.
+        report.against('AI reaction time, fastest of the wide sample', lo, 'ai', 'ai_reaction_delay_range');
+        report.against('AI reaction time, slowest of the wide sample', hi, 'ai', 'ai_reaction_delay_range');
+        report.measure('AI reaction time, standard deviation over the wide sample', sd, 's',
+          `${wide.length} engagements, range ${ms(lo)}..${ms(hi)}, mean ${ms(mean(wide))}. No sourced figure `
+          + 'exists for the DISPERSION of an AI reaction — targets.mjs has a base, a band and two human '
+          + 'anchors and nothing about spread — so this is reported and not gated');
+      }
+      // Structural: a continuous roll cannot pile its mass on one value. This is
+      // the failure the sd complaint is really about at its limit — an agent
+      // whose delay is effectively constant is a metronome the player learns —
+      // and it is assertable without inventing a dispersion target, because a
+      // point mass is a property of the distribution and not a tuning choice.
+      const counts = new Map();
+      for (const v of wide) counts.set(v.toFixed(4), (counts.get(v.toFixed(4)) ?? 0) + 1);
+      const modal = Math.max(...counts.values());
+      report.check('the reaction delay is a distribution and not a metronome',
+        wide.length > 0 && modal / wide.length < 0.5 && hi - lo > 4 * DT_FINE,
+        `the most repeated single delay accounts for ${modal}/${wide.length} draws (${pct(modal / wide.length)}) `
+        + `across ${counts.size} distinct values spanning ${ms(hi - lo)}, i.e. `
+        + `${f2((hi - lo) / DT_FINE)} ticks of the ${f2(1 / DT_FINE)} Hz grid. Structural — half the mass on `
+        + 'one value is a constant wearing a roll, and the 4-tick span is the point below which the grid, '
+        + 'not the roll, is what the player would be learning');
+    }
+
     /* ============================ 2. accuracy vs range ================= */
     //
     // Hits landed / rounds fired against a stationary, vulnerable player with
@@ -1400,6 +1494,240 @@ export default async function run(sim, report) {
         + `${f2(moved)} m from the spawn point over ${f2(span)} s. Both halves are asserted: a state machine `
         + 'that enters REPOSITION and gets nowhere was measured at 60% of a 26 s engagement with 0.00 m of '
         + 'displacement, because the cover point it chose was on the far side of a wall');
+    }
+
+    /* =============== 4b. dormancy with the sight line open ============= */
+    //
+    // THE STRUCTURAL INVARIANT THIS SUITE DID NOT HAVE, and the one that would
+    // have caught the worst defect in the game on day one: an enemy who can see
+    // the player does not stop shooting for longer than his own firing schedule
+    // allows.
+    //
+    // Section 4 measures inter-burst gaps and asserts the FLOOR — that bursts do
+    // not merge — over six 8 s engagements, and it passes on a game that goes
+    // silent for nine seconds, for two reasons. It never asserted a CEILING at
+    // all, and it drops every gap that follows an abandoned burst, which is
+    // exactly the class the dormancy lives in: the agent leaves ENGAGE for
+    // REPOSITION mid-burst, and the state it enters has no firing path. So the
+    // instrument threw away the evidence and then reported a shape.
+    //
+    // A blind comparison of recorded traces against traces synthesised from
+    // targets.mjs found it from the outside: longest gap 9.367 s with line of
+    // sight open and verified for the whole 14 s window, and 5 of 98 gaps over
+    // 1.15 s, against a reference whose 156 gaps maxed out at exactly 1.150 s.
+    // The enemy was idle for up to 67% of an engagement.
+    //
+    // Three properties are asserted here and each one is structural — derived
+    // from the agent's own published cadence, not from a reference trace:
+    //
+    //   THE CEILING. The longest CONFIG.fireInterval is 1.15 s, timed from the
+    //   end of a burst, and the interval only counts down while the agent can
+    //   see the player. So with the sight line verifiably open from one round to
+    //   the next, no two consecutive rounds may be more than 1.15 s apart. The
+    //   bound is duplicated here as a literal on purpose: reading it out of
+    //   ai.js would make both sides of the comparison move together, which is
+    //   how six checks in this project once reported "+0.00% PASS" while the
+    //   quantity they guarded moved 79%.
+    //
+    //   THE VOLUME FLOOR. The same cadence read as a rate: the slowest schedule
+    //   CONFIG can roll is the shortest burst, 2 rounds at 0.098 s, followed by
+    //   the longest interval, so 2 / (1.15 + 0.098) = 1.60 rounds per second of
+    //   open sight line is the least fire the schedule permits. This is the same
+    //   defect measured from the ammunition side — the comparison found 16.0
+    //   rounds per 14 s engagement at 28 m, i.e. 1.14/s — and it is asserted per
+    //   range because nothing in the firing schedule reads distance, so a range
+    //   that delivers less fire than another is a scheduler fault and not a
+    //   marksmanship one.
+    //
+    //   THE FIRST HIT IS EXPLAINED BY ROUNDS. Time from the first round to the
+    //   round that first lands, bounded by the slowest legal delivery of that
+    //   many rounds. This separates the two ways an opening burst can fail to
+    //   register: rounds that missed (an aim-error question, and there is no
+    //   sourced AI accuracy figure to gate it with) and rounds that were never
+    //   fired (a scheduler question, which the cadence does bound).
+    //
+    // Lethality is RECONSTRUCTED rather than observed, as section 3 does: the
+    // player carries 1e6 HP and the kill is the tick cumulative damage crosses
+    // the measured 100 HP pool. A mortal player would end each sample at the
+    // moment the AI succeeded, which truncates the round count the volume floor
+    // is measured from — and the round count is the quantity under test.
+    {
+      const RANGES_D = [12, 20, 28, 36];
+      const REPEATS_D = 4;
+      const WINDOW_D = 14;
+      // CONFIG.fireInterval[1], CONFIG.burstDelay, CONFIG.burstCount[0]:
+      // literals, not imports. See the note above.
+      const CEIL = 1.15, SPACING = 0.098, MIN_BURST = 2;
+      const RATE_FLOOR = MIN_BURST / (CEIL + (MIN_BURST - 1) * SPACING);
+      const SLACK = 2 * DT_LONG;   // the schedule is consumed in whole ticks, and
+      // _sawPlayer is refreshed on the agent's own 3-tick line-of-sight schedule
+
+      /** Was the agent's sight line open on every sampled tick of (ta, tb]? */
+      const openThrough = (rows, ta, tb) => {
+        let seen = 0;
+        for (const r of rows) {
+          if (r.t <= ta + 1e-9 || r.t > tb + 1e-9) continue;
+          seen++;
+          if (!r.sees) return false;
+        }
+        return seen > 0;
+      };
+
+      const per = new Map();
+      const eng = [];              // one entry per engagement, for the per-engagement floor
+      const gapsOpen = [];
+      const ttfh = [], overBound = [];
+      let worstGap = null, unusable = 0, engagements = 0;
+      let openHits = 0, openRounds = 0, firstBurstHits = 0, firstBurstRounds = 0;
+      for (const d of RANGES_D) {
+        const p = { d, rounds: 0, openTime: 0, kills: 0, trials: 0, perEng: [], ttk: [] };
+        for (let i = 0; i < REPEATS_D; i++) {
+          const e = await engage({
+            d, seconds: WINDOW_D, dt: DT_LONG, state: 'engage', vulnerable: true, health: 1e6,
+          });
+          if (!e.pre.sees || !e.pre.clearFire || !e.fires.length) { unusable++; continue; }
+          p.trials++; engagements++;
+          const f = e.fires;
+          const t1 = f[0].t;
+          // Rounds and open time are both measured from the FIRST round, not from
+          // t0: an enemy dropped straight into ENGAGE by the harness still holds
+          // the 1-3 s fireTimer its constructor rolled, and that opening silence
+          // is an artefact of the setup rather than a property of the scheduler.
+          const openTicks = e.rows.filter((r) => r.t > t1 && r.sees).length;
+          p.openTime += openTicks * DT_LONG;
+          p.rounds += f.filter((x) => x.t > t1).length;
+          p.perEng.push(f.length);
+          eng.push({ d, rounds: f.filter((x) => x.t > t1).length, openTime: openTicks * DT_LONG });
+          for (let k = 1; k < f.length; k++) {
+            if (!openThrough(e.rows, f[k - 1].t, f[k].t)) continue;
+            const gap = f[k].t - f[k - 1].t;
+            gapsOpen.push(gap);
+            if (!worstGap || gap > worstGap.gap) worstGap = { gap, d, at: f[k - 1].t - e.t0 };
+          }
+          // The opening burst against the rest of the engagement. Nothing in
+          // shoot() distinguishes them, so their hit rates must agree.
+          for (let k = 0; k < f.length; k++) {
+            const opening = f[k].bl === f[0].bl - k;
+            if (opening) { firstBurstRounds++; if (f[k].hits > 0) firstBurstHits++; }
+            else { openRounds++; if (f[k].hits > 0) openHits++; }
+          }
+          const jHit = f.findIndex((x) => x.hits > 0);
+          if (jHit > 0 && openThrough(e.rows, t1, f[jHit].t)) {
+            const k = jHit;                       // intervals between round 1 and the hit
+            // The slowest legal delivery of k+1 rounds alternates the longest
+            // interval with the intra-burst spacing.
+            const bound = Math.ceil(k / 2) * CEIL + Math.floor(k / 2) * SPACING + (k + 2) * DT_LONG;
+            overBound.push((f[jHit].t - t1) - bound);
+          }
+          if (jHit >= 0) ttfh.push(f[jHit].t + (f[jHit].flight ?? 0) - t1);
+          let cum = 0;
+          for (const x of f) {
+            cum += x.amount;
+            if (cum >= healthPool) { p.kills++; p.ttk.push(x.t - t1); break; }
+          }
+        }
+        per.set(d, p);
+      }
+      const rateOf = (d) => (per.get(d).openTime ? per.get(d).rounds / per.get(d).openTime : NaN);
+
+      report.check('the dormancy probe held a verified sight line in every engagement',
+        unusable === 0 && engagements === RANGES_D.length * REPEATS_D,
+        `${engagements}/${RANGES_D.length * REPEATS_D} engagements of ${WINDOW_D} s at `
+        + `${RANGES_D.join('/')} m usable, ${unusable} discarded for no line of sight, a blocked lane or no `
+        + `round fired at all; ${gapsOpen.length} round-to-round gaps with the sight line open on every `
+        + 'sampled tick');
+
+      // ---- the ceiling -------------------------------------------------
+      if (report.reached('there are sight-line-verified gaps to bound', allOf(gapsOpen.length || NaN),
+        `${gapsOpen.length} gaps over ${engagements} engagements, ${dist(gapsOpen, 'ms')}`)) {
+        report.check('an enemy who can see the player never stops firing for longer than his fire interval',
+          Math.max(...gapsOpen) <= CEIL + SLACK,
+          `longest gap ${ms(Math.max(...gapsOpen))} at ${f2(worstGap.d)} m, ${f2(worstGap.at)} s into the `
+          + `window, against the CONFIG.fireInterval ceiling of ${ms(CEIL)} + ${ms(SLACK)} of tick slack; `
+          + `${gapsOpen.filter((g) => g > CEIL + SLACK).length}/${gapsOpen.length} gaps over the ceiling, `
+          + `distribution ${dist(gapsOpen, 'ms')}. Structural: the interval is timed from the end of a burst `
+          + 'and only counts down while the agent can see the player, so with the sight line verified open '
+          + 'from one round to the next there is no schedule the agent can be running that is slower');
+        report.measure('longest sight-line-open silence, as a share of the fire interval',
+          Math.max(...gapsOpen) / CEIL, 'x the ceiling',
+          `p90 ${ms(quant(gapsOpen, 0.9))}, p99 ${ms(quant(gapsOpen, 0.99))} over ${gapsOpen.length} gaps`);
+      }
+
+      // ---- the volume floor, per range ---------------------------------
+      if (report.reached('every range delivered fire over an open sight line', allOf(...RANGES_D.map(rateOf)),
+        `${RANGES_D.map((d) => `${d} m ${per.get(d).rounds} rounds over ${f2(per.get(d).openTime)} s`).join(', ')}`)) {
+        // Per range AND per engagement. The aggregate alone is too forgiving to
+        // be the instrument for this: a nine-second silence is three gaps in a
+        // couple of hundred, so it moves a pooled rate by less than the spread
+        // between ranges and the row stays green on a game that goes quiet. An
+        // engagement is qualified for the per-engagement form once it has 3 s of
+        // open sight line, below which the ratio is a measurement of the window
+        // rather than of the schedule.
+        const q = eng.filter((x) => x.openTime >= 3);
+        const worstEng = q.reduce((w, x) => (x.rounds / x.openTime < w.rounds / w.openTime ? x : w),
+          q[0] ?? { d: NaN, rounds: 0, openTime: NaN });
+        report.check('volume of fire never falls below the slowest schedule the AI can roll',
+          RANGES_D.every((d) => rateOf(d) >= RATE_FLOOR)
+          && q.length > 0 && q.every((x) => x.rounds / x.openTime >= RATE_FLOOR),
+          `${RANGES_D.map((d) => `${d} m ${f2(rateOf(d))}/s`).join(', ')} against a floor of `
+          + `${f2(RATE_FLOOR)} rounds per second of open sight line = ${MIN_BURST} rounds of a shortest burst `
+          + `at ${ms(SPACING)} spacing per ${ms(CEIL)} interval; worst single engagement `
+          + `${f2(worstEng.rounds / worstEng.openTime)}/s (${worstEng.rounds} rounds over `
+          + `${f2(worstEng.openTime)} s open at ${f2(worstEng.d)} m), `
+          + `${q.filter((x) => x.rounds / x.openTime < RATE_FLOOR).length}/${q.length} qualifying `
+          + 'engagements under the floor. Structural, and asserted per range because nothing in the firing '
+          + 'schedule reads distance — a range delivering less fire than another is a scheduler fault, not a '
+          + 'marksmanship one');
+        for (const d of RANGES_D) {
+          const p = per.get(d);
+          report.measure(`AI rounds delivered per ${WINDOW_D} s engagement at ${d} m`, mean(p.perEng), 'rounds',
+            `${p.rounds} rounds over ${p.trials} engagements at ${f2(rateOf(d))}/s of open sight line, `
+            + `${p.kills}/${p.trials} reaching the ${f2(healthPool)} HP pool`
+            + `${p.ttk.length ? ` in a median ${ms(median(p.ttk))} from the first round` : ''} — no sourced `
+            + 'target: targets.mjs lists ai_accuracy in its own missing() set and no publisher documents an '
+            + 'AI rate of fire either');
+        }
+        const kills = RANGES_D.reduce((s, d) => s + per.get(d).kills, 0);
+        report.measure('AI kill rate over the whole range band', kills / engagements, 'fraction',
+          `${kills}/${engagements} engagements of ${WINDOW_D} s reached the ${f2(healthPool)} HP pool, `
+          + `${RANGES_D.map((d) => `${d} m ${per.get(d).kills}/${per.get(d).trials}`).join(', ')}, on `
+          + `${RANGES_D.reduce((s, d) => s + per.get(d).rounds, 0)} rounds`);
+      }
+
+      // ---- the first hit -----------------------------------------------
+      if (report.reached('the first landed round has a delay to report', allOf(median(ttfh)),
+        `${ttfh.length}/${engagements} engagements landed a round, ${overBound.length} of them with the sight `
+        + 'line open from the first round to the one that landed')) {
+        report.measure('AI first-shot to first-hit', median(ttfh), 's',
+          `${dist(ttfh, 'ms')}; ${ttfh.filter((v) => v > 1).length}/${ttfh.length} engagements took over a `
+          + 'second to land a round. No sourced target — the quantity is a joint property of the cadence and '
+          + 'an aim-error model targets.mjs has no reference for');
+        report.check('the delay to the first landed round is explained by rounds fired, not by silence',
+          overBound.length > 0 && Math.max(...overBound) <= 0,
+          `worst engagement overran the slowest legal delivery of its own round count by `
+          + `${ms(Math.max(...overBound))} (negative is inside the bound), over ${overBound.length} `
+          + `engagements with the sight line open throughout. The bound alternates the ${ms(CEIL)} interval `
+          + `with the ${ms(SPACING)} intra-burst spacing, so it is the cadence and nothing else; a round that `
+          + 'misses costs time inside it, a round never fired does not');
+      }
+      // Opening burst against the sustained rate. Two proportions, so two
+      // standard errors of allowance — the same discipline the accuracy steps
+      // use, and for the same reason: at this n a strict test is a coin flip.
+      if (report.reached('both the opening burst and the rest of the engagement fired rounds',
+        allOf(firstBurstRounds || NaN, openRounds || NaN),
+        `${firstBurstRounds} opening-burst rounds and ${openRounds} later rounds over ${engagements} `
+        + 'engagements')) {
+        const pF = firstBurstHits / firstBurstRounds, pL = openHits / openRounds;
+        const se = Math.sqrt(pF * (1 - pF) / firstBurstRounds + pL * (1 - pL) / openRounds);
+        report.check('the opening burst is no less accurate than the rest of the engagement',
+          pF >= pL - 2 * se,
+          `opening burst ${pct(pF)} (${firstBurstHits}/${firstBurstRounds}) against ${pct(pL)} `
+          + `(${openHits}/${openRounds}) later, difference ${pct(pF - pL)} +/- ${pct(se)} (1 s.e.). `
+          + 'Structural: shoot() applies one error model to every round and knows nothing about which round '
+          + 'of an engagement it is, so the two rates must agree inside sampling. A first burst that lands '
+          + 'less often than the fire that follows it would be a real defect — it is the damage cue that '
+          + 'tells a player he is under fire');
+      }
     }
 
     /* ============================= 5. a moving target ================== */

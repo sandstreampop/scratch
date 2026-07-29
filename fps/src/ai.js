@@ -57,6 +57,18 @@ const CONFIG = {
   // arming the burst without firing it, which measured 644-921 ms end to end —
   // outside the 0.20-0.40 s band in targets.mjs by more than a factor of two,
   // and reading as an enemy who had to wake up first.
+  // Kept at [0.22, 0.32] on purpose after a blind comparison called the band too
+  // narrow against the reference's 0.233-0.383. The only SOURCED statement about
+  // this quantity is ai.ai_reaction_delay_base (0.25 s, tolerance 0.20-0.30) and
+  // ai.ai_reaction_delay_range, whose tolerance IS the 0.20-0.40 s band; measured
+  // over 72 engagements the delay the player experiences runs 0.238-0.338 s at a
+  // 0.283 s mean, which is inside both. Widening to the full 0.20-0.40 band is
+  // what the comparison suggested and it fails the base: the mean would land at
+  // ~0.31 s once the line-of-sight schedule's couple of ticks are added, outside
+  // the 0.30 s ceiling on the median. Nothing publishes a DISPERSION for an AI
+  // reaction, so the sd difference (0.029 vs 0.041) is a shape the comparison had
+  // no reference for — two of its three judges said as much — and there is no
+  // number here to move it toward without inventing one.
   reactionTime: [0.22, 0.32],
   repositionChance: 0.55,
 };
@@ -608,36 +620,7 @@ export class Enemy {
         this.targetFacing = Math.atan2(toPlayer.x, toPlayer.z);
         this._aimBlend = Math.min(1, this._aimBlend + dt * 5);
 
-        if (sees) {
-          // Arm and fire in the same tick, and hold fireInterval until the
-          // burst is spent. Both were wrong before, and both were audible: the
-          // old order armed the burst on one tick and fired on the next, which
-          // put a tick of latency inside every reaction measurement; and
-          // fireTimer was decremented DURING the burst, so five rounds at
-          // 0.098 s spacing ate 0.39 s of a 0.42 s interval and the next burst
-          // began ~30 ms after the last one ended. The player heard one long
-          // burst and the rolled burstCount became fiction.
-          if (this.burstLeft <= 0) {
-            this.fireTimer -= dt;
-            if (this.fireTimer <= 0) {
-              this.burstLeft = CONFIG.burstCount[0]
-                + Math.floor(Math.random() * (CONFIG.burstCount[1] - CONFIG.burstCount[0] + 1));
-              this.burstTimer = 0;
-            }
-          }
-          if (this.burstLeft > 0) {
-            this.burstTimer -= dt;
-            if (this.burstTimer <= 0) {
-              this.shoot(player, distance);
-              this.burstTimer = CONFIG.burstDelay;
-              if (--this.burstLeft <= 0) {
-                this.fireTimer = THREE.MathUtils.lerp(
-                  CONFIG.fireInterval[0], CONFIG.fireInterval[1], Math.random(),
-                );
-              }
-            }
-          }
-        }
+        if (sees) this.serviceFire(dt, player, distance);
 
         // Break contact and move periodically so firefights are not static.
         if (this.stateTimer > 3.2 + Math.random() * 3
@@ -653,7 +636,43 @@ export class Enemy {
         break;
       }
       case STATE.REPOSITION: {
-        this._aimBlend = Math.max(0.35, this._aimBlend - dt * 2);
+        // Move AND shoot, whenever the sight line is actually open.
+        //
+        // This case used to contain no firing path at all, and that is the worst
+        // defect a blind telemetry comparison found in this game: ENGAGE hands
+        // over on `stateTimer > 3.2 + random()*3 && random() < 0.55`, REPOSITION
+        // has a six-second timeout, and nothing bounds re-entry — so two chained
+        // repositions with the player in plain view produced a measured 9.367 s
+        // of silence, 8.1x the 1.15 s ceiling the agent's own CONFIG.fireInterval
+        // sets, and 67% of a 14 s engagement. It also cost about a third of the
+        // volume of fire and half the kills at mid range, which is the same bug
+        // read off the ammunition instead of the clock.
+        //
+        // Firing while moving was chosen over the alternative — capping the
+        // non-firing window — for two reasons. It is what soldiers do: breaking
+        // contact under your own suppressive fire is the manoeuvre, and a bot
+        // that sprints between cover with its rifle down is the thing that reads
+        // as scripted. And a cap is a second timer that has to agree with
+        // fireInterval to mean anything, so it would restate the invariant in a
+        // place where it can silently drift out of agreement with it; running the
+        // one scheduler from both states makes the invariant hold by
+        // construction rather than by arithmetic.
+        //
+        // Deliberately NOT added: any movement penalty on the aim. The same
+        // comparison measured the AI's opening burst as landing too rarely and
+        // was explicit that the cause was this scheduler rather than the error
+        // model, so a `moving` term in shoot() would be a new invented constant
+        // pushing a quantity that has no sourced target — and it would hide the
+        // fix behind a compensating regression. The aim error is unchanged;
+        // gameplay-ai.mjs measures the opening burst against the sustained rate
+        // and they agree.
+        if (sees) {
+          this._aimBlend = Math.min(1, this._aimBlend + dt * 5);
+          this.targetFacing = Math.atan2(toPlayer.x, toPlayer.z);
+          this.serviceFire(dt, player, distance);
+        } else {
+          this._aimBlend = Math.max(0.35, this._aimBlend - dt * 2);
+        }
         if (this.repositionTarget) {
           const to = _v.copy(this.repositionTarget).sub(this.position);
           to.y = 0;
@@ -663,7 +682,11 @@ export class Enemy {
             this.stateTimer = 0;
           } else {
             to.divideScalar(d);
-            this.targetFacing = Math.atan2(to.x, to.z);
+            // Only while blind. A soldier who can see the player keeps the rifle
+            // on him (above) and covers the ground sideways or backwards, which
+            // is the pose the animator already produces from a facing that
+            // disagrees with the velocity.
+            if (!sees) this.targetFacing = Math.atan2(to.x, to.z);
             this.velocity.x = to.x * CONFIG.runSpeed;
             this.velocity.z = to.z * CONFIG.runSpeed;
             // Give up on a move that is not happening. integrate() zeroes the
@@ -697,6 +720,54 @@ export class Enemy {
 
     this.integrate(dt);
     this.animate(dt, now);
+  }
+
+  /**
+   * The burst scheduler: one tick of it, run from every state that can see the
+   * player.
+   *
+   * It lives in a method rather than inline in ENGAGE because it is now called
+   * from two states, and the whole of the worst behavioural defect this game has
+   * had was that the second of those states did not call it. The invariant the
+   * caller must preserve is the one gameplay-ai.mjs asserts: an agent with the
+   * sight line open does not go longer than CONFIG.fireInterval[1] between
+   * rounds, which holds for any set of states as long as every state that can
+   * see calls this every tick.
+   *
+   * Arm and fire in the same tick, and hold fireInterval until the burst is
+   * spent. Both were wrong before, and both were audible: the old order armed
+   * the burst on one tick and fired on the next, which put a tick of latency
+   * inside every reaction measurement; and fireTimer was decremented DURING the
+   * burst, so five rounds at 0.098 s spacing ate 0.39 s of a 0.42 s interval and
+   * the next burst began ~30 ms after the last one ended. The player heard one
+   * long burst and the rolled burstCount became fiction.
+   *
+   * Nothing here reads the state it was called from, and that is deliberate: a
+   * separate cadence for a moving shooter would be two schedules to keep in
+   * agreement with one published interval, and the interval is what the player
+   * hears.
+   */
+  serviceFire(dt, player, distance) {
+    if (this.burstLeft <= 0) {
+      this.fireTimer -= dt;
+      if (this.fireTimer <= 0) {
+        this.burstLeft = CONFIG.burstCount[0]
+          + Math.floor(Math.random() * (CONFIG.burstCount[1] - CONFIG.burstCount[0] + 1));
+        this.burstTimer = 0;
+      }
+    }
+    if (this.burstLeft > 0) {
+      this.burstTimer -= dt;
+      if (this.burstTimer <= 0) {
+        this.shoot(player, distance);
+        this.burstTimer = CONFIG.burstDelay;
+        if (--this.burstLeft <= 0) {
+          this.fireTimer = THREE.MathUtils.lerp(
+            CONFIG.fireInterval[0], CONFIG.fireInterval[1], Math.random(),
+          );
+        }
+      }
+    }
   }
 
   pickCover(player) {

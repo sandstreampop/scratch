@@ -322,6 +322,31 @@ async function sections(sim, report, baseColliders) {
   report.against('crouch top speed', S.crouch.steady, 'movement', 'crouch_speed_mw3');
   report.against('ADS top speed', S.ads.steady, 'movement', 'ads_movement_speed_mw3');
 
+  // The +/-12% band on movement.crouch_speed_mw3 is a TITLE band, not a precision
+  // band, and the blind telemetry comparison walked straight through it: 2.35 m/s
+  // reads as -2.1%, passes the assertion above, and is still slower than every
+  // crouch speed the source has ever published. The key's own note is why the
+  // lower half of that band is not sourced slack — it records the published
+  // change as "Decreased crouch movement speed from 2.6m/s to 2.4m/s (-8%)",
+  // reproduced twice inside the same patch notes, and calls it "THE MOST SOLID
+  // VALUE IN THIS BATCH". The ambiguity the band absorbs is which title/season is
+  // being modelled, and every title in the note's history is at or ABOVE the
+  // key's value (2.6 before Season 4). So the sourced range is one-sided
+  // downwards, and this asserts that side of it.
+  //
+  // The bound is read out of targets.mjs through report.targets rather than
+  // written here, so it cannot drift from the research and cannot be satisfied
+  // by editing this file. It is emphatically NOT read from src/ — that is the
+  // tautology the linter exists to stop.
+  const crouchKey = report.targets.TARGETS.movement.crouch_speed_mw3;
+  report.check('crouch speed is not below the slowest figure its key publishes',
+    S.crouch.steady >= crouchKey.value * (1 - 1e-9),
+    `crouch steady state ${S.crouch.steady.toFixed(4)} m/s against movement.crouch_speed_mw3 = `
+    + `${crouchKey.value} ${crouchKey.unit} (${((S.crouch.steady / crouchKey.value - 1) * 100).toFixed(2)}%). `
+    + `The key's +/-${(crouchKey.tol.pct * 100).toFixed(0)}% band covers title ambiguity, which can only put `
+    + 'crouch higher (2.6 m/s pre-Season-4), so nothing sourced permits a value below '
+    + `${crouchKey.value} ${crouchKey.unit} — quoted from ${crouchKey.title}`);
+
   // The ratios are what the model is actually built out of: nobody perceives
   // 2.35 m/s, they perceive "crouch is half speed". They are also the only form
   // in which the strafe and backpedal penalties are published.
@@ -524,6 +549,60 @@ async function sections(sim, report, baseColliders) {
       : `still moving at ${after[after.length - 1].speed.toFixed(4)} m/s `
         + `${((after[after.length - 1].t - rel.t) * 1000).toFixed(0)} ms after release`);
 
+  /* ==== 3b. the shape of the standing-start ramp =========================== */
+
+  // Every trace above is driven at 1/240, but the simulation does NOT tick at
+  // 1/240: Game.step banks the time it is handed and integrates in fixed 1/60
+  // slices, so four drive calls of 1/240 produce one tick and three duplicate
+  // samples of it. That is harmless for a steady state or a threshold crossing
+  // and fatal for anything phrased per tick — the differences of a 1/240 trace
+  // are 0, 0, 0, delta. So the ramp is driven at one call per simulation tick,
+  // which is the only grid on which "the increment this tick" is a quantity.
+  //
+  // The claim is structural and it is the whole claim available: nothing sourced
+  // publishes a CoD ground acceleration (targets.mjs still lists
+  // movement_acceleration as uncovered), so the magnitude of the ramp cannot be
+  // asserted. Its SHAPE can. A ramp built from a friction term that falls with
+  // speed and an acceleration term that does not produces strictly shrinking
+  // increments; two equal increments mean the friction term went constant, which
+  // is a tick of dead input the player feels at the start of every sprint.
+  const TICK60 = 1 / 60;
+  const IDLE = 6;
+  await stand();
+  const rampRows = await sim.drive({
+    ticks: IDLE + 40, dt: TICK60,
+    input: `if (i < ${IDLE}) { ${hold()} } ${hold('forward', 'sprint')}`,
+  });
+  const rampFrom = rampRows[IDLE - 1];
+  const rampSpeeds = rampRows.slice(IDLE - 1).map((r) => r.speed);
+  // The ramp ends at the first sample that has arrived at the steady state: past
+  // that the increments are legitimately 0 and "strictly decreasing" would be a
+  // claim about the plateau rather than about the ramp.
+  const arriveIdx = rampSpeeds.findIndex((v, k) => k > 0 && v >= S.sprint.steady - 1e-9);
+  report.check('the standing-start ramp starts from rest and arrives at the sprint steady state',
+    rampFrom.speed < 1e-9 && arriveIdx > 3,
+    `${IDLE} ticks of no input left the body at ${rampFrom.speed.toExponential(2)} m/s; holding `
+    + `forward+sprint reached the ${S.sprint.steady.toFixed(4)} m/s steady state `
+    + `${arriveIdx > 0 ? `${arriveIdx} ticks later` : 'never within 40 ticks'}`);
+  if (arriveIdx > 3) {
+    const inc = [];
+    for (let k = 1; k <= arriveIdx; k++) inc.push(rampSpeeds[k] - rampSpeeds[k - 1]);
+    // Strict, with no epsilon: consecutive increments of a real ramp differ by
+    // percent, and the defect this catches is two increments that are equal to
+    // the last bit.
+    const flat = inc.findIndex((d, k) => k > 0 && d >= inc[k - 1]);
+    report.check('the standing-start ramp has no flat spot: per-tick increments strictly decrease',
+      flat === -1,
+      `increments over the ${inc.length} ticks from rest to the steady state: `
+      + `${inc.map((d) => d.toFixed(4)).join(', ')} m/s`
+      + (flat === -1
+        ? ` — strictly decreasing, ratios ${inc.slice(1).map((d, k) => (d / inc[k]).toFixed(3)).join(', ')}`
+        : ` — increment ${flat + 1} (${inc[flat].toFixed(4)}) is not smaller than increment ${flat} `
+          + `(${inc[flat - 1].toFixed(4)}), i.e. ${(TICK60 * 1000).toFixed(1)} ms in which holding the key `
+          + 'bought nothing extra. A friction term that goes CONSTANT below a speed floor is what makes two '
+          + 'increments equal — the acceleration term is constant too, so their difference stops moving'));
+  }
+
   /* ==== 4. jump and gravity ================================================ */
 
   const jumpRun = async (dt) => {
@@ -658,6 +737,78 @@ async function sections(sim, report, baseColliders) {
       + `(${((best / take - 1) * 100).toFixed(3)}%, tolerance ${(eps * 100).toFixed(1)}%) — ${AIR_NOTE}`);
     report.measure('speed change over an airborne strafe-turn', best - take, 'm/s',
       'positive would be a strafe-jump gain');
+  }
+
+  /* ==== 5b. airborne momentum and the landing ============================== */
+
+  // Two structural claims, both on one trace, both driven at one call per
+  // simulation tick for the reason given in section 3b.
+  //
+  // (a) Horizontal momentum is CONSERVED in the air. This is not a tolerance and
+  //     not a magnitude: movement.air_control records an explicit negative result
+  //     — no CoD sv_airaccelerate / g_airAccelerate figure exists in anything
+  //     either research pass could reach, and Counter-Strike's must not be
+  //     borrowed — so there is no sourced drag coefficient to assert and the only
+  //     honest expectation is zero. The spec's positive half (a small steering
+  //     nudge, "well under 10% of ground authority") is asserted in section 5 and
+  //     is not what this measures: forward is held with the yaw fixed, so the
+  //     wish axis IS the velocity axis and the steering term is identically zero
+  //     by construction. Anything that moves the speed here is drag.
+  //
+  // (b) Speed through the landing is monotone non-decreasing and never dips below
+  //     the airborne minimum. The takeoff speed and the ground steady state are
+  //     the same speed (sprint, held throughout, onto the same flat platform), so
+  //     the tick that regains contact has nothing legitimate to subtract: a
+  //     trough there is the controller charging ground friction on a tick it did
+  //     not also accelerate on. This is the one shape in the whole velocity trace
+  //     that a player feels as a hitch rather than as a number.
+  const LAND_SETTLE = 72;                 // 1.2 s of sprint at the fixed 1/60 tick
+  await stand();
+  const jr = await sim.drive({
+    ticks: LAND_SETTLE + 60, dt: TICK60,
+    input: `if (i === ${LAND_SETTLE}) g.player.requestJump(g.elapsed); ${hold('forward', 'sprint')}`,
+  });
+  const liftIdx = jr.findIndex((r, k) => k >= LAND_SETTLE && !r.onGround);
+  const landIdx = liftIdx < 0 ? -1 : jr.findIndex((r, k) => k > liftIdx && r.onGround);
+  const airRun = liftIdx < 0 ? [] : jr.slice(liftIdx, landIdx < 0 ? jr.length : landIdx);
+  if (report.reached('the sprinting jump left the ground and came back to it',
+    airRun.length >= 20 && landIdx > 0 ? airRun.length : null,
+    airRun.length >= 20 && landIdx > 0
+      ? `airborne for ${airRun.length} ticks (${(airRun.length * TICK60 * 1000).toFixed(0)} ms) from tick `
+        + `${liftIdx}, back in contact at tick ${landIdx}`
+      : `only ${airRun.length} airborne ticks and ${landIdx > 0 ? 'a' : 'no'} landing — nothing to measure`)) {
+    const airSpeeds = airRun.map((r) => r.speed);
+    const airMax = Math.max(...airSpeeds);
+    const airMin = Math.min(...airSpeeds);
+    // 1e-6 relative is float dust, not a tolerance: with no drag term the
+    // airborne branch multiplies the horizontal velocity by exactly 1.
+    report.check('horizontal momentum is conserved through the whole airborne phase',
+      (airMax - airMin) <= airMax * 1e-6,
+      `${airRun.length} air ticks span [${airMin.toFixed(4)}, ${airMax.toFixed(4)}] m/s — a `
+      + `${((airMin / airMax - 1) * 100).toFixed(2)}% change, i.e. `
+      + `${((airMax - airMin) / (airRun.length * TICK60)).toFixed(3)} m/s^2 of drag over the arc. Expected 0: `
+      + 'movement.air_control records that no CoD air-acceleration figure exists to borrow, so no drag '
+      + 'magnitude is sourced and any is invented; the sanctioned steering nudge is zero here because the '
+      + 'wish axis is the velocity axis (forward held, yaw fixed)');
+
+    const win = jr.slice(landIdx - 1, landIdx + 6);
+    const dips = win.filter((r) => r.speed < airMin - 1e-9).length;
+    let mono = -1;
+    for (let k = 1; k < win.length; k++) if (win[k].speed < win[k - 1].speed - 1e-9) { mono = k; break; }
+    report.check('speed through the landing is monotone non-decreasing',
+      mono === -1,
+      `last air tick then ${win.length - 1} ticks from contact: `
+      + `${win.map((r) => r.speed.toFixed(4)).join(', ')} m/s`
+      + (mono === -1 ? ' — no tick loses speed'
+        : ` — tick ${mono} of the window drops ${(win[mono - 1].speed - win[mono].speed).toFixed(4)} m/s `
+          + `(${((win[mono - 1].speed - win[mono].speed) / TICK60).toFixed(1)} m/s^2) and has to be won back, `
+          + 'which is a hitch on every landing rather than a number on a chart'));
+    report.check('no tick of the landing reads below the airborne minimum',
+      dips === 0,
+      `airborne minimum ${airMin.toFixed(4)} m/s; the contact tick reads `
+      + `${jr[landIdx].speed.toFixed(4)} m/s and ${dips} of ${win.length} ticks in the landing window are `
+      + 'below the airborne minimum — the tick that regains contact cannot be slower than the air phase it '
+      + 'ends, because ground contact only ever adds authority');
   }
 
   /* ==== 6. frame-rate independence (expected RED) ========================== */
@@ -901,6 +1052,59 @@ async function sections(sim, report, baseColliders) {
         ? `longest mashed episode ${(Math.max(...mashBursts.map((b) => b.dur)) * 1000).toFixed(0)} ms vs `
           + `${(slideDur * 1000).toFixed(0)} ms held`
         : '0 boosted episodes in the mashed run, so there is nothing to bound');
+  }
+
+  // The SHAPE of the slide's exit, on its own trace at one call per simulation
+  // tick (section 3b). physics.slide_max_speed_scale (1.55) and
+  // physics.slide_max_duration (0.65 s) are two halves of one envelope and they
+  // jointly determine the decay: a slide that starts at 1.55x walk and is allowed
+  // to last 0.65 s has to have arrived at the crouch cap by the time the cap
+  // fires, or the cap is not what ends it — the clip is. Nothing invented is
+  // needed to see that, because the failure is a discontinuity: the per-tick
+  // decrement of a decay that is one curve never grows, and a brake tacked onto
+  // the end of it makes the decrement jump. The window runs from the slide's peak
+  // to the first tick at or below the crouch steady state measured in section 1,
+  // so any braking that happens ABOVE the crouch cap is inside it and any
+  // re-acceleration afterwards is outside it.
+  await stand();
+  const sdRows = await sim.drive({
+    ticks: LAND_SETTLE + 150, dt: TICK60,
+    input: `if (i < ${LAND_SETTLE}) { ${hold('forward', 'sprint')} } ${hold('forward', 'sprint', 'crouch')}`,
+  });
+  const sdPost = sdRows.slice(LAND_SETTLE);
+  const sdPeak = Math.max(...sdPost.map((r) => r.speed));
+  const sdPeakIdx = sdPost.findIndex((r) => r.speed === sdPeak);
+  const sdArrive = sdPost.findIndex((r, k) => k > sdPeakIdx && r.speed <= S.crouch.steady + 1e-9);
+  if (report.reached('the slide decays all the way to the crouch cap within the trace', sdArrive > 0 ? sdArrive : null,
+    sdArrive > 0
+      ? `peak ${sdPeak.toFixed(4)} m/s at tick ${sdPeakIdx}, first at or below the ${S.crouch.steady.toFixed(4)} `
+        + `m/s crouch steady state ${sdArrive - sdPeakIdx} ticks later`
+      : `never reached the ${S.crouch.steady.toFixed(4)} m/s crouch steady state in 2.5 s of held crouch`)) {
+    const drops = [];
+    for (let k = sdPeakIdx + 1; k <= sdArrive; k++) drops.push(sdPost[k - 1].speed - sdPost[k].speed);
+    const step = drops.findIndex((d, k) => k > 0 && d > drops[k - 1] + 1e-9);
+    report.check('the slide decays continuously into the crouch cap, with no step at the duration cap',
+      step === -1,
+      `${drops.length} ticks from the ${sdPeak.toFixed(4)} m/s peak down to `
+      + `${sdPost[sdArrive].speed.toFixed(4)} m/s; per-tick decrement `
+      + `${drops[0].toFixed(4)} -> ${drops[drops.length - 1].toFixed(4)} m/s`
+      + (step === -1
+        ? ' — never grows, so the decay is one curve and the crouch cap is where it lands rather than where '
+          + 'it is clipped'
+        : ` — decrement ${step} jumps from ${drops[step - 1].toFixed(4)} to ${drops[step].toFixed(4)} m/s `
+          + `(${(drops[step] / TICK60).toFixed(1)} m/s^2) at ${sdPost[step + sdPeakIdx].speed.toFixed(4)} m/s, `
+          + `which is ${(sdPost[step + sdPeakIdx].speed - S.crouch.steady).toFixed(4)} m/s above the crouch cap: `
+          + 'the slide is still fast when its duration runs out and the remainder is taken away in two ticks'));
+    // A second, independent measurement of the same sourced key: the speed a
+    // slide settles into, reached through the slide rather than by walking
+    // crouched. The two must be the same number and it must be the published one.
+    const sdFloor = mean(sdPost.slice(-30).map((r) => r.speed));
+    report.against('the speed a slide settles into', sdFloor, 'movement', 'crouch_speed_mw3');
+    report.check('the slide floor and the crouched walk are the same speed',
+      Math.abs(sdFloor - S.crouch.steady) < 1e-3,
+      `slide floor ${sdFloor.toFixed(4)} m/s over the last 0.5 s of held crouch vs a crouched-walk steady `
+      + `state of ${S.crouch.steady.toFixed(4)} m/s (differ by `
+      + `${Math.abs(sdFloor - S.crouch.steady).toFixed(5)} m/s) — one cap, reached two ways`);
   }
 
   /* ==== 9. mantle ========================================================== */
