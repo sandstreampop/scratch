@@ -18,7 +18,11 @@
 //   — which is the actual bug (the acceleration clamp projects velocity onto the
 //   wish axis, so a turn adds a full step at right angles to what is already
 //   there) and which no constant can silence. The absolute speed is asserted
-//   separately against the sourced target.
+//   separately against the sourced target — and against the right RUN, which
+//   took a while to get right: the sourced tac-sprint figures are forward
+//   speeds, so the sourced anchor belongs on the camera-swing turn (forward held
+//   throughout) and not on the forward+strafe run, whose 45 deg heading carries
+//   the elliptical strafe penalty and is 0.883x by construction. See section 2.
 //
 //   Flat ground is built, not searched for. The previous version asserted
 //   contact stability "on flat ground" while running on a 3.63% gradient behind
@@ -381,17 +385,88 @@ async function sections(sim, report, baseColliders) {
     turnPeak <= S.sprint.steady * (1 + eps),
     `sprinting straight settles at ${S.sprint.steady.toFixed(4)} m/s; adding a strafe key after `
     + `${(SETTLE * DT).toFixed(2)} s peaks at ${turnPeak.toFixed(4)} m/s `
-    + `(${((turnPeak / S.sprint.steady - 1) * 100).toFixed(3)}% over) — the acceleration clamp projects `
-    + 'velocity onto the wish axis, so a new wish direction can add a full step at right angles to what is '
-    + 'already there');
+    + `(${((turnPeak / S.sprint.steady - 1) * 100).toFixed(3)}% over) — the failure this guards is the `
+    + 'acceleration clamp projecting velocity onto the wish axis, which lets a new wish direction add a full '
+    + 'step at right angles to what is already there; a negative number here is the diagonal heading penalty, '
+    + 'which the ellipse check below accounts for separately');
   report.check('turning the camera at full sprint does not raise the top speed',
     swingPeak <= S.sprint.steady * (1 + eps),
     `a 110 deg/s turn while sprinting peaks at ${swingPeak.toFixed(4)} m/s vs ${S.sprint.steady.toFixed(4)} `
     + `m/s straight (${((swingPeak / S.sprint.steady - 1) * 100).toFixed(3)}% over)`);
-  // And the absolute number against the sourced target, so that "no overshoot"
+
+  // The absolute number against the sourced target, so that "no overshoot"
   // cannot be satisfied by a game that sprints at 20 m/s.
-  report.against('sprint speed through a direction change', turnPeak,
+  //
+  // ATTRIBUTION FIX. This used to be fed `turnPeak` — the forward+strafe run —
+  // and read 6.02956 m/s against the 6.8 m/s tac-sprint target, 11.3% low. The
+  // shortfall is not the turn and it is not the acceleration clamp: 6.02956 is
+  // the DIAGONAL heading cap, tac sprint times the elliptical heading penalty,
+  // and the strafe run is not a turn at all — the yaw never moves, the body
+  // settles onto a new straight line 45 deg off the old one and stays there. So
+  // the run was measuring the cost of a heading, while the target
+  // (movement.tactical_sprint_speed_ar_bp50_mw3, "the BP50's tactical sprint
+  // speed was decreased from 7m/s to 6.8m/s") is a FORWARD speed, published for
+  // a player running where he is looking. The two are different quantities and
+  // the diagonal one is 0.883x the other by construction.
+  //
+  // What a player means by "sprinting through a turn" is the camera swing: yaw
+  // sweeping while forward stays held, so the wish direction is forward
+  // throughout and the cap is the forward cap. That is the run measured here,
+  // over a window that starts 0.2 s after the yaw begins to move — long enough
+  // for the lag angle between velocity and wish to reach its fixed point, short
+  // enough that the curving path is still on the platform (checked below, not
+  // assumed). Ruled out: measuring the last 0.5 s of the swing trace, which is
+  // 88 deg of accumulated turn later and can leave the 36 x 14 m platform, so a
+  // fall would be inside the window.
+  const TW0 = SETTLE + Math.round(0.2 / DT);
+  const TW1 = SETTLE + Math.round(0.5 / DT);
+  const swingWin = swing.slice(TW0, TW1);
+  const swingSpeeds = swingWin.map((r) => r.speed);
+  const swingSteady = mean(swingSpeeds);
+  const swingMin = Math.min(...swingSpeeds);
+  const swingSwept = Math.abs(swing[TW1 - 1].yaw - swing[SETTLE - 1].yaw) * 180 / Math.PI;
+  const swingGrounded = swingWin.every((r) => r.onGround);
+
+  report.check('the sustained-turn window is a real turn, taken on the ground',
+    swingGrounded && swingSwept > 40 && swingWin.length > 50,
+    `${swingWin.length} ticks from 0.2 s to 0.5 s after the yaw starts moving; ${swingSwept.toFixed(1)} deg `
+    + `of yaw swept by the end of it, ${swingWin.filter((r) => r.onGround).length}/${swingWin.length} ticks `
+    + 'in ground contact — a window that left the platform would be measuring a fall');
+  report.check('sprint speed does not sag through a sustained turn',
+    swingMin >= swingSteady * (1 - eps),
+    `through the turn the speed stays within [${swingMin.toFixed(4)}, ${Math.max(...swingSpeeds).toFixed(4)}] `
+    + `m/s of a ${swingSteady.toFixed(4)} m/s mean (worst dip `
+    + `${((swingMin / swingSteady - 1) * 100).toFixed(3)}%, tolerance ${(eps * 100).toFixed(1)}%) — the point `
+    + 'of asserting the mean below is only worth anything if the mean is not hiding a trough');
+  report.against('sprint speed through a direction change', swingSteady,
     'movement', 'tactical_sprint_speed_ar_bp50_mw3');
+
+  // The diagonal number still gets reported, and it still gets a claim made
+  // about it — just not that claim. No sourced value exists for a diagonal
+  // sprint on either research pass, so the assertion available is a consistency
+  // one, and it is a strong one: the elliptical limit says a 45 deg wish should
+  // be capped at sqrt(2) / hypot(1, 1/k) of the forward cap, where k is the
+  // pure-lateral penalty. Every term on both sides here is measured through the
+  // simulation — k comes from the strafe and walk runs in section 1, the
+  // forward cap from the sprint run, the diagonal from the strafe-key run — so
+  // nothing is read out of TUNING and a change to strafeScale moves both sides
+  // together only if the ellipse is genuinely what the controller implements.
+  // If the diagonal were instead capped per-axis, or the penalty dropped while
+  // sprinting, this disagrees.
+  const k = S.strafe.steady / S.walk.steady;
+  const ellipse = Math.SQRT2 / Math.hypot(1, 1 / k);
+  const diagRatio = turnPeak / S.sprint.steady;
+  report.measure('sprint speed on a diagonal heading (forward + strafe held)', turnPeak, 'm/s',
+    'no sourced reference: the CoD tac-sprint figures are forward speeds, and no diagonal-heading sprint '
+    + 'speed was found for any title — the ellipse check below is what constrains this number');
+  report.check('a diagonal sprint is capped by the elliptical heading limit the measured strafe penalty implies',
+    Math.abs(diagRatio / ellipse - 1) < 5e-3,
+    `forward+strafe sprint ${turnPeak.toFixed(5)} m/s is ${diagRatio.toFixed(5)}x the `
+    + `${S.sprint.steady.toFixed(4)} m/s forward sprint; the measured pure-lateral penalty is `
+    + `${k.toFixed(4)} (strafe ${S.strafe.steady.toFixed(4)} / walk ${S.walk.steady.toFixed(4)}), for which an `
+    + `ellipse predicts ${ellipse.toFixed(5)}x — off by ${((diagRatio / ellipse - 1) * 100).toFixed(3)}% `
+    + '(tolerance 0.5%). This is why the diagonal is 11% below the forward tac-sprint target and why that is '
+    + 'a heading penalty rather than a defect in the turn');
 
   /* ==== 3. acceleration and deceleration =================================== */
 

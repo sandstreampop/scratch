@@ -327,10 +327,22 @@ async function install(sim) {
      * Zone damage multipliers, measured out of enemy health.
      *
      * Each probe re-raycasts to learn which zone the ray really lands on, then
-     * fires the game's own resolveBullet() and reads the health delta. The
-     * expected unmultiplied damage is recomputed from the live SPEC and the
-     * actual hit distance, so the multiplier is delta/raw and does not depend on
-     * every ray landing at the same range.
+     * fires the game's own shot path and reads the health delta. What comes back
+     * is the RAW health delta in HP and the distance it was taken at, and
+     * nothing else: the caller turns those into multipliers by dividing the
+     * per-zone deltas by the measured BODY delta.
+     *
+     * It used to divide by an expectation recomputed here from SPEC.damage and
+     * SPEC.falloffStart/End/Scale, and that was wrong twice over. Wrong in fact,
+     * because that lerp damage model was replaced by main.js's two-range-stop
+     * model and is now read by nothing — 34 HP of expectation against 30 HP of
+     * delivered damage scaled every absolute multiplier by 30/34, so the body
+     * reference read x0.882 and the head x1.235 while their RATIO, 1.40, was
+     * exactly right because the same error sat in both. And wrong in principle,
+     * because this probe measures ZONE MULTIPLIERS: the damage model is
+     * somebody else's instrument (gameplay-ballistics.mjs owns it) and no reading
+     * here should move when that model is retuned. Normalising against the
+     * measured body delta is what makes that true.
      *
      * Health is topped back up before each shot: a 2.6x head hit kills a 100 HP
      * soldier in two rounds, and a dead enemy leaves director.raycast() with
@@ -343,6 +355,16 @@ async function install(sim) {
      * to the ground and the health delta was zero. That reported a LIMB
      * MULTIPLIER OF 0.000 and the "a limb hit is worth less than a body shot"
      * check passed on it — a green line measuring dirt.
+     *
+     * Enemy.applyDamage is wrapped for the duration of the probe so each ray
+     * carries the two numbers the SHOOTER handed the target — `amount`, the HP
+     * the round had left when it arrived, and `mult`, the zone multiplier the
+     * shooter resolved — alongside the HP the target actually lost. That pairing
+     * is the whole measurement: delta/amount is the multiplier the target
+     * APPLIED, mult is the one it was PASSED, and a divergence between them is
+     * precisely the defect this section exists to catch. The wrapper is removed
+     * in a finally, because a leaked patch on a prototype method changes what
+     * every later suite measures.
      */
     rec.zoneProbe = ({ n = 40 }) => {
       const e = g.director.enemies[0];
@@ -359,30 +381,67 @@ async function install(sim) {
       const out = [];
       let eaten = 0;
       const tmp = new THREE.Vector3();
-      for (let i = 0; i < n; i++) {
-        const fy = (i / (n - 1)) * 2 - 1;
-        for (const fx of [-0.35, -0.12, 0, 0.12, 0.35]) {
-          tmp.copy(centre)
-            .addScaledVector(right, fx * size.x * 0.5)
-            .addScaledVector(up, fy * size.y * 0.5);
-          const dir = tmp.sub(o).normalize();
-          const hit = g.director.raycast(o, dir, S.range);
-          if (!hit) continue;
-          const wd = window.__SIM.rayWorld([o.x, o.y, o.z], [dir.x, dir.y, dir.z], S.range);
-          if (hit.distance >= wd) { eaten++; continue; }
-          const falloff = Math.max(0, Math.min(1,
-            1 - (hit.distance - S.falloffStart) / (S.falloffEnd - S.falloffStart)));
-          const raw = S.damage * (S.falloffScale + (1 - S.falloffScale) * falloff);
-          e.health = 5000;
-          const before = e.health;
-          // fireRound, not resolveBullet: rounds were given a flight, so the
-          // player's shot path launches a projectile and resolveBullet no longer
-          // exists on Game. This threw outright — TypeError, and the whole suite
-          // died mid-run rather than reporting a red — which is the better of the
-          // two failure modes but still cost 41 checks.
-          g.fireRound(o, dir, true);
-          out.push({ zone: hit.zone, delta: before - e.health, raw, d: hit.distance });
+
+      const proto = Object.getPrototypeOf(e);
+      const realApply = proto.applyDamage;
+      const passed = [];
+      proto.applyDamage = function (amount, zone, direction, zoneMult) {
+        const h0 = this.health;
+        // Forwarded with arguments, not with a re-listed parameter set, so a
+        // default in the real signature is not overwritten with undefined here.
+        const killed = realApply.apply(this, arguments);
+        passed.push({ amount, zone, mult: zoneMult, applied: h0 - this.health });
+        return killed;
+      };
+      try {
+        for (let i = 0; i < n; i++) {
+          const fy = (i / (n - 1)) * 2 - 1;
+          for (const fx of [-0.35, -0.12, 0, 0.12, 0.35]) {
+            tmp.copy(centre)
+              .addScaledVector(right, fx * size.x * 0.5)
+              .addScaledVector(up, fy * size.y * 0.5);
+            const dir = tmp.sub(o).normalize();
+            const hit = g.director.raycast(o, dir, S.range);
+            if (!hit) continue;
+            const wd = window.__SIM.rayWorld([o.x, o.y, o.z], [dir.x, dir.y, dir.z], S.range);
+            if (hit.distance >= wd) { eaten++; continue; }
+            e.health = 5000;
+            const before = e.health;
+            const seen = passed.length;
+            // fireRound, not resolveBullet: rounds were given a flight, so the
+            // player's shot path launches a projectile and resolveBullet no longer
+            // exists on Game. This threw outright — TypeError, and the whole suite
+            // died mid-run rather than reporting a red — which is the better of the
+            // two failure modes but still cost 41 checks.
+            g.fireRound(o, dir, true);
+            const calls = passed.slice(seen);
+            const call = calls.length === 1 ? calls[0] : null;
+            out.push({
+              zone: hit.zone,
+              delta: before - e.health,
+              d: hit.distance,
+              // How many times this one round landed on the soldier. Usually
+              // one; a round that gets through a forearm and carries on into the
+              // torso lands twice, and its health delta is then the sum of two
+              // different multipliers against two different arrival damages.
+              // Those rays are unusable for a per-zone ratio and are excluded
+              // rather than averaged into one, which is what an earlier version
+              // of this probe did without knowing it.
+              calls: calls.length,
+              // null when the round never reached applyDamage at all, or reached
+              // it more than once — the difference between "a body hit is worth
+              // 1x" and "something happened and the arithmetic called it 1x".
+              amount: call ? call.amount : null,
+              applied: call ? call.applied : null,
+              mult: call ? call.mult : null,
+              // The zone the SHOOTER resolved, which is the authority. The
+              // probe's own raycast can name the forearm a round only grazed.
+              zoneSeen: call ? call.zone : null,
+            });
+          }
         }
+      } finally {
+        proto.applyDamage = realApply;
       }
       e.health = 5000;
       e.alive = true;
@@ -1313,54 +1372,181 @@ export default async function run(sim, report) {
 
     /* ========================== 7. zone multipliers ==================== */
     //
-    // Measured out of enemy health deltas through the game's own
-    // resolveBullet(), never read from applyDamage(). The expected unmultiplied
-    // damage is recomputed per ray from the live SPEC and the actual hit
-    // distance, so the multiplier is a ratio and does not depend on every probe
-    // ray landing at the same range.
+    // Measured out of enemy health deltas through the game's own shot path, and
+    // normalised against the damage the round MEASURABLY arrived with — the
+    // `amount` the shooter handed applyDamage() — rather than against a damage
+    // figure recomputed here.
+    //
+    // The recomputed version is what made three of these rows red, and it is
+    // worth being explicit about how, because the failure was quiet. It rebuilt
+    // an expected raw damage from SPEC.damage and SPEC.falloffStart/End/Scale:
+    // one flat 34 HP lerped down from 45 m. main.js replaced that with a
+    // two-range-stop model (30 HP flat to 37.5 m, linear to 20 HP at 50 m) and
+    // nothing reads the SPEC block any more, so at the probe's 20 m every
+    // absolute multiplier came out scaled by 30/34 — body x0.882 instead of
+    // x1.000, head x1.235 instead of x1.400 — while the head/body RATIO printed
+    // 1.40 exactly, because the identical error sat above and below the line.
+    // A ratio that is right for the wrong reason is the hardest kind of green.
+    //
+    // Normalising against the observed `amount` fixes the absolute figures and,
+    // more to the point, makes this section independent of the damage model
+    // altogether: it measures the zone ladder, and gameplay-ballistics.mjs owns
+    // falloff. Retuning the range stops must not move a single number here — and
+    // because the normaliser is per-ray rather than a run median, neither may
+    // penetration, which really does reach these rays: some of them cross the
+    // soldier's own rifle and arrive with a fraction of 30 HP.
+    //
+    // Normalising against the run's median BODY delta instead would fix the ratios
+    // and was the shorter route, but it makes the body row read x1.000 by
+    // construction — a tautology the linter cannot see, in the exact row whose
+    // job is to notice a target applying a multiplier of its own to a torso hit.
     {
-      const { probes, eaten } = await sim.eval((a) => window.__AI.zoneProbe(a), { n: 60 });
-      const byZone = { head: [], body: [], limb: [] };
-      for (const p of probes) if (byZone[p.zone]) byZone[p.zone].push(p.delta / p.raw);
-      const m = { head: median(byZone.head), body: median(byZone.body), limb: median(byZone.limb) };
+      /**
+       * Per-zone medians of a probe run.
+       *
+       * Each usable ray contributes applied/amount — the HP the target lost over
+       * the HP the round arrived with — keyed on the zone the SHOOTER resolved,
+       * not the zone the probe's own raycast predicted. Both refinements are
+       * there because of measured rays, not for tidiness: 6 of 139 rays reach the
+       * soldier through one zone and land in another (a round that gets through a
+       * forearm and carries on into the torso), and a further handful land TWICE.
+       * Keyed on the probe's prediction, those rays put a torso hit in the limb
+       * bucket; summed over two calls, they put 1.72x in it.
+       */
+      const fold = ({ probes }) => {
+        const byZone = { head: [], body: [], limb: [] };
+        for (const p of probes) {
+          if (p.calls !== 1 || !(p.amount > 0) || !byZone[p.zoneSeen]) continue;
+          byZone[p.zoneSeen].push(p);
+        }
+        const med = (z, f) => median(byZone[z].map(f));
+        const per = (f) => ({ head: med('head', f), body: med('body', f), limb: med('limb', f) });
+        return {
+          byZone,
+          n: { head: byZone.head.length, body: byZone.body.length, limb: byZone.limb.length },
+          x: per((p) => p.applied / p.amount),
+          // What the shooter SAID the multiplier was, over the same rays.
+          said: per((p) => p.mult),
+          arrived: per((p) => p.amount),
+        };
+      };
+
+      const run = await sim.eval((a) => window.__AI.zoneProbe(a), { n: 60 });
+      const { probes, eaten } = run;
+      const z = fold(run);
+      const m = z.x;
+      const usable = z.n.head + z.n.body + z.n.limb;
 
       report.check('every zone was hit often enough to measure its multiplier',
-        byZone.head.length >= 3 && byZone.body.length >= 3 && byZone.limb.length >= 3,
-        `${probes.length} probe rays resolved into the soldier: head ${byZone.head.length}, `
-        + `body ${byZone.body.length}, limb ${byZone.limb.length}; ${eaten} further rays were dropped because `
-        + 'the terrain was in front of the zone they found (the low rays into the boots), which is what made '
-        + 'the first version of this probe report a limb multiplier of 0.000');
-      for (const z of ['head', 'body', 'limb']) {
-        report.measure(`${z} damage multiplier, from health deltas`, m[z], 'x',
-          `${byZone[z].length} rays against a base of ${probes.length ? f2(median(probes.map((p) => p.raw))) : '?'}`
-          + ' HP. No sourced zone-multiplier target exists for this weapon; the damage model belongs to '
-          + 'weapon.js/SPEC, which this suite does not own');
+        z.n.head >= 3 && z.n.body >= 3 && z.n.limb >= 3,
+        `${probes.length} probe rays resolved into the soldier and ${usable} of them landed exactly once and are `
+        + `usable: head ${z.n.head}, body ${z.n.body}, limb ${z.n.limb}. ${probes.filter((p) => p.calls !== 1).length} `
+        + `were dropped for landing other than once, ${probes.filter((p) => p.calls === 1 && p.zoneSeen !== p.zone).length} `
+        + `more landed in a zone other than the one the probe predicted and are counted where they landed, and ${eaten} `
+        + 'never made it because the terrain was in front of the zone they found (the low rays into the boots), which '
+        + 'is what made the first version of this probe report a limb multiplier of 0.000');
+
+      for (const zone of ['head', 'body', 'limb']) {
+        report.measure(`${zone} damage multiplier, from health deltas`, m[zone], 'x',
+          `${z.n[zone]} rays; median ${f2(median(z.byZone[zone].map((p) => p.applied)))} HP lost against `
+          + `${f2(z.arrived[zone])} HP arriving`);
       }
+
+      // The head multiplier IS sourced for the weapon this game models, and the
+      // note on the old measure row saying otherwise was simply false:
+      // damage.m4a1_mw2019_headshot_multiplier is 1.4x for the MW2019 M4A1, and
+      // this is a second, independent instrument arriving at it — out of enemy
+      // health deltas on a soldier the AI suite's own hitbox grid has just walked
+      // over, where gameplay-ballistics.mjs measures it down its own shot path.
+      // Two routes to a sourced number is not duplication, it is the only way to
+      // notice that one of the routes is broken.
+      report.against('headshot multiplier, from enemy health deltas', m.head,
+        'damage', 'm4a1_mw2019_headshot_multiplier');
+
+      // A real comparison rather than 1/1: the HP the target lost against the HP
+      // the round arrived with. A body hit is the reference because the shooter
+      // passes 1.0 for it, so this row goes red the moment the target applies
+      // anything of its own to a torso hit — which is exactly what the 2.6
+      // literal in applyDamage() used to do to a head hit.
       report.check('a body hit is the unmultiplied reference', Math.abs(m.body - 1) < 0.02,
-        `body multiplier measured x${f3(m.body)}; anything else means falloff or the probe's own arithmetic `
-        + 'is leaking into the ratio');
-      report.check('a headshot is worth more than a body shot', m.head > m.body * 1.5,
-        `head x${f3(m.head)} vs body x${f3(m.body)}, ratio ${f2(m.head / m.body)}`);
+        `body hits took x${f3(m.body)} of the ${f2(z.arrived.body)} HP the round arrived with, over `
+        + `${z.n.body} rays`);
+
+      // Ordering only, and deliberately so. This used to demand head > body*1.5,
+      // which is a number no MW2019 assault rifle has ever had: 1.5x is the
+      // sniper and M14 figure (damage.mw2019_headshot_multiplier_sniper_rifles),
+      // the M4A1 is 1.4x, and the check therefore went red against a CORRECT
+      // headshot multiplier. Magnitude belongs to the against() above; what is
+      // left here is the structural statement, which is what the row's name says.
+      report.check('a headshot is worth more than a body shot', m.head > m.body,
+        `head x${f3(m.head)} vs body x${f3(m.body)}, ratio ${f2(m.head / m.body)} — magnitude is asserted `
+        + 'against damage.m4a1_mw2019_headshot_multiplier one row up; 1.5x, which this row used to require, is '
+        + 'the sniper figure');
       report.check('a limb hit is worth less than a body shot', m.limb < m.body,
         `limb x${f3(m.limb)} vs body x${f3(m.body)}, ratio ${f2(m.limb / m.body)}`);
 
-      // SPEC.headshotMultiplier is 2.4 and Enemy.applyDamage() applies 2.6. The
-      // dead constant is proved dead behaviourally: quadruple it and re-measure.
-      // A test that read the constant would report a headshot multiplier this
-      // weapon has never had. Resolving the duplication needs a multiplier ai.js
-      // can import from the file that owns the damage model, so this row is
-      // expected red until weapon.js exports one — see the report.
+      // ---- which multiplier is live -------------------------------------
+      //
+      // This pair replaces a check that asserted SPEC.headshotMultiplier governs
+      // headshot damage. It did not and it should not: three commits went into
+      // making main.js's BALLISTICS.zoneMultiplier the single sourced table and
+      // passing it into applyDamage() as an argument, and SPEC's 2.4 — along with
+      // the 2.6 literal that used to live in applyDamage() — is deliberately
+      // dead. A red row saying "the constant is dead" was reporting the fix as
+      // the defect. What has to be true instead is that the value the SHOOTER
+      // passes is the value the TARGET applies, and that SPEC cannot reach it.
+      //
+      // Both halves are behavioural, and they are opposite in sign so neither can
+      // be satisfied by a probe that has stopped measuring: perturbing the sourced
+      // table must MOVE the measurement, perturbing SPEC must NOT.
+      report.check('the zone multiplier the shooter passes is the one the target applies',
+        Math.abs(m.head - z.said.head) < 0.005 && Math.abs(m.body - z.said.body) < 0.005
+        && Math.abs(m.limb - z.said.limb) < 0.005,
+        `applied vs passed: head x${f3(m.head)} vs x${f3(z.said.head)}, body x${f3(m.body)} vs `
+        + `x${f3(z.said.body)}, limb x${f3(m.limb)} vs x${f3(z.said.limb)} — the passed figures are the `
+        + 'zoneMult argument main.js resolved from its sourced table, read at the applyDamage() boundary');
+
+      // Perturb the sourced table. Doubling the head entry must double the
+      // measured head multiplier and leave body alone; if it does not, the live
+      // ladder is somewhere else and the table is decoration.
+      const before = await sim.eval(() => {
+        const t = window.__GAME.ballistics.zoneMultiplier;
+        const was = t.head; t.head = was * 2; return was;
+      });
+      // Restored in a finally: a perturbation left in the sourced table would
+      // make every later section of this suite measure a headshot this weapon
+      // does not have.
+      let perturbed;
+      try {
+        perturbed = fold(await sim.eval((a) => window.__AI.zoneProbe(a), { n: 24 }));
+      } finally {
+        await sim.eval((v) => { window.__GAME.ballistics.zoneMultiplier.head = v; }, before);
+      }
+      report.check('the sourced zone-multiplier table is the live one',
+        Math.abs(perturbed.x.head / m.head - 2) < 0.02 && Math.abs(perturbed.x.body - m.body) < 0.02,
+        `BALLISTICS.zoneMultiplier.head ${f2(before)} -> ${f2(before * 2)} moved the measured head multiplier `
+        + `x${f3(m.head)} -> x${f3(perturbed.x.head)} (${f2(perturbed.x.head / m.head)}x, wanted 2.00x) and left `
+        + `body at x${f3(perturbed.x.body)}`);
+
+      // And the constant that is supposed to be dead. Quadrupling it must change
+      // nothing: if it moves the measurement, ai.js has gone back to reading its
+      // own copy and the game has two sources of truth again.
       const prev = await sim.eval((v) => {
-        const s = window.__AI.SPEC; const before = s.headshotMultiplier; s.headshotMultiplier = v; return before;
+        const s = window.__AI.SPEC; const was = s.headshotMultiplier; s.headshotMultiplier = v; return was;
       }, 9.9);
-      const again = await sim.eval((a) => window.__AI.zoneProbe(a), { n: 24 });
-      await sim.eval((v) => { window.__AI.SPEC.headshotMultiplier = v; }, prev);
-      const headAgain = median(again.probes.filter((p) => p.zone === 'head').map((p) => p.delta / p.raw));
-      report.check('SPEC.headshotMultiplier governs headshot damage',
-        Math.abs(headAgain - m.head) > 0.1,
-        `SPEC.headshotMultiplier ${f2(prev)} -> 9.9 left the measured head multiplier at x${f3(headAgain)} `
-        + `(was x${f3(m.head)}); the live multiplier is the ${f2(m.head)} hard-coded in `
-        + 'Enemy.applyDamage(), so the constant is dead');
+      let inert;
+      try {
+        inert = fold(await sim.eval((a) => window.__AI.zoneProbe(a), { n: 24 }));
+      } finally {
+        await sim.eval((v) => { window.__AI.SPEC.headshotMultiplier = v; }, prev);
+      }
+      report.check('SPEC.headshotMultiplier is inert on the path a round takes',
+        Math.abs(inert.x.head - m.head) < 0.005,
+        `SPEC.headshotMultiplier ${f2(prev)} -> 9.9 left the measured head multiplier at x${f3(inert.x.head)} `
+        + `(was x${f3(m.head)}). It is dead on purpose — main.js's sourced table is the single source and `
+        + 'weapon.js owns removing the field. applyDamage() still names it in the fallback it takes when a caller '
+        + 'passes no multiplier at all, which no caller in the game does; the wording of this row is the honest '
+        + 'width of what the measurement covers');
     }
 
     /* ------------------------------------------------ coverage gaps ----- */

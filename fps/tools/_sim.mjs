@@ -349,7 +349,32 @@ export async function openSim({
           // leaves every bone at the origin, so the raycast finds nothing and
           // the whole TTK section reports misses on a shot that was dead centre.
           // Silencing shoot() gets the intended behaviour without that.
-          if (e.inert) { enemy.shoot = () => {}; }
+          //
+          // But update() also NAVIGATES, and a dummy that walks is not a dummy.
+          // playerShoot() calls director.alertAll(player.position, 55), so the
+          // first round of any measurement wakes a target inside 55 m into ALERT
+          // with the player's position as its lastKnown; a soldier facing 0 by
+          // default cannot see the player, so the ALERT branch walks him toward
+          // that point at CONFIG.walkSpeed. Measured drift was 0.42 m over the
+          // five travel-time ranges and 0.41 m across 114 TTK engagements — a
+          // target contributing its own motion to a travel-time measurement, and
+          // 42 cm is 0.6 ms of flight at this muzzle velocity plus a moving
+          // chest for the spread cone to miss.
+          //
+          // Neutralised at integrate(), which is the one place the body is
+          // actually displaced, rather than by stubbing update() or by teleporting
+          // the body back afterwards. The state machine still runs, the facing
+          // still turns, animate() still poses the skeleton off a zero velocity,
+          // and every hit mesh is where the spawn put it — which is all a target
+          // dummy has ever been asked to be. Nothing rides on the velocity being
+          // zeroed rather than the position being restored except honesty about
+          // the pose: a body snapped back each tick would be walking on the spot
+          // in every frame the raycast sees.
+          if (e.inert) {
+            enemy.shoot = () => {};
+            const integrate0 = enemy.integrate.bind(enemy);
+            enemy.integrate = (dt) => { enemy.velocity.set(0, 0, 0); integrate0(dt); };
+          }
           if (e.health !== undefined) enemy.health = e.health;
           enemy.group.updateMatrixWorld(true);
           spawned.push({ id: enemy.id, x: enemy.position.x, y: enemy.position.y, z: enemy.position.z });

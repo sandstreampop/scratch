@@ -140,6 +140,14 @@ const _rv = new THREE.Vector3();
 const _rd = new THREE.Vector3();
 const _rp = new THREE.Vector3();
 const _rm = new THREE.Matrix4();
+// Incoming fire: the player has no zone meshes for director.raycast to find, so
+// a round aimed at him is resolved against the body box. Its own scratch Ray,
+// Box3 and points, for the same reason the vectors above have theirs.
+const _rray = new THREE.Ray();
+const _rbox = new THREE.Box3();
+const _rhp = new THREE.Vector3();
+const _rfrom = new THREE.Vector3();
+const _rn = new THREE.Vector3();
 // materialPath's own, and not a reuse of _rd: it is called from inside
 // advanceRound's loop with advanceRound's direction vector as its argument, and
 // writing the local-space direction into that same vector left every round that
@@ -580,7 +588,14 @@ class Game {
     const length = _rv.length();
     if (length < 1e-6) return true;
     _rd.copy(_rv).divideScalar(length);
+    const from = _rfrom.copy(round.pos);
+    const before = round.flown;
     const reach = this.advanceRound(round, _rd, length);
+    // Only incoming fire has an ear to go past. Tracked per segment rather than
+    // once per shot because the round is now in the air for several ticks.
+    if (!round.fromPlayer) {
+      this.noteNearMiss(round, from, _rd, round.flown - before, reach.spent);
+    }
     return reach.spent || round.flown >= SPEC.range;
   }
 
@@ -594,6 +609,13 @@ class Game {
    * The loop is what penetration needs: a round that gets through a surface
    * carries on from the far face inside the same segment, so a 4 cm sheet does
    * not cost it a tick.
+   *
+   * Which body a round can hit is decided by who fired it, and deliberately not
+   * by "every body in the scene": incoming fire is tested against the player and
+   * outgoing fire against the soldiers. There is no friendly fire between the
+   * garrison in any Call of Duty, and a soldier's round starts at his own muzzle
+   * anchor — inside his own hit meshes — so a symmetric test would have every
+   * enemy shoot himself in the chest on the tick he pulled the trigger.
    */
   advanceRound(round, dir, length) {
     let left = length;
@@ -601,16 +623,19 @@ class Game {
     // Three surfaces is a wall, a window and a crate: past that the round has
     // nothing left worth spending another pair of raycasts on.
     for (let crossings = 0; crossings < 3 && left > 1e-4; crossings++) {
-      const enemyHit = this.director.raycast(round.pos, dir, left);
+      const bodyHit = round.fromPlayer
+        ? this.director.raycast(round.pos, dir, left)
+        : this.playerRaycast(round.pos, dir, left);
       const ray = new THREE.Raycaster(round.pos, dir, 0.02, left);
       const worldHits = ray.intersectObjects(this.level.raycastables, false);
       const worldHit = worldHits.length ? worldHits[0] : null;
 
-      if (enemyHit && (!worldHit || enemyHit.distance < worldHit.distance)) {
-        round.flown += enemyHit.distance;
-        round.pos.copy(enemyHit.point);
-        this.hitBody(round, enemyHit, dir);
-        return { spent: true, at: first ?? enemyHit.distance };
+      if (bodyHit && (!worldHit || bodyHit.distance < worldHit.distance)) {
+        round.flown += bodyHit.distance;
+        round.pos.copy(bodyHit.point);
+        if (round.fromPlayer) this.hitBody(round, bodyHit, dir);
+        else this.hitPlayer(round, bodyHit, dir);
+        return { spent: true, at: first ?? bodyHit.distance };
       }
       if (!worldHit) break;
 
@@ -672,6 +697,80 @@ class Game {
     // so a scaled mesh reports the thickness it actually has.
     _rp.addScaledVector(_rpd, exit).applyMatrix4(hit.object.matrixWorld);
     return _rp.distanceTo(hit.point);
+  }
+
+  /**
+   * Where an incoming round meets the player, in the same shape director.raycast
+   * hands back for a soldier, or null.
+   *
+   * Against the body AABB, which is the box enemyShoot() tested before incoming
+   * fire was given travel time and the box player.collides() moves the body
+   * with. The player has no per-zone hit meshes, so there is no zone system to
+   * consult here: every hit reads 'body', which is what the flat damage figure
+   * hitPlayer() applies already assumed.
+   */
+  playerRaycast(origin, dir, maxDistance) {
+    if (this.player.alive === false) return null;
+    const box = this.player.aabb(_rbox);
+    _rray.set(origin, dir);
+    const point = _rray.intersectBox(box, _rhp);
+    if (!point) return null;
+    const distance = origin.distanceTo(point);
+    if (distance > maxDistance) return null;
+    return { zone: 'body', point, distance };
+  }
+
+  /**
+   * A round arriving on the player.
+   *
+   * 11-16 HP, unchanged from what enemyShoot() applied when it resolved its own
+   * ray: seven to nine rounds for a kill against 100 HP. targets.mjs has no
+   * sourced per-round figure for AI damage, so giving the round travel time is
+   * not the moment to invent one — the magnitude is carried across untouched and
+   * only the tick it lands on has moved.
+   *
+   * `retain` is the one addition, and it is a consequence of the shared walk
+   * rather than a new rule: a round that crossed thin cover on its way in now
+   * arrives weakened, exactly as the player's own rounds do, where before it
+   * simply stopped at the first surface and never arrived at all.
+   */
+  hitPlayer(round, hit, dir) {
+    round.struck = true;
+    this.player.damage((11 + Math.random() * 5) * round.retain);
+    this.audio.hurt();
+    this._damageFlash = 1;
+    this._lastHitDirection = dir.clone();
+  }
+
+  /**
+   * The supersonic crack of an incoming round going past.
+   *
+   * Kept, and moved onto the round: incoming fire used to resolve in one call, so
+   * the miss distance was a property of the whole ray and the cue was played on
+   * the tick the trigger broke. A round with travel time goes past the player
+   * when it goes past the player, and that is the instant the cue belongs to —
+   * without it the crack of a round from 150 m arrives half a second before the
+   * round does, and audio.js's speed-of-sound delay on the report describes
+   * nothing.
+   *
+   * Once per round, and never for a round that connected: audio.hurt() is that
+   * round's cue and two sounds for one bullet is one too many.
+   */
+  noteNearMiss(round, from, dir, travelled, spent) {
+    if (round.struck || round.snapped) return;
+    const ear = this.camera.position;
+    const reach = Math.max(0, travelled);
+    // Closest approach to the ear along the stretch actually flown — clamped to
+    // `travelled` and not to the segment length, so a round the world ate is
+    // measured up to the wall and not through it.
+    const along = THREE.MathUtils.clamp(_rn.copy(ear).sub(from).dot(dir), 0, reach);
+    const miss = _rn.copy(from).addScaledVector(dir, along).distanceTo(ear);
+    round.nearest = Math.min(round.nearest ?? Infinity, miss);
+    // The closest point of approach lies strictly inside the stretch just flown,
+    // or the round is spent: either way no later segment can get nearer.
+    if (!spent && along >= reach - 1e-6) return;
+    round.snapped = true;
+    if (round.nearest < 4) this.audio.snap(round.nearest);
   }
 
   /** A round arriving on a soldier. */
@@ -761,36 +860,22 @@ class Game {
     this.vfx.tracers.fire(origin, dir, Math.min(distance + 30, 160), 460, 0.018);
     this.vfx.muzzleSmoke(origin, dir);
 
-    // Does it hit the player? Test against the player's body box, and let the
-    // world take the round first if something is in the way.
-    const ray = new THREE.Raycaster(origin, dir, 0.2, 200);
-    const worldHits = ray.intersectObjects(this.level.raycastables, false);
-    const box = this.player.aabb(new THREE.Box3());
-    const hitPoint = ray.ray.intersectBox(box, new THREE.Vector3());
-    const playerDist = hitPoint ? origin.distanceTo(hitPoint) : Infinity;
-    const worldDist = worldHits.length ? worldHits[0].distance : Infinity;
-
-    if (playerDist < worldDist) {
-      this.player.damage(11 + Math.random() * 5);
-      this.audio.hurt();
-      this._damageFlash = 1;
-      this._lastHitDirection = dir.clone();
-    } else {
-      // Near miss — the supersonic snap sells incoming fire more than a hit does.
-      const toPlayer = this.camera.position.clone().sub(origin);
-      const along = toPlayer.dot(dir);
-      const closest = origin.clone().addScaledVector(dir, THREE.MathUtils.clamp(along, 0, worldDist));
-      const miss = closest.distanceTo(this.camera.position);
-      if (miss < 4) this.audio.snap(miss);
-      if (worldHits.length) {
-        const h = worldHits[0];
-        const normal = h.face
-          ? h.face.normal.clone().transformDirection(h.object.matrixWorld)
-          : new THREE.Vector3(0, 1, 0);
-        this.vfx.impact(h.point, normal, this.classifySurface(h.object), 0.8);
-        this.audio.impact(this.classifySurface(h.object), h.distance);
-      }
-    }
+    // Down the same walk the player's rounds take, and for the same reason:
+    // ballistics.bullet_model_is_projectile_not_hitscan is a property of the
+    // GAME, not of one shooter. This used to be a single Raycaster call resolved
+    // on the tick the trigger broke — a hitscan round with a projectile round's
+    // sound — so a soldier at 150 m hit the player 0.2 s before his bullet could
+    // have arrived, there was nothing for him to lead a moving target by, and
+    // audio.js's speed-of-sound delay on the report put the crack of the shot
+    // AFTER the hit it had already scored.
+    //
+    // Everything specific to incoming fire now lives on the round: it is tested
+    // against the player rather than the garrison (advanceRound), the hit applies
+    // the same damage it always did (hitPlayer), and the near-miss crack is
+    // emitted on the tick the round actually goes past (noteNearMiss). The world
+    // impact a missed round leaves is hitSurface's, which is where a player round
+    // has always got its own.
+    this.fireRound(origin, dir, false);
   }
 
   /* --------------------------------------------------------------- frame -- */

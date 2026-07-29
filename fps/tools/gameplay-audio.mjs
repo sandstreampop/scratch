@@ -71,12 +71,23 @@
 //     was clamped forward to the next block boundary — the crack's 1.2 ms attack
 //     is 0.41 of a quantum long, so the transient this game is proudest of was
 //     the part being quantised away. Fixed by scheduling one quantum ahead.
-//   - the magazine-seat click plays ~190 ms (tactical) / ~240 ms (empty) after
-//     the magazine visually seats, past the ITU-R BT.1359-1 detectability
-//     threshold for audio lagging video. That gate lives in weapon.js and is
-//     not this file's to change, so the check is left red on purpose.
-//   - the reload track documents a bolt-release phase and audio.js defines a
-//     'bolt' sound, and nothing ever plays it. Also weapon.js.
+//   - the magazine-seat click played 183 ms (tactical) / 233 ms (empty) after
+//     the magazine visually seats, 1.5x and 1.9x the ITU-R BT.1359-1
+//     detectability threshold for audio lagging video. weapon.js gated the click
+//     at reload phase 0.80 while the insert stroke lands the magazine at 0.72,
+//     and the error cost MORE on the longer empty track because eight
+//     hundredths of a reload is eight hundredths of a longer reload. Fixed in
+//     weapon.js by gating the cue on the phase the animation lands on; both
+//     tracks now measure one 16.67 ms tick, which is the tick grid.
+//   - the reload track documented a bolt-release phase and audio.js defined a
+//     full 'bolt' voice, and nothing ever played it. Fixed in weapon.js, on the
+//     empty reload only: a tactical reload does not cycle the bolt.
+//   - WHAT THIS SUITE HAD WRONG. "trigger press to round is one simulated tick"
+//     compared the measured interval against the harness's own dt, which became
+//     unsatisfiable the moment main.js moved to a fixed 60 Hz tick — a round
+//     cannot be quantised finer than the grid it is fired on, so no change to
+//     the game could have made 4.17 ms of it. The expectation is now in TICKS,
+//     with the tick length measured off the trace's own timestamps.
 
 const DT = 1 / 240;      // four samples inside the 79 ms shot interval
 const DT_RELOAD = 1 / 240; // 2.18 s of reload is 523 ticks; 4 ms on a 2180 ms phase is 0.2%
@@ -520,11 +531,43 @@ export default async function run(sim, report) {
   // the engine's ENTIRE input-to-sound contribution. The end-to-end figure is
   // that plus the platform path from section 1, and it is measured rather than
   // asserted because the platform term dominates it and is not ours.
+  //
+  // ONE TICK, NOT ONE DRIVEN dt. This check compared inputToRound against DT and
+  // was red at 16.67 ms against 4.17 ms. That red was the instrument, not the
+  // game: main.js banks the time it is handed and integrates only in fixed
+  // TICK-long slices, so the finest grain a round can be quantised to is one
+  // simulation tick whatever dt the harness pushes, and no change to src/ could
+  // ever have satisfied it. Driving at DT = 1/240 does not buy four times the
+  // resolution on this quantity — it buys four samples per tick of the same
+  // 60 Hz grid, which is what the rest of section 2 wants and why DT stays.
+  //
+  // The tick length is MEASURED, not read. g.elapsed advances by exactly one
+  // tick on the ticking steps and by nothing on the others, so the set of
+  // nonzero increments of the trace's own timestamps IS the tick grid. Reading
+  // main.js's TICK is barred by the runner's lint for the right reason, and
+  // g.tickLength — reachable through sim.eval — is the constant under test here:
+  // an expectation built from it would move with it and the check could never
+  // disagree. Deriving it from the trace means a tick that did not actually
+  // advance by tickLength shows up as a spread in the increments, which is
+  // asserted below rather than averaged away.
+  const tSteps = burst.slice(1).map((r, i) => r.t - burst[i].t).filter((d) => d > 1e-9);
+  const tickLen = tSteps.length ? Math.min(...tSteps) : NaN;
+  const tickSpread = tSteps.length ? Math.max(...tSteps) - tickLen : NaN;
+  report.check('the simulation advances on one fixed tick grid',
+    tSteps.length > 0 && tickSpread < 1e-9,
+    `${tSteps.length} advances of g.elapsed over ${burst.length} driven steps of ${ms(DT)}, all `
+    + `${ms(tickLen)} to within ${ms(tickSpread)} — i.e. one step in `
+    + `${(burst.length / Math.max(1, tSteps.length)).toFixed(2)} moved the simulation, and the grid is the `
+    + 'game\'s own rather than the harness\'s. A variable-dt integrator would show a spread here');
+
   const press = preFire.t;
   const inputToRound = lastShots.length ? lastShots[0] - press : NaN;
+  const roundTicks = inputToRound / tickLen;
   report.check('trigger press to round is one simulated tick',
-    Math.abs(inputToRound - DT) < 1e-9,
-    `${ms(inputToRound)} at dt=${ms(DT)} — the round leaves on the first tick after the trigger goes down`);
+    Number.isFinite(roundTicks) && Math.abs(roundTicks - 1) < 1e-6,
+    `${ms(inputToRound)} = ${roundTicks.toFixed(4)} ticks of the measured ${ms(tickLen)} grid, driven at `
+    + `dt=${ms(DT)} — the round leaves on the first tick after the trigger goes down. Two ticks would mean `
+    + 'the trigger was polled a tick before the round it fired');
 
   const leads = perRound.map((r) => r.lead);
   const engineBudget = inputToRound + med(leads);
@@ -918,13 +961,15 @@ export default async function run(sim, report) {
   /* ------------------------------------------------ 6. the reload track -- */
   //
   // Two reloads, measured entirely from the event log and the observed magazine
-  // animation. Nothing here reads SPEC.reloadTime or the 0.08/0.50/0.80
+  // animation. Nothing here reads SPEC.reloadTime or the 0.08/0.50/0.72/0.86 cue
   // thresholds: the reload's duration is the interval over which `reloading` is
   // true, and the animation landmarks are read off magGroup.position.y as the
   // simulation actually moves it. That matters because the thresholds and the
-  // animation comment in weapon.js DISAGREE — the comment describes seating
-  // between 0.72 and 0.86 and the seat sound fires at 0.80 — and only the
-  // observed animation can say which one the player sees.
+  // animation comment in weapon.js used to DISAGREE — the comment described the
+  // insert stroke ending at 0.72 and the seat click fired at 0.80 — and only the
+  // observed animation could say which one the player sees. It is what decided
+  // the repair, and it is still what is measured, so a re-timed stroke moves the
+  // window with it instead of being asserted against a remembered number.
   //
   // The cue-to-animation windows are ITU-R BT.1359-1's detectability pair
   // (45 ms early / 125 ms late), not a tolerance of this file's choosing. An
@@ -1021,10 +1066,13 @@ export default async function run(sim, report) {
         + `(y ${fx(bottom.magY)} m) and is home by ${seated ? ph(seated.t).toFixed(3) : 'n/a'} — `
         + `${ms(ins.sim - bottom.t)} into a ${ms((seated?.t ?? NaN) - bottom.t)} insertion stroke`);
 
-      // The A/V sync check with teeth. The magazine is visually home well before
-      // the click that says it is, and the gap is measured against ITU-R
-      // BT.1359-1 rather than against a number of our own. The gate that sets it
-      // is weapon.js's 0.80 phase threshold, which this agent does not own.
+      // The A/V sync check with teeth, and the one that found the seat click
+      // 183 ms (tactical) / 233 ms (empty) behind the picture. The gap is
+      // measured against ITU-R BT.1359-1 rather than against a number of our
+      // own, and both sides of it come off the running simulation: the cue's own
+      // timestamp against the tick magGroup.position.y first reads home. It is
+      // still able to disagree — the cue is gated on a phase in weapon.js, not
+      // on the seated tick, so moving that phase by two ticks moves this number.
       const seatLag = seated ? seat.sim - seated.t : NaN;
       report.check(`${kind} 'seat' click is inside the A/V detectability window of the magazine seating`,
         Number.isFinite(seatLag) && seatLag <= lagThr && seatLag >= -leadThr,
@@ -1034,17 +1082,27 @@ export default async function run(sim, report) {
     }
 
     // weapon.js documents "0.86-1.0 bolt release (empty reload only)" and
-    // audio.js defines a 'bolt' entry in the mechanical() spec table with its
-    // own frequency, amplitude and duration. Nothing calls it. This is not a
-    // latency defect but it is the same instrument reading it: a mechanical
-    // event that the reload track claims exists and never fires.
+    // audio.js defines a 'bolt' entry in the mechanical() spec table with its own
+    // frequency, amplitude and duration. Nothing called it, so the sound existed
+    // and was unreachable. This is not a latency defect but it is the same
+    // instrument reading it: a mechanical event the reload track claims exists.
+    //
+    // Both halves are asserted, because "fire it always" is the wrong repair and
+    // is invisible from the empty side alone: the bolt is only locked back when
+    // the magazine ran dry, so a tactical reload has nothing to release.
+    const bolt = calls.filter((c) => c.args[0] === 'bolt' && c.sim >= start && c.sim <= rows[iOff].t);
     if (empty) {
-      const bolt = calls.filter((c) => c.args[0] === 'bolt');
       report.check('empty reload plays the bolt-release cue its own track documents',
         bolt.length === 1,
-        `${bolt.length} 'bolt' cues over a ${ms(dur)} empty reload. weapon.js documents a bolt-release `
-        + 'phase at 0.86-1.0 and audio.mechanical has a full \'bolt\' voice defined; onReloadEvent is '
-        + 'never called with it, so the sound exists and is unreachable');
+        `${bolt.length} 'bolt' cues over a ${ms(dur)} empty reload, at phase `
+        + `${bolt.map((b) => ph(b.sim).toFixed(3)).join('/') || 'n/a'} against the 0.86-1.0 bolt-release `
+        + 'phase weapon.js documents; audio.mechanical has a full \'bolt\' voice defined (2100 Hz, 0.16 s) '
+        + 'and a count of zero means onReloadEvent is never called with it');
+    } else {
+      report.check('tactical reload does not cycle the bolt',
+        bolt.length === 0,
+        `${bolt.length} 'bolt' cues over a ${ms(dur)} tactical reload — the bolt is only held back by an `
+        + 'empty magazine, so a cue here would be a sound with no mechanism behind it');
     }
   }
 

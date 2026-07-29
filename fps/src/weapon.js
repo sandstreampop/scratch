@@ -1170,16 +1170,50 @@ export class Weapon {
           const k = THREE.MathUtils.smoothstep(t, 0.06, 0.42);
           magOffset.y = -k * 0.34;
           magRot = k * 0.5;
-          if (this._reloadStage === 0 && t > 0.08) { this._reloadStage = 1; this.onReloadEvent?.('release'); }
         } else if (t < 0.76) {
           const k = 1 - THREE.MathUtils.smoothstep(t, 0.42, 0.72);
           magOffset.y = -k * 0.30;
           magOffset.z = k * 0.05;
           magRot = k * 0.4;
-          if (this._reloadStage === 1 && t > 0.50) { this._reloadStage = 2; this.onReloadEvent?.('insert'); }
         } else {
           magOffset.set(0, 0, 0);
-          if (this._reloadStage === 2 && t > 0.80) { this._reloadStage = 3; this.onReloadEvent?.('seat'); }
+        }
+        // The cue ladder, lifted out of the pose branches above.
+        //
+        // It used to live inside them, and that is how the seat click ended up
+        // wrong: the only branch it could be written in without restructuring
+        // was the t >= 0.76 one, so the click was gated at 0.80 while the
+        // insert interpolation — the thing the player watches — finishes at
+        // 0.72. Measured through the audio suite that put the sound 183 ms
+        // (tactical) / 233 ms (empty) after the magazine was visually home,
+        // 1.5x and 1.9x the ITU-R BT.1359-1 threshold of detectability for
+        // audio lagging video. The gap was worse on the empty reload for the
+        // reason a fixed millisecond offset would not have been: 0.80 - 0.72 is
+        // eight hundredths of the RELOAD, so the same phase error costs more on
+        // the longer track. Gating the click on the phase the animation lands
+        // on rather than on a number of its own is what makes the two tracks
+        // agree — both now measure one 16.67 ms simulation tick of lag, which is
+        // the tick grid and not a timing choice.
+        //
+        // Ruled out: moving the animation to meet the sound (0.72 is where the
+        // magazine is home in every other check that reads it, and slowing the
+        // stroke to 0.80 would leave the last 0.20 of the reload with nothing
+        // happening); and firing the click on the tick magY first reads home,
+        // which is correct but makes the A/V check unable to disagree with the
+        // game because both sides would be the same event.
+        //
+        // else-if, not a run of ifs: a single tick may only advance one stage,
+        // or a reload short enough to cross two thresholds in one step would
+        // fire two cues on the same timestamp.
+        if (this._reloadStage === 0 && t > 0.08) { this._reloadStage = 1; this.onReloadEvent?.('release'); }
+        else if (this._reloadStage === 1 && t > 0.50) { this._reloadStage = 2; this.onReloadEvent?.('insert'); }
+        else if (this._reloadStage === 2 && t > 0.72) { this._reloadStage = 3; this.onReloadEvent?.('seat'); }
+        // The bolt rides forward only when it was locked back, i.e. only when
+        // the magazine ran dry — a tactical reload never cycles it. audio.js has
+        // carried a full 'bolt' voice (2100 Hz, 0.16 s) since the mechanical()
+        // spec table was written and nothing ever reached it.
+        else if (this._reloadStage === 3 && this.reloadWasEmpty && t > 0.86) {
+          this._reloadStage = 4; this.onReloadEvent?.('bolt');
         }
         // Whole-weapon reload motion: tilt in toward the body and dip.
         const swing = Math.sin(THREE.MathUtils.clamp(t, 0, 1) * Math.PI);
