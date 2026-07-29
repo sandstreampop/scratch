@@ -1,0 +1,1096 @@
+{
+ "metric": "ttk",
+ "tick": 0.016666667,
+ "columns": {
+  "range": "engagement range, m",
+  "comp": "1 = the shooter compensates for recoil, 0 = the shooter holds the trigger and does not",
+  "eng": "engagement index within that range and condition, 0-based",
+  "ttk": "seconds from the first round landing to the fatal one, or null if the target survived the magazine (this is the convention the published figures use: it excludes the first round's flight)",
+  "tkill": "seconds from the trigger breaking to the fatal round landing, or null",
+  "stk": "rounds that landed on the target up to and including the fatal one, or null",
+  "fired": "rounds that left the barrel during the engagement"
+ },
+ "n": 120,
+ "rows": [
+  {
+   "range": 10,
+   "comp": 1,
+   "eng": 0,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 1,
+   "eng": 1,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 1,
+   "eng": 2,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 1,
+   "eng": 3,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 1,
+   "eng": 4,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 1,
+   "eng": 5,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 1,
+   "eng": 6,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 1,
+   "eng": 7,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 1,
+   "eng": 8,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 1,
+   "eng": 9,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 1,
+   "eng": 0,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 1,
+   "eng": 1,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 1,
+   "eng": 2,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 1,
+   "eng": 3,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 1,
+   "eng": 4,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 1,
+   "eng": 5,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 1,
+   "eng": 6,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 1,
+   "eng": 7,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 1,
+   "eng": 8,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 1,
+   "eng": 9,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 1,
+   "eng": 0,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 1,
+   "eng": 1,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 1,
+   "eng": 2,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 1,
+   "eng": 3,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 1,
+   "eng": 4,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 1,
+   "eng": 5,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 1,
+   "eng": 6,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 1,
+   "eng": 7,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 1,
+   "eng": 8,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 1,
+   "eng": 9,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 1,
+   "eng": 0,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 1,
+   "eng": 1,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 1,
+   "eng": 2,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 1,
+   "eng": 3,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 1,
+   "eng": 4,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 1,
+   "eng": 5,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 1,
+   "eng": 6,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 1,
+   "eng": 7,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 1,
+   "eng": 8,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 1,
+   "eng": 9,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 1,
+   "eng": 0,
+   "ttk": 0.366667,
+   "tkill": 0.433333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 1,
+   "eng": 1,
+   "ttk": 0.366667,
+   "tkill": 0.433333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 1,
+   "eng": 2,
+   "ttk": 0.366667,
+   "tkill": 0.433333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 1,
+   "eng": 3,
+   "ttk": 0.366667,
+   "tkill": 0.433333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 1,
+   "eng": 4,
+   "ttk": 0.366667,
+   "tkill": 0.433333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 1,
+   "eng": 5,
+   "ttk": 0.366667,
+   "tkill": 0.433333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 1,
+   "eng": 6,
+   "ttk": 0.366667,
+   "tkill": 0.433333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 1,
+   "eng": 7,
+   "ttk": 0.366667,
+   "tkill": 0.433333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 1,
+   "eng": 8,
+   "ttk": 0.366667,
+   "tkill": 0.433333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 1,
+   "eng": 9,
+   "ttk": 0.366667,
+   "tkill": 0.433333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 1,
+   "eng": 0,
+   "ttk": 0.366667,
+   "tkill": 0.483333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 1,
+   "eng": 1,
+   "ttk": 0.366667,
+   "tkill": 0.483333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 1,
+   "eng": 2,
+   "ttk": 0.366667,
+   "tkill": 0.483333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 1,
+   "eng": 3,
+   "ttk": 0.366667,
+   "tkill": 0.483333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 1,
+   "eng": 4,
+   "ttk": 0.366667,
+   "tkill": 0.483333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 1,
+   "eng": 5,
+   "ttk": 0.366667,
+   "tkill": 0.483333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 1,
+   "eng": 6,
+   "ttk": 0.366667,
+   "tkill": 0.483333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 1,
+   "eng": 7,
+   "ttk": 0.366667,
+   "tkill": 0.483333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 1,
+   "eng": 8,
+   "ttk": 0.366667,
+   "tkill": 0.483333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 1,
+   "eng": 9,
+   "ttk": 0.366667,
+   "tkill": 0.483333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 0,
+   "eng": 0,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 0,
+   "eng": 1,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 0,
+   "eng": 2,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 0,
+   "eng": 3,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 0,
+   "eng": 4,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 0,
+   "eng": 5,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 0,
+   "eng": 6,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 0,
+   "eng": 7,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 0,
+   "eng": 8,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 10,
+   "comp": 0,
+   "eng": 9,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 0,
+   "eng": 0,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 0,
+   "eng": 1,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 0,
+   "eng": 2,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 0,
+   "eng": 3,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 0,
+   "eng": 4,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 0,
+   "eng": 5,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 0,
+   "eng": 6,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 0,
+   "eng": 7,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 0,
+   "eng": 8,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 25,
+   "comp": 0,
+   "eng": 9,
+   "ttk": 0.266667,
+   "tkill": 0.266667,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 0,
+   "eng": 0,
+   "ttk": 0.266667,
+   "tkill": 0.283333,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 0,
+   "eng": 1,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 0,
+   "eng": 2,
+   "ttk": 0.266667,
+   "tkill": 0.283333,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 0,
+   "eng": 3,
+   "ttk": 0.266667,
+   "tkill": 0.283333,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 0,
+   "eng": 4,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 0,
+   "eng": 5,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 0,
+   "eng": 6,
+   "ttk": 0.266667,
+   "tkill": 0.283333,
+   "stk": 4,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 0,
+   "eng": 7,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 0,
+   "eng": 8,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 45,
+   "comp": 0,
+   "eng": 9,
+   "ttk": 0.366667,
+   "tkill": 0.383333,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 0,
+   "eng": 0,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 0,
+   "eng": 1,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 0,
+   "eng": 2,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 0,
+   "eng": 3,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 0,
+   "eng": 4,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 0,
+   "eng": 5,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 0,
+   "eng": 6,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 0,
+   "eng": 7,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 0,
+   "eng": 8,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 60,
+   "comp": 0,
+   "eng": 9,
+   "ttk": 0.366667,
+   "tkill": 0.4,
+   "stk": 5,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 0,
+   "eng": 0,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 0,
+   "eng": 1,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 0,
+   "eng": 2,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 0,
+   "eng": 3,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 0,
+   "eng": 4,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 0,
+   "eng": 5,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 0,
+   "eng": 6,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 0,
+   "eng": 7,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 0,
+   "eng": 8,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 80,
+   "comp": 0,
+   "eng": 9,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 0,
+   "eng": 0,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 0,
+   "eng": 1,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 0,
+   "eng": 2,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 0,
+   "eng": 3,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 0,
+   "eng": 4,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 0,
+   "eng": 5,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 0,
+   "eng": 6,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 0,
+   "eng": 7,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 0,
+   "eng": 8,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  },
+  {
+   "range": 120,
+   "comp": 0,
+   "eng": 9,
+   "ttk": null,
+   "tkill": null,
+   "stk": null,
+   "fired": 30
+  }
+ ]
+}

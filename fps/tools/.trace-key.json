@@ -1,0 +1,147 @@
+{
+  "generated": "2026-07-29T00:46:12.099Z",
+  "tick": 0.016666666666666666,
+  "note": "JUDGES: DO NOT READ THIS FILE. It is kept outside traces/ for that reason.",
+  "metrics": {
+    "recoil": {
+      "ours": "A",
+      "reference": "B",
+      "rows": 600,
+      "provenance": "synthesised from targets.mjs keys [damage.m4a1_mw2019_rpm, physics.multiplayer_server_tick_rate, recoil.recoil_determinism, recoil.recoil_recentering_behaviour, recoil.ads_bullet_spread_degrees] — NOT a recording from a shipped title",
+      "sampling": {
+        "modelLateralSd": {
+          "0": 0.4582,
+          "1": 0.3024
+        },
+        "blocksRejected": {
+          "0": 2,
+          "1": 0
+        },
+        "band": "a candidate block is accepted only if its lateral sample deviation is within 0.62..1.45 x the model's own (the central 90% for this sample size)"
+      },
+      "keys": [
+        "damage.m4a1_mw2019_rpm",
+        "physics.multiplayer_server_tick_rate",
+        "recoil.recoil_determinism",
+        "recoil.recoil_recentering_behaviour",
+        "recoil.ads_bullet_spread_degrees"
+      ],
+      "quotes": {
+        "recoil.recoil_determinism": "The single most load-bearing finding for this port, and well corroborated from two independent angles. CoD recoil is NOT a fixed learnable spray pattern like CS:GO: it is bounded randomness with a repeatable central tendency. Implement as kick_v = rand(minV, m",
+        "recoil.recoil_recentering_behaviour": "Answers \"does the view return fully to point of aim\" — yes, but only once firing stops, and it is a RATE not a timer. Center speed takes effect immediately on firing, so recentering competes with the next shot kick rather than waiting for trigger release. Duri",
+        "recoil.ads_bullet_spread_degrees": "0 degrees = 0 rad. Hard zero, corroborated three ways: almost all non-shotgun weapons have NO random spread while aiming down sights — shots land at precisely the point indicated by the sights. Documented exceptions: Vanguard and WWII shipped with ADS bloom, w"
+      },
+      "nullKeys": [
+        "recoil.per_shot_vertical_kick_degrees",
+        "recoil.per_shot_horizontal_kick_degrees",
+        "recoil.total_vertical_climb_after_n_rounds_degrees",
+        "recoil.ads_vs_hipfire_recoil_multiplier"
+      ],
+      "formula": "per round: one uniform vertical draw in [vMin,vMax] and one uniform horizontal draw in [hMin,hMax], both scaled by the ADS factor; per 1/60 s tick: kick += (previous aim point - kick) * (1 - exp(-centreSpeed/60)); rounds leave on the first tick at or after k * 60/682 s. Aim is read before the round's own kick. Spread contributes nothing: recoil.ads_bullet_spread_degrees is 0 with a tolerance of exactly 0.",
+      "borrowed": [
+        "recoilVerticalMin: weapon.js SPEC.recoilVerticalMin — recoil.per_shot_vertical_kick_degrees is null",
+        "recoilVerticalMax: weapon.js SPEC.recoilVerticalMax — recoil.per_shot_vertical_kick_degrees is null",
+        "recoilHorizontalMin: weapon.js SPEC.recoilHorizontalMin — recoil.per_shot_horizontal_kick_degrees is null",
+        "recoilHorizontalMax: weapon.js SPEC.recoilHorizontalMax — recoil.per_shot_horizontal_kick_degrees is null",
+        "recoilCenterSpeed: weapon.js SPEC.recoilCenterSpeed — recoil.recoil_recentering_behaviour names a \"per-weapon centre speed\" but publishes no rate",
+        "recoilAdsScale: weapon.js SPEC.recoilAdsScale — recoil.ads_vs_hipfire_recoil_multiplier is null (\"none exists\")"
+      ],
+      "caveat": "magnitude is NOT sourced — this trace tests shape only"
+    },
+    "velocity": {
+      "ours": "B",
+      "reference": "A",
+      "rows": 720,
+      "provenance": "synthesised from targets.mjs keys [movement.base_walk_speed_legacy_iw, movement.sprint_speed_scale, movement.crouch_speed_mw3, movement.air_control, physics.gravity, physics.jump_initial_velocity, physics.slide_max_speed_scale, physics.slide_max_duration, physics.multiplayer_server_tick_rate] — NOT a recording from a shipped title",
+      "keys": [
+        "movement.base_walk_speed_legacy_iw",
+        "movement.sprint_speed_scale",
+        "movement.crouch_speed_mw3",
+        "movement.air_control",
+        "physics.gravity",
+        "physics.jump_initial_velocity",
+        "physics.slide_max_speed_scale",
+        "physics.slide_max_duration",
+        "physics.multiplayer_server_tick_rate"
+      ],
+      "formula": "walk 4.83 m/s, sprint 4.83 x 1.5 = 7.245 m/s, crouch 2.4 m/s; slide entry 4.83 x 1.55 = 7.487 m/s decaying at ln(7.487/2.4)/0.65 = 1.7502 /s so that it lands on the crouch speed after exactly 0.65 s; jump v0 6.345 m/s under 20.32 m/s^2, semi-implicit on the 1/60 s grid; airborne horizontal speed constant; ground move is friction-then-accelerate capped at the stance target.",
+      "quotes": {
+        "movement.air_control": "NO NUMERIC sv_airaccelerate / g_airAccelerate default exists for CoD in anything either pass could reach. A dedicated query returned only Counter-Strike values (sv_airaccelerate 10, CS:GO/CS2 12), which MUST NOT be borrowed for CoD — that borrowing is the spec"
+      },
+      "borrowed": [
+        "groundAccel: player.js TUNING.groundAccel — no acceleration rate is published in any domain",
+        "friction: player.js TUNING.friction — no ground friction rate is published"
+      ],
+      "caveat": "plateaux, jump ballistics and slide envelope are sourced; the acceleration and friction rates that shape the knees are not"
+    },
+    "ttk": {
+      "ours": "A",
+      "reference": "B",
+      "rows": 120,
+      "provenance": "synthesised from targets.mjs keys [damage.health_mw2019, damage.m4a1_mw2019_max_damage, damage.m4a1_mw2019_min_damage, damage.m4a1_mw2019_near_range_stop, damage.m4a1_mw2019_far_range_stop, damage.m4a1_mw2019_rpm, damage.mcw_mw3_torso_multiplier_post_buff, damage.m4a1_mw2019_headshot_multiplier, ballistics.ar_muzzle_velocity_mcw_mw3_2023, ballistics.instant_hit_range_formula_divisor, physics.multiplayer_server_tick_rate, recoil.recoil_determinism, recoil.recoil_recentering_behaviour] — NOT a recording from a shipped title",
+      "keys": [
+        "damage.health_mw2019",
+        "damage.m4a1_mw2019_max_damage",
+        "damage.m4a1_mw2019_min_damage",
+        "damage.m4a1_mw2019_near_range_stop",
+        "damage.m4a1_mw2019_far_range_stop",
+        "damage.m4a1_mw2019_rpm",
+        "damage.mcw_mw3_torso_multiplier_post_buff",
+        "damage.m4a1_mw2019_headshot_multiplier",
+        "ballistics.ar_muzzle_velocity_mcw_mw3_2023",
+        "ballistics.instant_hit_range_formula_divisor",
+        "physics.multiplayer_server_tick_rate",
+        "recoil.recoil_determinism",
+        "recoil.recoil_recentering_behaviour"
+      ],
+      "crossChecks": [
+        "damage.m4a1_mw2019_stk_max_range",
+        "damage.m4a1_mw2019_stk_min_range",
+        "damage.m4a1_mw2019_ttk_max_range",
+        "damage.m4a1_mw2019_ttk_min_range"
+      ],
+      "quotes": {
+        "damage.m4a1_mw2019_ttk_max_range": "264 ms, +/-25 ms (~10%), absorbing the first-bullet convention and the +/-2% RPM band. Arithmetic: 4 STK means 3 inter-shot gaps; 60000/682 = 87.98 ms per gap; 3 x 87.98 = 263.9 ms. The CoD TTK convention EXCLUDES the first bullet travel/instant hit, so TTK = ",
+        "ballistics.instant_hit_range_formula_divisor": "Warzone servers run a 20 Hz tick, so any target inside (velocity / 20) metres resolves within a single tick and the projectile is indistinguishable from hitscan. The divisor is EXACT (hence abs: 0); only the per-weapon derived instant-hit radius needs slack, a"
+      },
+      "formula": "30 HP flat to 37.5 m, linear to 20 HP at 50 m, flat beyond; 100 HP target; rounds on the first tick at or after k * 60/682 s; the first 37.5 m (= 750/20) resolves on the trigger tick and the remainder flies at the muzzle velocity, arriving on the first tick at or after; TTK = fatal arrival - first arrival.",
+      "borrowed": [
+        "recoilVerticalMin: weapon.js SPEC.recoilVerticalMin — recoil.per_shot_vertical_kick_degrees is null",
+        "recoilVerticalMax: weapon.js SPEC.recoilVerticalMax — recoil.per_shot_vertical_kick_degrees is null",
+        "recoilHorizontalMin: weapon.js SPEC.recoilHorizontalMin — recoil.per_shot_horizontal_kick_degrees is null",
+        "recoilHorizontalMax: weapon.js SPEC.recoilHorizontalMax — recoil.per_shot_horizontal_kick_degrees is null",
+        "recoilCenterSpeed: weapon.js SPEC.recoilCenterSpeed — recoil.recoil_recentering_behaviour names a \"per-weapon centre speed\" but publishes no rate",
+        "recoilAdsScale: weapon.js SPEC.recoilAdsScale — recoil.ads_vs_hipfire_recoil_multiplier is null (\"none exists\")",
+        "torsoHalfWidth: player.js TUNING.radius as the torso half-width; no title publishes hitbox extents"
+      ],
+      "caveat": "the compensated half is sourced end to end; the uncompensated half needs a recoil magnitude and a hitbox, neither of which any key supplies"
+    },
+    "ai": {
+      "ours": "B",
+      "reference": "A",
+      "rows": 24,
+      "provenance": "synthesised from targets.mjs keys [ai.ai_reaction_delay_base, ai.ai_reaction_delay_range, damage.health_mw2019, ballistics.ar_muzzle_velocity_mcw_mw3_2023, ballistics.instant_hit_range_formula_divisor, physics.multiplayer_server_tick_rate] — NOT a recording from a shipped title",
+      "keys": [
+        "ai.ai_reaction_delay_base",
+        "ai.ai_reaction_delay_range",
+        "damage.health_mw2019",
+        "ballistics.ar_muzzle_velocity_mcw_mw3_2023",
+        "ballistics.instant_hit_range_formula_divisor",
+        "physics.multiplayer_server_tick_rate"
+      ],
+      "formula": "reaction ~ Triangular(0.2, mode 0.25, 0.4) s, quantised up to the 1/60 s tick; rounds fly 750 m/s past a 37.5 m instant-hit radius; player 100 HP; a burst is fired at the borrowed intra-burst spacing and separated by the borrowed inter-burst interval.",
+      "borrowed": [
+        "aiBurstCount: ai.js CONFIG.burstCount — no published AI burst length",
+        "aiBurstDelay: ai.js CONFIG.burstDelay — no published intra-burst spacing",
+        "aiFireInterval: ai.js CONFIG.fireInterval — no published inter-burst interval",
+        "aiDamage: ai.js CONFIG.damage / main.js hitPlayer 11-16 HP — no published AI per-round damage",
+        "aiAimErrorMetres: ai.js CONFIG.aimErrorMetres — no published AI aim error",
+        "aiAimErrorAngle: ai.js CONFIG.aimErrorAngle — no published AI aim error",
+        "aiAimErrorFloorRange: ai.js CONFIG.aimErrorFloorRange — no published AI aim error",
+        "torsoHalfWidth: player.js TUNING.radius as the torso half-width; no title publishes hitbox extents",
+        "torsoHeight: player.js TUNING.standHeight as the body height; no title publishes hitbox extents"
+      ],
+      "caveat": "the reaction band is sourced; the rhythm (burst length, spacing, interval), the damage and the accuracy are all borrowed — nothing publishes them"
+    }
+  }
+}

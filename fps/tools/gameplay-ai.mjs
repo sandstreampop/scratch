@@ -20,11 +20,29 @@
 //   installed on the prototype, not on an instance, because every sim.setup()
 //   throws the roster away and spawns fresh soldiers.
 //
-//   Hits are Player.prototype.damage() calls, attributed to a specific round:
-//   main.enemyShoot() resolves the shot synchronously inside enemy.shoot(), so a
-//   damage call arriving while a shoot() is on the stack belongs to that round.
-//   That is what makes "missed" distinguishable from "never fired" — the two
-//   live in different arrays, and a range reporting 0% says which it was.
+//   Hits are Player.prototype.damage() calls, attributed to a specific round by
+//   IDENTITY rather than by timing. Incoming fire is no longer hitscan:
+//   main.fireRound() flies the first muzzleVelocity/instantHitDivisor = 37.5 m on
+//   the tick the trigger broke and hands whatever survives to game.projectiles,
+//   which is then flown at tick resolution — 53 ms of air at 40 m, 160 ms at
+//   120 m. So a damage call arriving while a shoot() is on the stack belongs to
+//   that round, and a damage call arriving LATER belongs to the round the tap on
+//   Game.fireRound stamped as it went onto the projectile list. That is what
+//   makes "missed" distinguishable from "never fired" — the two live in different
+//   arrays, and a range reporting 0% says which it was.
+//
+//   The stamp is the repair of a real and expensive instrument defect. This file
+//   originally attributed a hit to "whichever round is on the stack" and nothing
+//   else, which was correct for hitscan and became a window sized for instant
+//   resolution the moment rounds were given a flight. Every hit past 37.5 m was
+//   then attributed to no round at all: the measured curve read 74.8% / 47.4% /
+//   36.4% at 10-30 m and EXACTLY 0.0% at 40, 50 and 60 m, the log-log fit divided
+//   by log(0) and reported the falloff as range^-Infinity, and the 40 m
+//   time-to-kill projection came out 100 HP / (0 x mean of an empty array) = NaN,
+//   which report.measure() correctly refused — taking the whole suite down with
+//   it. A zero produced by the instrument and a zero produced by the game are
+//   indistinguishable in a report, which is why section 0 now asserts that every
+//   damage event lands on a round at a range PAST the instant-hit band.
 //
 //   Every engagement checks its own preconditions before its numbers are
 //   quoted: that the enemy could see the player at t=0, that the AI's firing
@@ -43,8 +61,12 @@
 // statements and every detail string says so. Everything else with no reference
 // value is a MEAS row, which cannot pass and cannot inflate a pass rate.
 //
-// Two rows are red on purpose and belong to files this suite does not own; both
-// name the owner in their detail. See the report.
+// No row is red on purpose any more. Two used to be — the hitscan AI round and
+// the untagged silhouette meshes — and both were closed in the files that owned
+// them, so the rows that named those owners now pass. What is left of that
+// arrangement is the MEAS rows for findings this suite can only report: the AI
+// aims at the eye rather than the centre of the player's box (main.enemyShoot),
+// and it does not lead a target it now needs to lead past 37.5 m (ai.js).
 
 
 // 1/240 for anything whose answer is a timestamp (reaction, TTK): the AI's own
@@ -96,6 +118,15 @@ function quant(arr, p) {
   return a[lo] + (a[hi] - a[lo]) * (i - lo);
 }
 const median = (a) => quant(a, 0.5);
+/**
+ * The finiteness of a group of numbers, as one number report.reached() can take.
+ *
+ * NaN if any member is missing, the group size otherwise. One guard then covers a
+ * set of MEAS rows drawn from one sample, instead of a separate green row in front
+ * of each — a reached() row that structurally cannot fail is a check(…, true, …)
+ * wearing a different hat, and the linter cannot see that one.
+ */
+const allOf = (...vs) => (vs.every(Number.isFinite) ? vs.length : NaN);
 const mean = (a) => {
   const f = a.filter(Number.isFinite);
   return f.length ? f.reduce((s, x) => s + x, 0) / f.length : NaN;
@@ -124,9 +155,11 @@ async function install(sim) {
     const wp = await import('/src/weapon.js');
 
     const rec = {
-      fires: [], hits: [], cur: -1,
+      fires: [], hits: [], cur: -1, arriving: -1,
       SPEC: wp.SPEC,
-      reset() { rec.fires.length = 0; rec.hits.length = 0; rec.cur = -1; },
+      reset() {
+        rec.fires.length = 0; rec.hits.length = 0; rec.cur = -1; rec.arriving = -1;
+      },
     };
     window.__AI = rec;
 
@@ -145,18 +178,79 @@ async function install(sim) {
         bl: this.burstLeft,
         // Filled in by the tracer tap below, which sees the post-spread ray.
         blocked: null, onTarget: null, missBy: null, lateral: null, geom: 0,
+        // Set by the fireRound tap: 1 if anything survived the 37.5 m instant-hit
+        // stretch and went into the air, 0 if the round was spent on the tick it
+        // was fired. `flight` is how long the hit took to arrive, in seconds, and
+        // is 0 for a round that resolved instantly.
+        flew: null, flight: null,
       });
       rec.cur = idx;
       try { return shoot0.apply(this, arguments); } finally { rec.cur = -1; }
     };
 
-    // Hits. Attributed to whichever round is on the stack; a damage call with
-    // no round on the stack (there is no such path today) would land in .hits
-    // with fire:-1 rather than being silently credited to the last round.
+    /* ---- attribution across a round's flight ---------------------------- */
+    //
+    // Two channels, because a round can resolve in either of two places and the
+    // suite must not care which:
+    //
+    //   rec.cur       a round still inside enemy.shoot(), i.e. inside the
+    //                 instant-hit stretch fireRound() flies on the firing tick.
+    //   rec.arriving  a round that outlived that stretch, went onto
+    //                 game.projectiles, and is being resolved N ticks later from
+    //                 updateProjectiles(). Identified by the index stamped on the
+    //                 round object itself, so attribution is by IDENTITY and no
+    //                 window has to be guessed at all — a window sized for one
+    //                 flight time is wrong for every other range, and the flight
+    //                 times here span 0 ms to 160 ms.
+    //
+    // The stamp is put on in a tap on Game.fireRound rather than by wrapping the
+    // round: fireRound() constructs the round privately and pushes it only if it
+    // survived, so "everything appended to game.projectiles during this shoot()"
+    // is the one place the object becomes reachable from outside.
+    const gp = Object.getPrototypeOf(g);
+    const fireRound0 = gp.fireRound;
+    gp.fireRound = function (origin, dir, fromPlayer) {
+      const idx = rec.cur;
+      const before = this.projectiles.length;
+      const out = fireRound0.apply(this, arguments);
+      if (idx >= 0) {
+        for (let i = before; i < this.projectiles.length; i++) {
+          this.projectiles[i].__aiFire = idx;
+          this.projectiles[i].__aiFiredAt = g.elapsed;
+        }
+        rec.fires[idx].flew = this.projectiles.length > before ? 1 : 0;
+      }
+      return out;
+    };
+
+    // hitPlayer() is the one call that has both the round and the damage in
+    // scope. Player.damage() sees only an amount, so the round's identity is
+    // handed down through rec.arriving for the duration of the call.
+    const hitPlayer0 = gp.hitPlayer;
+    gp.hitPlayer = function (round, hit, dir) {
+      const was = rec.arriving;
+      rec.arriving = round.__aiFire ?? -1;
+      const fired = round.__aiFiredAt;
+      if (rec.arriving >= 0 && Number.isFinite(fired)) {
+        rec.fires[rec.arriving].flight = g.elapsed - fired;
+      }
+      try { return hitPlayer0.apply(this, arguments); } finally { rec.arriving = was; }
+    };
+
+    // Hits. Attributed to the round on the stack, or failing that to the round in
+    // the air that is landing. A damage call belonging to neither lands in .hits
+    // with fire:-1 rather than being silently credited to the last round — and
+    // section 0 asserts that no such call exists past the instant-hit band, which
+    // is the assertion this file did not have when the band was introduced.
     const dmg0 = pl.Player.prototype.damage;
     pl.Player.prototype.damage = function (amount) {
-      rec.hits.push({ t: g.elapsed, amount, fire: rec.cur, health: this.health });
-      if (rec.cur >= 0) { rec.fires[rec.cur].hits++; rec.fires[rec.cur].amount += amount; }
+      const idx = rec.cur >= 0 ? rec.cur : rec.arriving;
+      rec.hits.push({ t: g.elapsed, amount, fire: idx, health: this.health });
+      if (idx >= 0) {
+        rec.fires[idx].hits++;
+        rec.fires[idx].amount += amount;
+        if (rec.fires[idx].flight === null) rec.fires[idx].flight = 0;
+      }
       return dmg0.apply(this, arguments);
     };
 
@@ -471,6 +565,34 @@ async function arm(sim, vulnerable) {
   }, vulnerable);
 }
 
+/**
+ * Flies every incoming round still in the air to its conclusion.
+ *
+ * The last rounds of any window are still travelling when the window closes — at
+ * 60 m a round spends 30 ms past the instant-hit stretch, so at 8 s of window and
+ * ~2 rounds/s in contact there are one or two of them. Left unresolved they are
+ * counted in the denominator of a hit rate and can never appear in its numerator,
+ * which biases every range past 37.5 m downwards by a few points and biases it
+ * MORE the further out you go — i.e. it fakes exactly the falloff this suite
+ * measures.
+ *
+ * Flown through updateProjectiles() alone, not through g.step(): stepping would
+ * give the agent extra ticks to shoot in and the window would no longer be the
+ * window. Nothing else in the simulation advances, so g.elapsed is frozen and the
+ * flight times of these particular rounds are not measured — the count is
+ * returned so the reader can see how many rounds that is.
+ */
+async function flush(sim) {
+  return sim.eval(() => {
+    const g = window.__GAME;
+    const incoming = () => g.projectiles.filter((p) => !p.fromPlayer).length;
+    const air = incoming();
+    let ticks = 0;
+    while (incoming() > 0 && ticks < 480) { g.updateProjectiles(g.tickLength ?? 1 / 240); ticks++; }
+    return { air, ticks, left: incoming() };
+  });
+}
+
 /** Everything the recorder saw. */
 async function records(sim) {
   return sim.eval(() => ({
@@ -528,8 +650,11 @@ function engagementFactory(sim, lane) {
       };
     });
     const rows = await sim.drive({ seconds, dt, input, sample });
+    // Before reading the record: a round still in the air has no outcome yet, and
+    // reading the record first would count it as a miss.
+    const air = await flush(sim);
     const rec = await records(sim);
-    return { pre, rows, ...rec, t0: rows.length ? rows[0].t - dt : 0, d };
+    return { pre, rows, ...rec, air, t0: rows.length ? rows[0].t - dt : 0, d };
   }
   engage.at = at;
   engage.yaw = yaw;
@@ -542,7 +667,8 @@ function engagementFactory(sim, lane) {
 export default async function run(sim, report) {
   const state = await install(sim);
   report.check('the AI probe installed its taps', state === 'installed' || state === 'already installed',
-    `3 prototype/instance taps wrapped — Enemy.shoot, Player.damage, vfx.tracers.fire (${state})`);
+    `5 prototype/instance taps wrapped — Enemy.shoot, Player.damage, Game.fireRound, Game.hitPlayer, `
+    + `vfx.tracers.fire (${state})`);
 
   // One long clear lane, reused by every engagement. 60 m of AI accuracy
   // measured across a courtyard wall would be a measurement of the wall. The
@@ -607,6 +733,59 @@ export default async function run(sim, report) {
         gg.length > 0 && agree === gg.length,
         `${agree}/${gg.length} rounds classified identically by Player.damage() and by an independent `
         + 'ray-vs-player-AABB test');
+    }
+
+    // (c2) attribution survives the round's flight.
+    //
+    //      This is the check whose absence cost this suite two rows and 19 MEAS
+    //      values. Everything above is inside main.js's instant-hit band
+    //      (muzzleVelocity/instantHitDivisor = 750/20 = 37.5 m), where an incoming
+    //      round still resolves on the tick the trigger broke and a hit can be
+    //      credited to "whichever shoot() is on the stack". PAST that band the
+    //      round is in the air for several ticks and no shoot() is on the stack
+    //      when it lands, so the old attribution credited it to nothing at all and
+    //      three of the six accuracy ranges read exactly 0.0% — a number produced
+    //      by the instrument and indistinguishable, in a report, from an AI that
+    //      cannot shoot.
+    //
+    //      So: at a range chosen to be past the band, every damage event must land
+    //      on a round, and the rounds that landed must have taken measurable time
+    //      to arrive. Both halves matter. The first alone would pass if the band
+    //      were widened to cover the whole map; the second alone would pass while
+    //      the hits went unattributed.
+    //      Pooled over four engagements rather than taken from one. The hit rate at
+    //      this range is around a tenth, so a single 8 s window lands two or three
+    //      rounds and a liveness check resting on two samples goes red on the toss
+    //      of a seed — which is the failure mode this file has been audited for
+    //      twice already.
+    {
+      let events = 0, orphans = 0, rounds = 0, flew = 0, air = 0, landed = 0;
+      const flights = [];
+      for (let i = 0; i < 4; i++) {
+        const far = await engage({ d: 55, seconds: 8, dt: DT_LONG, state: 'engage', vulnerable: true });
+        events += far.hits.length;
+        orphans += far.hits.filter((h) => h.fire < 0).length;
+        rounds += far.fires.length;
+        flew += far.fires.filter((f) => f.flew === 1).length;
+        air += far.air.air;
+        const hit = far.fires.filter((f) => f.hits > 0);
+        landed += hit.length;
+        flights.push(...hit.map((f) => f.flight));
+      }
+      report.check('a hit from beyond the instant-hit band is still attributed to its round',
+        events > 0 && orphans === 0 && landed > 0,
+        `${events} damage events from ${rounds} rounds at 55 m over 4 engagements, `
+        + `${orphans} of them credited to no round; ${landed} rounds landed, `
+        + `${flew} of ${rounds} outlived the 37.5 m instant-hit stretch, ${air} were still in the air when a `
+        + 'window closed and were flown out. Attribution is by the index stamped on the round object, not by a '
+        + 'time window: the window that used to be assumed was one tick wide, and the flight times here are '
+        + 'two to four ticks');
+      if (report.reached('there is a flight time to report at 55 m', median(flights),
+        `${flights.filter(Number.isFinite).length} of ${landed} landed rounds carry a flight time`)) {
+        report.measure('flight time of an AI round that connects at 55 m', median(flights), 's',
+          `${dist(flights, 'ms')} between the tick the round left the barrel and the tick its damage `
+          + `arrived — 55 m is ${f2(55 - 37.5)} m past main.js's instant-hit radius at 750 m/s`);
+      }
     }
 
     // (d) the player's health pool, measured behaviourally and WITHOUT the test
@@ -714,18 +893,23 @@ export default async function run(sim, report) {
         unseen === 0 && noShot === 0 && total.length === RANGES.length * REPEATS,
         `${total.length}/${RANGES.length * REPEATS} trials usable — ${unseen} discarded for no line of `
         + `sight at t0, ${noShot} for no round inside 2.2 s`);
-      report.reached('the reaction distribution has a median to report', median(total),
+      const reactionOk = report.reached('the reaction distribution has a median to report', median(total),
         `${dist(total, 'ms')} at ${f2(median(firstDist))} m median engagement range`);
       reactionMedian = median(total);
 
-      report.against('AI reaction time, median (first sight -> first round)',
-        reactionMedian, 'ai', 'ai_reaction_delay_base');
-      // The tails against the sourced band, which is the entry whose tolerance
-      // IS the band (value: null, tol {min, max}). A median inside 0.25 s with a
-      // p90 outside 0.40 s is a bot that is usually fair and occasionally asleep,
-      // and that is the failure a median alone cannot see.
-      report.against('AI reaction time, p10', quant(total, 0.1), 'ai', 'ai_reaction_delay_range');
-      report.against('AI reaction time, p90', quant(total, 0.9), 'ai', 'ai_reaction_delay_range');
+      // Inside the guard, not merely after it: against() refuses a non-finite
+      // measurement by throwing, exactly as measure() does, so a reached() row that
+      // goes red and is then ignored buys nothing at all.
+      if (reactionOk) {
+        report.against('AI reaction time, median (first sight -> first round)',
+          reactionMedian, 'ai', 'ai_reaction_delay_base');
+        // The tails against the sourced band, which is the entry whose tolerance
+        // IS the band (value: null, tol {min, max}). A median inside 0.25 s with a
+        // p90 outside 0.40 s is a bot that is usually fair and occasionally asleep,
+        // and that is the failure a median alone cannot see.
+        report.against('AI reaction time, p10', quant(total, 0.1), 'ai', 'ai_reaction_delay_range');
+        report.against('AI reaction time, p90', quant(total, 0.9), 'ai', 'ai_reaction_delay_range');
+      }
       report.check('the reaction distribution is ordered and has spread',
         quant(total, 0.1) < reactionMedian && reactionMedian < quant(total, 0.9)
         && quant(total, 0.9) - quant(total, 0.1) > 0.03,
@@ -736,12 +920,21 @@ export default async function run(sim, report) {
       // bisect. ALERT->ENGAGE is the reaction roll itself; ENGAGE->round should
       // now be one tick, because ENGAGE arms and fires the burst on the same
       // tick and fireTimer is armed at zero on the transition.
-      report.measure('reaction leg: first sight -> ALERT', median(legAlert), 's',
-        'the line-of-sight schedule re-tests one agent in three ticks, so up to 2 ticks land here');
-      report.measure('reaction leg: ALERT -> ENGAGE', median(legEngage), 's',
-        'the CONFIG.reactionTime roll, which is now the whole of the reaction');
-      report.measure('reaction leg: ENGAGE -> first round', median(legFire), 's',
-        'was 0.12-0.34 s of fresh fireTimer plus a tick spent arming the burst without firing it');
+      // Guarded as a group, because all three legs come out of the same trials:
+      // allOf() is NaN unless every one of them has a median, so one row covers the
+      // set without putting an unfalsifiable green line in front of each.
+      if (report.reached('the reaction decomposition has a median for every leg',
+        allOf(median(legAlert), median(legEngage), median(legFire)),
+        `3 legs over ${total.length} trials — ${legAlert.filter(Number.isFinite).length} reached ALERT, `
+        + `${legEngage.filter(Number.isFinite).length} reached ENGAGE, `
+        + `${legFire.filter(Number.isFinite).length} got from ENGAGE to a round`)) {
+        report.measure('reaction leg: first sight -> ALERT', median(legAlert), 's',
+          'the line-of-sight schedule re-tests one agent in three ticks, so up to 2 ticks land here');
+        report.measure('reaction leg: ALERT -> ENGAGE', median(legEngage), 's',
+          'the CONFIG.reactionTime roll, which is now the whole of the reaction');
+        report.measure('reaction leg: ENGAGE -> first round', median(legFire), 's',
+          'was 0.12-0.34 s of fresh fireTimer plus a tick spent arming the burst without firing it');
+      }
     }
 
     /* ============================ 2. accuracy vs range ================= */
@@ -771,7 +964,7 @@ export default async function run(sim, report) {
       const rec = {
         d, fired: 0, hit: 0, blocked: 0, onTarget: 0, misses: [], dists: [], amounts: [],
         aimAbove: [], dys: [], boxH: [],
-        unusable: 0, drift: 0, trials: 0, engageTicks: 0, ticks: 0,
+        unusable: 0, drift: 0, trials: 0, engageTicks: 0, ticks: 0, air: 0, flights: [],
       };
       const ttks = [];
       for (let i = 0; i < TRIALS; i++) {
@@ -779,6 +972,7 @@ export default async function run(sim, report) {
         if (!e.pre.sees || !e.pre.clearFire) { rec.unusable++; continue; }
         rec.trials++;
         rec.ticks += e.rows.length;
+        rec.air += e.air.air;
         // How much of the window the agent spent in contact at all. Without this
         // the round count per range is a mystery: at 10 m pickCover() scores
         // cover points by |distToPlayer - 16|, so a soldier that starts inside
@@ -794,7 +988,7 @@ export default async function run(sim, report) {
           rec.dists.push(f.dist);
           if (f.onTarget) rec.onTarget++;
           if (f.blocked) rec.blocked++;
-          if (f.hits > 0) { rec.hit++; rec.amounts.push(f.amount); }
+          if (f.hits > 0) { rec.hit++; rec.amounts.push(f.amount); rec.flights.push(f.flight); }
           if (Number.isFinite(f.missBy) && !f.hits) rec.misses.push(f.missBy);
           if (Number.isFinite(f.aimAbove)) { rec.aimAbove.push(f.aimAbove); rec.boxH.push(f.boxH); }
           if (Number.isFinite(f.dy)) rec.dys.push(f.dy);
@@ -818,13 +1012,21 @@ export default async function run(sim, report) {
       }).join(', ')} `
       + `(${RANGES.reduce((s, d) => s + acc.get(d).unusable, 0)} trials discarded for no LOS or a blocked `
       + `lane, ${RANGES.reduce((s, d) => s + acc.get(d).drift, 0)} rounds discarded for repositioning out of `
-      + 'the range bucket)');
+      + `the range bucket, ${RANGES.reduce((s, d) => s + acc.get(d).air, 0)} still in the air at the end of a `
+      + 'window and flown out before the record was read)');
 
-    for (const d of RANGES) {
-      const r = acc.get(d);
-      report.measure(`AI accuracy at ${d} m`, rate(d), '',
-        `${r.hit}/${r.fired} rounds over ${r.trials} engagements — no sourced target exists `
-        + '(targets.mjs lists ai_accuracy in its own missing() set and says why)');
+    // One guard for the six rows: allOf() is NaN unless every range produced a
+    // ratio, and a range with no rounds fired at all would otherwise hand
+    // measure() a 0/0.
+    if (report.reached('every range produced a hit rate to report', allOf(...RANGES.map(rate)),
+      `${RANGES.length} ranges, rounds fired ${RANGES.map((d) => acc.get(d).fired).join('/')}`)) {
+      for (const d of RANGES) {
+        const r = acc.get(d);
+        report.measure(`AI accuracy at ${d} m`, rate(d), '',
+          `${r.hit}/${r.fired} rounds over ${r.trials} engagements, `
+          + `${r.hit ? `median flight ${ms(median(r.flights))} to the hit` : 'no hits'} — no sourced target `
+          + 'exists (targets.mjs lists ai_accuracy in its own missing() set and says why)');
+      }
     }
 
     // The three structural statements. Each is one property, so one cause
@@ -922,12 +1124,15 @@ export default async function run(sim, report) {
       const aimAbove = RANGES.flatMap((d) => acc.get(d).aimAbove);
       const dys = RANGES.flatMap((d) => acc.get(d).dys);
       const h = median(RANGES.flatMap((d) => acc.get(d).boxH));
-      report.measure('AI aim point above the centre of the player AABB', median(aimAbove), 'm',
-        `${pct(median(aimAbove) / h)} of the ${f2(h)} m body box, over ${aimAbove.length} rounds — `
-        + 'main.enemyShoot() aims at camera.position, i.e. the eye');
-      report.measure('height of the AI round above the player centre, p90', quant(dys, 0.9), 'm',
-        `median ${f2(median(dys))} m, so the top of the cone lands ${f2(quant(dys, 0.9) - h / 2)} m over `
-        + 'the head; every one of those rounds is a guaranteed miss whatever the spread is tuned to');
+      if (report.reached('the aim-point geometry has rounds to report', allOf(median(aimAbove), quant(dys, 0.9), h),
+        `${aimAbove.length} rounds carry an aim height and ${dys.length} a miss height`)) {
+        report.measure('AI aim point above the centre of the player AABB', median(aimAbove), 'm',
+          `${pct(median(aimAbove) / h)} of the ${f2(h)} m body box, over ${aimAbove.length} rounds — `
+          + 'main.enemyShoot() aims at camera.position, i.e. the eye');
+        report.measure('height of the AI round above the player centre, p90', quant(dys, 0.9), 'm',
+          `median ${f2(median(dys))} m, so the top of the cone lands ${f2(quant(dys, 0.9) - h / 2)} m over `
+          + 'the head; every one of those rounds is a guaranteed miss whatever the spread is tuned to');
+      }
     }
 
     // Rounds the world ate on their way to a player they would otherwise have
@@ -973,18 +1178,36 @@ export default async function run(sim, report) {
     {
       const meds = RANGES.map((d) => median(ttk.get(d).filter(Number.isFinite)));
       const series = [];
+      // Computed for every range up front so the projections can be guarded as one
+      // group. This is the arithmetic that took the suite down: at a range with no
+      // attributed hits, mean(r.amounts) is the mean of an empty array — NaN — and
+      // healthPool/NaN is NaN, which JSON.stringify() renders as `null` in the
+      // reporter's own error message. A single unguarded measure() cost 22 green
+      // rows and 19 MEAS values, which is a worse report than any red row.
+      const projOf = (d) => {
+        const r = acc.get(d);
+        const engS = r.engageTicks * DT_LONG;
+        return healthPool / ((engS ? r.fired / engS : NaN) * rate(d) * mean(r.amounts));
+      };
+      const projs = RANGES.map(projOf);
+      const projOk = report.reached('a time-to-kill projection is computable at every range',
+        allOf(...projs),
+        `${RANGES.length} ranges; hit rates ${RANGES.map((d) => pct(rate(d))).join('/')} and `
+        + `${RANGES.map((d) => acc.get(d).amounts.length).join('/')} attributed hits to average HP over. A `
+        + 'range with no attributed hits has no HP per hit and therefore no projection — which is a fact '
+        + 'about the measurement, and must be a red row rather than a thrown suite');
       for (const [i, d] of RANGES.entries()) {
         const all = ttk.get(d);
         const done = all.filter(Number.isFinite);
         const r = acc.get(d);
         const engS = r.engageTicks * DT_LONG;
-        const proj = healthPool / ((engS ? r.fired / engS : NaN) * rate(d) * mean(r.amounts));
+        const proj = projs[i];
         series.push({ d, t: proj, observed: done.length > 0 });
         if (done.length) {
           report.measure(`AI time-to-kill at ${d} m`, meds[i], 's',
             `${dist(done, 'ms')}; ${all.length - done.length}/${all.length} engagements never dealt `
             + `${f2(healthPool)} HP inside the ${f2(WINDOW)} s window`);
-        } else {
+        } else if (projOk) {
           // Censored, not defective, and reported as a projection built only out
           // of measured quantities — hit rate, rounds per second sustained while
           // in contact, and mean damage per hit. A red row here would say the AI
@@ -1126,14 +1349,18 @@ export default async function run(sim, report) {
         `delivered ${lens.join('/')} against ${intended.join('/')} rolled: ${merged} runs longer than the `
         + `roll; shortest observed gap between bursts ${ms(Math.min(...gaps))} against a CONFIG.fireInterval `
         + 'floor of 420 ms, which is now timed from the end of the burst rather than its start');
-      report.measure('bursts abandoned before the roll was spent', cut / bursts.length, 'fraction',
-        `${cut}/${bursts.length} bursts delivered fewer rounds than rolled. The ENGAGE branch only advances a `
-        + 'burst while it can see the player, so a burst the agent leaves contact in the middle of is never '
-        + 'finished — and because the split is on burstLeft rather than on timing, a burst that merely PAUSED '
-        + 'and resumed does not count here');
-      report.measure('AI inter-burst delay', median(gaps), 's',
-        `${dist(gaps, 'ms')} between the last round of a burst and the first of the next, against a `
-        + 'CONFIG.fireInterval of [0.42, 1.15] s now timed from the end of the burst');
+      if (report.reached('the pacing run produced bursts and completed-burst gaps to report',
+        allOf(cut / bursts.length, median(gaps)),
+        `${bursts.length} bursts and ${gaps.length} gaps between consecutive completed bursts`)) {
+        report.measure('bursts abandoned before the roll was spent', cut / bursts.length, 'fraction',
+          `${cut}/${bursts.length} bursts delivered fewer rounds than rolled. The ENGAGE branch only advances a `
+          + 'burst while it can see the player, so a burst the agent leaves contact in the middle of is never '
+          + 'finished — and because the split is on burstLeft rather than on timing, a burst that merely PAUSED '
+          + 'and resumed does not count here');
+        report.measure('AI inter-burst delay', median(gaps), 's',
+          `${dist(gaps, 'ms')} between the last round of a burst and the first of the next, against a `
+          + 'CONFIG.fireInterval of [0.42, 1.15] s now timed from the end of the burst');
+      }
       // The pacing defect, asserted. fireTimer used to be decremented DURING the
       // burst, so a five-round burst at 0.098 s spacing consumed 0.39 s of a
       // 0.42 s interval and the next burst opened ~30 ms after the last one
@@ -1147,8 +1374,11 @@ export default async function run(sim, report) {
         gaps.length > 0 && Math.min(...gaps) >= 0.42 - DT_LONG,
         `shortest gap ${ms(Math.min(...gaps))} over ${gaps.length} completed-burst transitions, `
         + `distribution ${dist(gaps, 'ms')}`);
-      report.measure('AI firing duty cycle', inBurst / contactSpan, 'fraction of contact inside a burst',
-        `${f2(contactRounds / contactSpan)} rounds/s while in contact`);
+      if (report.reached('there was contact to measure a duty cycle over', allOf(inBurst / contactSpan),
+        `${f2(contactSpan)} s of contact across 6 engagements, ${contactRounds} rounds`)) {
+        report.measure('AI firing duty cycle', inBurst / contactSpan, 'fraction of contact inside a burst',
+          `${f2(contactRounds / contactSpan)} rounds/s while in contact`);
+      }
       // The number that reframes every pacing figure above: over a 26 s firefight
       // this agent is out of contact much of the time. It repositions to a cover
       // point chosen by pickCover() — which scores for cover, not for sight
@@ -1219,43 +1449,127 @@ export default async function run(sim, report) {
 
       const rS = stand.hit / stand.fired, rM = move.hit / move.fired;
       const se = Math.sqrt(rS * (1 - rS) / stand.fired + rM * (1 - rM) / move.fired);
-      report.measure('AI hit rate, standing player at 20 m', rS, '', `${stand.hit}/${stand.fired} rounds`);
-      report.measure('AI hit rate, strafing player at 20 m', rM, '', `${move.hit}/${move.fired} rounds`);
-      report.measure('strafing advantage in standard errors', (rS - rM) / se, 's.e.',
-        `difference ${pct(rS - rM)} +/- ${pct(se)} (1 s.e.). main.enemyShoot() re-aims at camera.position on `
-        + 'the tick it fires and resolves the round on that same tick, so movement can open no aim error at '
-        + 'all; whatever difference survives comes from the eye sitting near the top of the AABB and the view '
-        + 'bob moving it');
-      report.measure('AI lead along the player direction of travel', mean(move.lat), 'm',
-        `p10 ${f3(quant(move.lat, 0.1))} m .. p90 ${f3(quant(move.lat, 0.9))} m over ${move.lat.length} `
-        + 'rounds; a hitscan round resolved on the firing tick has nothing to lead');
+      // Guarded on the values that are REPORTED, not on the ingredients they are
+      // built from. Guarding fS, fM and the standard error separately looks
+      // equivalent and is not: two arms that both hit nothing give three perfectly
+      // finite zeros and a difference of 0/0, so the guard passes and the row
+      // below still throws. Found by re-running this file with the attribution fix
+      // reverted, which is the only reason the hole was visible at all.
+      if (report.reached('both arms of the strafing comparison fired rounds',
+        allOf(rS, rM, (rS - rM) / se, mean(move.lat)),
+        `${stand.fired} rounds standing, ${move.fired} strafing, ${move.lat.length} of them above 0.5 m/s`)) {
+        report.measure('AI hit rate, standing player at 20 m', rS, '', `${stand.hit}/${stand.fired} rounds`);
+        report.measure('AI hit rate, strafing player at 20 m', rM, '', `${move.hit}/${move.fired} rounds`);
+        report.measure('strafing advantage in standard errors', (rS - rM) / se, 's.e.',
+          `difference ${pct(rS - rM)} +/- ${pct(se)} (1 s.e.). main.enemyShoot() re-aims at camera.position on `
+          + 'the tick it fires, and 20 m is inside main.js\'s 37.5 m instant-hit radius, so the round still '
+          + 'resolves on that tick and movement can open no aim error at this range at all; whatever difference '
+          + 'survives comes from the eye sitting near the top of the AABB and the view bob moving it. Past '
+          + '37.5 m the round is in the air and the same measurement is a different quantity — see the lead '
+          + 'deficit measured below');
+        report.measure('AI lead along the player direction of travel', mean(move.lat), 'm',
+          `p10 ${f3(quant(move.lat, 0.1))} m .. p90 ${f3(quant(move.lat, 0.9))} m over ${move.lat.length} `
+          + 'rounds at 20 m; a round that resolves on the firing tick has nothing to lead, and inside the '
+          + 'instant-hit radius that is still what happens');
+      }
 
-      // Why there is no lead to measure: AI fire is hitscan. Established by
-      // calling shoot() directly at close range — where the measured hit rate is
-      // highest, so rounds actually connect — and comparing the tick each round
-      // left the barrel with the tick its damage landed. The previous version
-      // fired 12 rounds from 25.7 m, none of them connected, and it reported
+      /* ---- the same question past the instant-hit band ------------------- */
+      //
+      // 20 m is inside main.js's 37.5 m instant-hit radius, where the round is
+      // resolved on the firing tick and there is by construction nothing to lead.
+      // That was the whole story when incoming fire was hitscan; it is now the
+      // story for the first 37.5 m only, and the measurement above cannot see past
+      // it. A round fired at 50 m spends 17 ms in the air after its instant
+      // stretch, a player strafing at 3.6 m/s covers 6 cm in that time, and
+      // main.enemyShoot() aims at where the camera IS — so the deficit is real,
+      // predictable from those three numbers, and small next to the spread cone.
+      //
+      // Both figures are MEAS. Neither is asserted, for the same reason the 20 m
+      // pair is not: at ~60 rounds a side one standard error on a difference of
+      // proportions is 6 to 8 points, so any gate tight enough to be interesting
+      // here is a coin flip. What the rows are for is to make the size of the
+      // effect visible instead of leaving a reader to assume it either way — and
+      // to record that leading is a thing this AI does not do, which is a finding
+      // about ai.js and main.enemyShoot() rather than about this instrument.
+      {
+        const farStand = { fired: 0, hit: 0, lat: [] };
+        const farMove = { fired: 0, hit: 0, lat: [], atFire: [] };
+        for (let i = 0; i < 6; i++) {
+          for (const [rec2, input] of [[farStand, null], [farMove, STRAFE]]) {
+            const e = await engage({ d: 50, seconds: 5, dt: DT_LONG, state: 'engage', vulnerable: true, input });
+            if (!e.pre.sees) continue;
+            for (const f of e.fires) {
+              rec2.fired++;
+              if (f.hits > 0) rec2.hit++;
+              if (rec2.atFire) rec2.atFire.push(f.speed);
+              if (Number.isFinite(f.lateral)) rec2.lat.push(f.lateral);
+            }
+          }
+        }
+        const fS = farStand.hit / farStand.fired, fM = farMove.hit / farMove.fired;
+        const fSe = Math.sqrt(fS * (1 - fS) / farStand.fired + fM * (1 - fM) / farMove.fired);
+        if (report.reached('both arms of the past-the-band strafing comparison fired rounds',
+          allOf(fS, fM, (fS - fM) / fSe, mean(farMove.lat)),
+          `${farStand.fired} rounds standing and ${farMove.fired} strafing at 50 m, `
+          + `${farMove.lat.length} of the latter above 0.5 m/s`)) {
+          report.measure('strafing advantage at 50 m, in standard errors', (fS - fM) / fSe, 's.e.',
+            `standing ${pct(fS)} (${farStand.hit}/${farStand.fired}) against strafing ${pct(fM)} `
+            + `(${farMove.hit}/${farMove.fired}), difference ${pct(fS - fM)} +/- ${pct(fSe)} (1 s.e.). 50 m is `
+            + '12.5 m past the instant-hit radius, so unlike the 20 m pair above this one is measured on a '
+            + 'round that really is in the air while the target moves');
+          report.measure('AI lead along the player direction of travel at 50 m', mean(farMove.lat), 'm',
+            `p10 ${f3(quant(farMove.lat, 0.1))} m .. p90 ${f3(quant(farMove.lat, 0.9))} m over `
+            + `${farMove.lat.length} rounds. main.enemyShoot() aims at camera.position — where the player IS, `
+            + 'not where he will be — so a mean indistinguishable from zero here says the AI does not lead, '
+            + 'and at 17 ms of flight past the band against 3.6 m/s of strafe the miss it costs is ~6 cm '
+            + 'against a spread cone already 1.5 m wide at this range. A finding about ai.js and '
+            + 'main.enemyShoot(), not a defect in this instrument');
+        }
+      }
+
+      // Whether an AI round has travel time at all, measured by comparing the tick
+      // each round left the barrel with the tick its damage landed.
+      //
+      // The range is the whole measurement and it has been wrong twice. The first
+      // version fired 12 rounds from 25.7 m, none of them connected, and reported
       // "hitscan" from zero samples: `resolved > 0 && worst > 0 ? 1 : 0` makes an
-      // empty measurement byte-identical to a measured hitscan. Hence reached()
-      // in front of it.
-      await engage({ d: 9, seconds: 0.5, dt: DT_LONG, state: 'engage', vulnerable: true });
+      // empty measurement byte-identical to a measured hitscan, hence the reached()
+      // in front of it. The second moved to 9 m to get rounds that connect and
+      // thereby moved INSIDE main.js's instant-hit radius, where a faithful
+      // MW2019 model is hitscan on purpose: 750/20 = 37.5 m of every round is
+      // resolved on the tick the trigger broke, and a probe inside that radius
+      // measures zero travel time on a game that has it. It would have reported
+      // ballistics.bullet_model_is_projectile_not_hitscan as violated by a correct
+      // implementation.
+      //
+      // So the probe fires from past that radius, and it collects outcomes from the
+      // recorder's per-round flight times rather than from what happens to be
+      // synchronous with shoot() — which is the same defect this whole file was
+      // repaired for, in miniature: a round that lands three ticks later is not
+      // visible to a loop that only looks before its next step.
+      await engage({ d: 55, seconds: 0.5, dt: DT_LONG, state: 'engage', vulnerable: true });
       const travel = await sim.eval(() => {
         const g = window.__GAME;
         const e = g.director.enemies[0];
         if (!e) return null;
-        let fired = 0, resolved = 0, worst = 0;
+        const rec = window.__AI;
+        rec.reset();
+        const dist = e.position.distanceTo(g.camera.position);
         for (let i = 0; i < 60; i++) {
-          const t = g.elapsed;
-          const before = window.__AI.hits.length;
-          fired++;
           e.shoot(g.player, e.position.distanceTo(g.camera.position));
-          for (let k = before; k < window.__AI.hits.length; k++) {
-            resolved++;
-            worst = Math.max(worst, window.__AI.hits[k].t - t);
-          }
           g.step(1 / 240);
         }
-        return { fired, resolved, worst, dist: e.position.distanceTo(g.camera.position) };
+        // 0.25 s of tail with no manual trigger, so the last rounds fired are in
+        // the air over ticks that really elapse and their flight times are real.
+        for (let i = 0; i < 60; i++) g.step(1 / 240);
+        const landed = rec.fires.filter((f) => f.hits > 0 && Number.isFinite(f.flight));
+        return {
+          fired: rec.fires.length,
+          resolved: landed.length,
+          worst: landed.reduce((m, f) => Math.max(m, f.flight), 0),
+          instant: landed.filter((f) => f.flight === 0).length,
+          dist,
+        };
       });
       const resolved = travel ? travel.resolved : 0;
       if (report.reached('the travel-time probe landed rounds to time', resolved > 0 ? resolved : NaN,
@@ -1265,8 +1579,10 @@ export default async function run(sim, report) {
           travel.worst > 0 ? 1 : 0, 'ballistics', 'bullet_model_is_projectile_not_hitscan');
         report.measure('largest gap between an AI round leaving the barrel and its damage arriving',
           travel.worst, 's',
-          `over ${resolved} resolved rounds — AI fire is a single Raycaster call inside main.enemyShoot(), `
-          + 'resolved on the firing tick. Fixing that is main.js/ballistics work, not ai.js');
+          `over ${resolved} resolved rounds from ${f2(travel.dist)} m, of which ${travel.instant} arrived on the `
+          + 'firing tick. main.enemyShoot() now sends its round down main.fireRound(), the same walk a player '
+          + 'round takes: the first 37.5 m is resolved instantly by design and only the remainder is flown, so '
+          + 'this figure is the flight past that radius and it is zero for any engagement inside it');
       }
     }
 
@@ -1308,11 +1624,14 @@ export default async function run(sim, report) {
       });
       report.against('visible soldier meshes that cannot be hit',
         counts.untagged.length, 'integrity', 'hitbox_visible_mesh_hittable');
-      report.measure('zone-tagged share of the visible silhouette meshes',
-        counts.tagged / counts.vis, 'fraction',
-        `${counts.tagged}/${counts.vis} visible meshes tagged, ${counts.all} meshes in the hierarchy, `
-        + `${counts.effects} additive effect quads excluded (the muzzle flash is a light, not a surface)`
-        + (counts.untagged.length ? `; untagged: ${counts.untagged.join(' | ')}` : ''));
+      if (report.reached('the soldier has visible meshes to take a tagged share of',
+        allOf(counts.tagged / counts.vis), `${counts.vis} visible meshes of ${counts.all} in the hierarchy`)) {
+        report.measure('zone-tagged share of the visible silhouette meshes',
+          counts.tagged / counts.vis, 'fraction',
+          `${counts.tagged}/${counts.vis} visible meshes tagged, ${counts.all} meshes in the hierarchy, `
+          + `${counts.effects} additive effect quads excluded (the muzzle flash is a light, not a surface)`
+          + (counts.untagged.length ? `; untagged: ${counts.untagged.join(' | ')}` : ''));
+      }
 
       // 61x61 = 3721 rays. Chunked by rows: intersectObjects against ~50
       // rounded boxes per ray is real work, and one evaluate long enough to look
@@ -1446,10 +1765,14 @@ export default async function run(sim, report) {
         + 'never made it because the terrain was in front of the zone they found (the low rays into the boots), which '
         + 'is what made the first version of this probe report a limb multiplier of 0.000');
 
-      for (const zone of ['head', 'body', 'limb']) {
-        report.measure(`${zone} damage multiplier, from health deltas`, m[zone], 'x',
-          `${z.n[zone]} rays; median ${f2(median(z.byZone[zone].map((p) => p.applied)))} HP lost against `
-          + `${f2(z.arrived[zone])} HP arriving`);
+      const zoneOk = report.reached('every zone has a multiplier to report', allOf(m.head, m.body, m.limb),
+        `3 zones over ${usable} usable rays — head ${z.n.head}, body ${z.n.body}, limb ${z.n.limb}`);
+      if (zoneOk) {
+        for (const zone of ['head', 'body', 'limb']) {
+          report.measure(`${zone} damage multiplier, from health deltas`, m[zone], 'x',
+            `${z.n[zone]} rays; median ${f2(median(z.byZone[zone].map((p) => p.applied)))} HP lost against `
+            + `${f2(z.arrived[zone])} HP arriving`);
+        }
       }
 
       // The head multiplier IS sourced for the weapon this game models, and the
@@ -1460,8 +1783,13 @@ export default async function run(sim, report) {
       // over, where gameplay-ballistics.mjs measures it down its own shot path.
       // Two routes to a sourced number is not duplication, it is the only way to
       // notice that one of the routes is broken.
-      report.against('headshot multiplier, from enemy health deltas', m.head,
-        'damage', 'm4a1_mw2019_headshot_multiplier');
+      // Guarded by the same row: against() refuses a non-finite measurement for the
+      // same reason measure() does, and a zone nobody hit would take the suite down
+      // here just as surely.
+      if (zoneOk) {
+        report.against('headshot multiplier, from enemy health deltas', m.head,
+          'damage', 'm4a1_mw2019_headshot_multiplier');
+      }
 
       // A real comparison rather than 1/1: the HP the target lost against the HP
       // the round arrived with. A body hit is the reference because the shooter
