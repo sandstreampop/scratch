@@ -653,15 +653,7 @@ updateOrbits(0);
 const cam = {
   pos: [0,0,0], yaw: 0, pitch: 0, vel: [0,0,0], fov: 72*Math.PI/180,
 };
-{ // start: hanging over the night side of halcyon, sun eclipsed by the planet
-  const h = bodies[2];
-  const away = [h.pos[0], h.pos[1], h.pos[2]];
-  const l = Math.hypot(...away); away[0]/=l; away[1]/=l; away[2]/=l;
-  cam.pos = [ h.pos[0] + away[0]*h.r*3.4, h.pos[1] + h.r*1.1, h.pos[2] + away[2]*h.r*3.4 ];
-  const to = [ h.pos[0]-cam.pos[0], h.pos[1]-cam.pos[1], h.pos[2]-cam.pos[2] ];
-  cam.yaw = Math.atan2(-to[0], -to[2]);
-  cam.pitch = Math.atan2(to[1], Math.hypot(to[0],to[2]));
-}
+// starting position is set by respawn() once it's defined (below)
 const input = { x:0, y:0, up:0, boost:0, brake:0 };
 let manualInput = false;
 window.__setInput = o => { manualInput = true; Object.assign(input, o); };
@@ -830,9 +822,12 @@ const WHISPERS = [
   'the void is not hostile. it simply does not care.',
   'light itself takes hours to cross what you are looking at',
   'nothing out here has a name until you give it one. the names die with you.',
+  'if you shouted right now, the sound would travel exactly nowhere',
+  'the distance between you and anything is the only thing that grows',
+  'somewhere, the last person who remembers you is forgetting',
 ];
 let whisperT = 14, whisperIdx = 0, whisperLock = 0;
-let lookSunT = 0, lookBHT = 0, sunCD = 0, bhCD = 0, beltCD = 0;
+let lookSunT = 0, lookBHT = 0, lookHomeT = 0, sunCD = 0, bhCD = 0, beltCD = 0, homeCD = 0, probeCD = 0;
 function whisper(text, hold) {
   const w = $('whisper');
   w.textContent = text;
@@ -842,10 +837,19 @@ function whisper(text, hold) {
 }
 function updateWhispers(dt, ctx) {
   if (death.state) return;
-  whisperLock -= dt; sunCD -= dt; bhCD -= dt; beltCD -= dt;
+  whisperLock -= dt; sunCD -= dt; bhCD -= dt; beltCD -= dt; homeCD -= dt; probeCD -= dt;
   // staring at things long enough earns a reply
   lookSunT = (ctx.lookSun && ctx.sunDist > 2.5e6) ? lookSunT + dt : 0;
   lookBHT  = (ctx.lookBH && ctx.bhDist > 1.5e7)  ? lookBHT + dt  : 0;
+  lookHomeT = (ctx.lookHome && ctx.homeDist > 2.2e7) ? lookHomeT + dt : 0;
+  if (ctx.probeDist < 7e4 && probeCD <= 0) {
+    whisper('someone built this. someone waited years for it to call home. both are dust.', 11);
+    probeCD = 600; whisperT = 60; return;
+  }
+  if (lookHomeT > 2.6 && homeCD <= 0) {
+    whisper('everything you have ever loved is on that dot. from here it does not even flicker.', 11);
+    homeCD = 260; whisperT = 55; lookHomeT = 0; return;
+  }
   if (lookSunT > 2.6 && sunCD <= 0) {
     whisper('it has been burning for four billion years. it will not notice when you stop.', 10);
     sunCD = 220; whisperT = 50; lookSunT = 0; return;
@@ -907,10 +911,12 @@ function beginDeath(cause) {
   $('hud').style.opacity = 0; $('labels').style.opacity = 0;
 }
 function respawn() {
+  // hang over home's terminator: night side below, a lit crescent on the limb
   const h = bodies[2];
-  const away = [h.pos[0], h.pos[1], h.pos[2]];
-  const l = Math.hypot(...away); away[0]/=l; away[1]/=l; away[2]/=l;
-  cam.pos = [h.pos[0]+away[0]*h.r*3.4, h.pos[1]+h.r*1.1, h.pos[2]+away[2]*h.r*3.4];
+  const a = [h.pos[0], h.pos[1], h.pos[2]];
+  const l = Math.hypot(...a); a[0]/=l; a[1]/=l; a[2]/=l;
+  // y-lift of 1.1r at 3.4r range puts the sun exactly cresting the planet's limb
+  cam.pos = [h.pos[0]+a[0]*h.r*3.4, h.pos[1]+h.r*1.1, h.pos[2]+a[2]*h.r*3.4];
   cam.vel = [0,0,0];
   const to = [h.pos[0]-cam.pos[0], h.pos[1]-cam.pos[1], h.pos[2]-cam.pos[2]];
   cam.yaw = Math.atan2(-to[0], -to[2]); cam.pitch = Math.atan2(to[1], Math.hypot(to[0],to[2]));
@@ -947,9 +953,12 @@ function updateDeath(dt) {
   }
 }
 window.__death = () => ({ ...death });
+respawn();   // initial spawn uses the same composition as every rebirth
 
 // ---------------------------------------------------------- comet
 const COMET = { name:'wanderer', a:1.35e7, e:0.82, om:2.6e-5, tilt:0.22, ph:2.1, pos:[0,0,0] };
+// a dead relay probe, still on station, still catching the light
+const PROBE = { name:'relay 7', a:7.9e6, ph:4.9, om:3.3e-5, pos:[0,0,0] };
 function updateComet(t) {
   const E = COMET.ph + COMET.om*t;
   const a = COMET.a, e = COMET.e, b = a*Math.sqrt(1-e*e);
@@ -957,6 +966,10 @@ function updateComet(t) {
   COMET.pos[0] = x;
   COMET.pos[1] = z*Math.sin(COMET.tilt);
   COMET.pos[2] = z*Math.cos(COMET.tilt);
+  const P = PROBE.ph + PROBE.om*t;
+  PROBE.pos[0] = Math.cos(P)*PROBE.a;
+  PROBE.pos[1] = 4e4*Math.sin(t*8e-5 + 2.0);
+  PROBE.pos[2] = Math.sin(P)*PROBE.a;
 }
 updateComet(0);
 const N_TAIL = 620;
@@ -1196,6 +1209,27 @@ function draw(t) {
     }
   }
 
+  // the dead probe: a glint that catches the sun as it tumbles
+  {
+    const pRel = rel(PROBE.pos);
+    const pD = Math.hypot(...pRel);
+    if (pD < 4e5) {
+      const blink = 1.1 + 2.6*Math.pow(Math.max(Math.sin(t*0.62), 0), 18);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false);
+      gl.useProgram(pGlow.p);
+      gl.uniformMatrix4fv(pGlow.u.uProj, false, proj);
+      gl.uniformMatrix3fv(pGlow.u.uView, false, view);
+      gl.uniform1f(pGlow.u.uLogF, LOGF);
+      gl.uniform3fv(pGlow.u.uRel, pRel);
+      gl.uniform1f(pGlow.u.uSize, 170);
+      gl.uniform3f(pGlow.u.uColor, 0.55*blink, 0.6*blink, 0.7*blink);
+      gl.uniform1f(pGlow.u.uHollow, 0.0);
+      gl.bindVertexArray(quadVao);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); drawCount++;
+      gl.depthMask(true); gl.disable(gl.BLEND);
+    }
+  }
+
   // atmosphere shells (additive)
   gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false);
   gl.enable(gl.CULL_FACE); gl.cullFace(gl.FRONT);
@@ -1334,7 +1368,7 @@ let last = 0, simT = 0, fpsAcc = 0, fpsN = 0, hudT = 0, adaptT = 0;
 function nearestBody() {
   let best=null, bd=Infinity;
   const all = [{name:SUN.name, pos:SUN.pos, r:SUN.r}, ...bodies, {name:BH.name, pos:BH.pos, r:BH.r},
-    {name:COMET.name, pos:COMET.pos, r:30}];
+    {name:COMET.name, pos:COMET.pos, r:30}, {name:PROBE.name, pos:PROBE.pos, r:0.02}];
   for (const b of all) {
     const d = Math.hypot(b.pos[0]-cam.pos[0], b.pos[1]-cam.pos[1], b.pos[2]-cam.pos[2]) - b.r;
     if (d < bd) { bd = d; best = b; }
@@ -1405,7 +1439,11 @@ function step(dt) {
   const lookSun = (-(fx*cam.pos[0]+fy*cam.pos[1]+fz*cam.pos[2])/Math.max(sunDist,1)) > 0.9987;
   const lookBH = ((fx*(BH.pos[0]-cam.pos[0])+fy*(BH.pos[1]-cam.pos[1])+fz*(BH.pos[2]-cam.pos[2]))/Math.max(bhDist,1)) > 0.9987;
   const inBelt = Math.abs(Math.hypot(cam.pos[0],cam.pos[2]) - BELT_R) < 1.3e6 && Math.abs(cam.pos[1]) < 4.5e5;
-  updateWhispers(dt, { speedC: sp/C_KM, nearDist: near.dist, sunDist, bhDist, lookSun, lookBH, inBelt });
+  const h = bodies[2];
+  const homeDist = Math.hypot(h.pos[0]-cam.pos[0], h.pos[1]-cam.pos[1], h.pos[2]-cam.pos[2]);
+  const lookHome = ((fx*(h.pos[0]-cam.pos[0])+fy*(h.pos[1]-cam.pos[1])+fz*(h.pos[2]-cam.pos[2]))/Math.max(homeDist,1)) > 0.99965;
+  const probeDist = Math.hypot(PROBE.pos[0]-cam.pos[0], PROBE.pos[1]-cam.pos[1], PROBE.pos[2]-cam.pos[2]);
+  updateWhispers(dt, { speedC: sp/C_KM, nearDist: near.dist, sunDist, bhDist, lookSun, lookBH, inBelt, lookHome, homeDist, probeDist });
   updateAudio(dt, { bhDist, novaBright: nova.bright });
   return { near, sp };
 }
@@ -1417,7 +1455,8 @@ function updateHud(st) {
   buildView();
   // the black hole's *visible* footprint (lensed disk) is ~5x its horizon
   const targets = [{name:SUN.name,pos:SUN.pos,r:SUN.r},...bodies.filter(b=>b.parent===undefined),
-    {name:BH.name,pos:BH.pos,r:BH.r*5.5},{name:COMET.name,pos:COMET.pos,r:9000}];
+    {name:BH.name,pos:BH.pos,r:BH.r*5.5},{name:COMET.name,pos:COMET.pos,r:9000},
+    {name:PROBE.name,pos:PROBE.pos,r:400,maxD:3.5e5}];
   const cand = [];
   for (const b of targets) {
     const r = rel(b.pos);
@@ -1429,6 +1468,7 @@ function updateHud(st) {
     const ang = b.r/d;
     el.style.opacity = 0;
     if (vz > -NEAR || ang > 0.045) continue;
+    if (b.maxD && d > b.maxD) continue;
     const px = proj[0]*vx/-vz, py = proj[5]*vy/-vz;
     if (px < -0.88 || px > 0.88 || py < -0.86 || py > 0.9) continue;
     const pxR = ang / (2*Math.tan(cam.fov/2)) * H;      // body's on-screen radius
