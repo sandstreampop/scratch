@@ -41,6 +41,9 @@
   #brake { bottom:calc(20px + env(safe-area-inset-bottom)); width:60px; height:60px; line-height:60px; right:calc(26px + env(safe-area-inset-right)); }
   #scream { bottom:calc(186px + env(safe-area-inset-bottom)); width:56px; height:56px; line-height:56px;
     right:calc(28px + env(safe-area-inset-right)); font-size:8px; opacity:.7; }
+  @media (max-height: 480px) {   /* landscape phones: keep whispers off the thumb controls */
+    #whisper { bottom:10%; padding:0 22%; font-size:12px; }
+  }
   #start { position:absolute; inset:0; background:radial-gradient(ellipse at 50% 45%, #05060a 0%, #000 75%);
     display:flex; flex-direction:column; align-items:center; justify-content:center; z-index:10;
     color:#cdd3e0; font:300 13px/2 -apple-system,'Helvetica Neue',sans-serif; letter-spacing:.14em;
@@ -465,11 +468,22 @@ void main(){
   gl_Position = uProj * vec4(v*100.0, 1.0);
   gl_Position.z = gl_Position.w * 0.99999;
 }`;
-const FS_SKY = NOISE + `
-in vec3 vDir;
+// the nebula is static in direction-space: bake it to a cubemap once at boot
+// instead of paying 27 noise evaluations per pixel per frame
+const FS_SKY_BAKE = NOISE + `
+in vec2 vUv;
+uniform int uFace;
 out vec4 o;
+vec3 faceDir(int f, vec2 c){
+  if (f==0) return vec3( 1.0, -c.y, -c.x);
+  if (f==1) return vec3(-1.0, -c.y,  c.x);
+  if (f==2) return vec3( c.x,  1.0,  c.y);
+  if (f==3) return vec3( c.x, -1.0, -c.y);
+  if (f==4) return vec3( c.x, -c.y,  1.0);
+  return vec3(-c.x, -c.y, -1.0);
+}
 void main(){
-  vec3 d = normalize(vDir);
+  vec3 d = normalize(faceDir(uFace, vUv*2.0-1.0));
   vec3 gN = normalize(vec3(0.31,0.87,0.38));
   float band = exp(-pow(dot(d,gN),2.0)*16.0);
   float neb = fbm3(d*4.0)*fbm3(d*9.0+3.7);
@@ -479,6 +493,11 @@ void main(){
   col += vec3(0.03,0.02,0.05) * pow(fbm3(d*2.5+31.0),2.0)*0.6;
   o = vec4(col, 1.0);
 }`;
+const FS_SKY = `
+in vec3 vDir;
+uniform lowp samplerCube uSky;
+out vec4 o;
+void main(){ o = vec4(texture(uSky, normalize(vDir)).rgb, 1.0); }`;
 
 const VS_GLOW = `
 layout(location=0) in vec2 aPos;
@@ -517,23 +536,23 @@ uniform float uBHr;      // photon-sphere screen radius (uv units, aspect-correc
 uniform float uBHon;
 uniform vec2 uAspect;
 uniform float uTime; uniform float uFlash;
-uniform vec2 uSun; uniform float uSunI;
+uniform vec2 uSun; uniform float uSunI; uniform float uBHfront;
 uniform float uDark; uniform float uWhite;
 out vec4 o;
 vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0); }
 void main(){
   vec2 uv = vUv;
   vec3 col;
-  if (uBHon > 0.5) {
+  if (uBHon > 0.001) {
     vec2 d = (uv - uBH) * uAspect;
     float r = length(d);
     float rs = uBHr;
-    float pull = min(rs*rs / max(r, 1e-4) * 1.35, rs*2.2);
+    float pull = min(rs*rs / max(r, 1e-4) * 1.35, rs*2.2) * uBHon;
     float infl = smoothstep(rs*14.0, rs*2.0, r);
     vec2 dir = d / max(r, 1e-5);
     vec2 warp = dir * pull * infl;
     // frame-dragging twist
-    float tw = 0.55 * rs / max(r, rs) * infl;
+    float tw = 0.55 * rs / max(r, rs) * infl * uBHon;
     vec2 dirT = vec2(-dir.y, dir.x);
     vec2 suv = uv - (warp + dirT * tw * rs) / uAspect;
     float ca = min(pull, rs) * smoothstep(rs*5.0, rs*1.2, r) * 0.05;
@@ -541,10 +560,10 @@ void main(){
     col.g = texture(uTex, suv).g;
     col.b = texture(uTex, suv + dir*ca/uAspect).b;
     // event horizon + photon ring
-    float hole = smoothstep(rs*1.02, rs*0.92, r);
+    float hole = smoothstep(rs*1.02, rs*0.92, r) * uBHon;
     col = mix(col, vec3(0.0), hole);
     float ring = exp(-pow((r-rs*1.08)/(rs*0.07), 2.0));
-    col += vec3(1.0,0.82,0.6) * ring * 1.8;
+    col += vec3(1.0,0.82,0.6) * ring * 1.8 * uBHon;
   } else {
     col = texture(uTex, uv).rgb;
   }
@@ -554,6 +573,11 @@ void main(){
             + texture(uTex, uSun-vec2(0.004,0.0)).rgb;
     float lum = dot(sc, vec3(0.33));
     float vis = smoothstep(1.6, 3.6, lum) * uSunI;
+    if (uBHon > 0.001 && uBHfront > 0.5) {
+      // no glare from behind an event horizon (only when the hole is nearer)
+      float rsun = length((uSun - uBH) * uAspect);
+      vis *= mix(1.0, smoothstep(uBHr*1.05, uBHr*1.7, rsun), uBHon);
+    }
     if (vis > 0.001) {
       vec2 sd = (vUv - uSun) * uAspect;
       float sr = length(sd);
@@ -586,6 +610,32 @@ const pBelt = prog(VS_BELT, FS_BELT);
 const pSky  = prog(VS_SKY, FS_SKY);
 const pGlow = prog(VS_GLOW, FS_GLOW);
 const pPost = prog(VS_POST, FS_POST);
+const pSkyBake = prog(VS_POST, FS_SKY_BAKE);
+
+// bake the sky cubemap once
+const skyCube = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_CUBE_MAP, skyCube);
+for (let f=0; f<6; f++)
+  gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X+f, 0, gl.RGBA8, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+{
+  const bf = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bf);
+  gl.viewport(0, 0, 256, 256);
+  gl.useProgram(pSkyBake.p);
+  gl.bindVertexArray(quadVao);
+  for (let f=0; f<6; f++) {
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_CUBE_MAP_POSITIVE_X+f, skyCube, 0);
+    gl.uniform1i(pSkyBake.u.uFace, f);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  gl.bindVertexArray(null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.deleteFramebuffer(bf);
+}
 
 // ---------------------------------------------------------- framebuffer
 let fbo=null, fboTex=null, fboDepth=null, fboW=0, fboH=0;
@@ -641,7 +691,8 @@ const BH = { name:'gorgon', pos:[9.5e7, 6e6, -6.5e7], r:52000,   // ~6.5 light-m
   disk:{ r0:2.6, r1:11.0, tiltX:0.35, tiltZ:0.15 } };
 BH.dist0 = Math.hypot(BH.pos[0], BH.pos[1], BH.pos[2]);
 
-for (const b of bodies) { b.pos=[0,0,0]; }
+for (const b of bodies) { b.pos=[0,0,0]; if (b.ring) b.ring.mat = mat3TiltXZ(b.ring.tiltX, b.ring.tiltZ); }
+BH.disk.mat = mat3TiltXZ(BH.disk.tiltX, BH.disk.tiltZ);
 function updateOrbits(t) {
   for (const b of bodies) {
     const th = b.ph + b.om*t;
@@ -677,20 +728,21 @@ const isTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
 $('hintTouch').style.display = isTouch ? '' : 'none';
 $('hintKeys').style.display  = isTouch ? 'none' : '';
 
-// keyboard
+// keyboard and touch each write their own channel set; the merged view is
+// rebuilt every frame, so an iPad user can hold the stick AND press shift.
 const keys = {};
+const tin = { x:0, y:0, up:0, boost:0, brake:0 };   // touch-owned inputs
 addEventListener('keydown', e => { keys[e.code]=1; if(e.code==='Space') e.preventDefault(); });
 addEventListener('keyup',   e => { keys[e.code]=0; });
-function pollKeys() {
-  if (manualInput || (isTouch && !anyKey)) return;
-  input.x = (keys.KeyD?1:0) - (keys.KeyA?1:0);
-  input.y = (keys.KeyW?1:0) - (keys.KeyS?1:0);
-  input.up = (keys.Space?1:0) - ((keys.ControlLeft||keys.KeyC)?1:0);
-  input.boost = keys.ShiftLeft||keys.ShiftRight?1:0;
-  input.brake = keys.KeyX?1:0;
+const clamp1 = v => Math.max(-1, Math.min(1, v));
+function gatherInput() {
+  if (manualInput) return;
+  input.x = clamp1(((keys.KeyD?1:0) - (keys.KeyA?1:0)) + tin.x);
+  input.y = clamp1(((keys.KeyW?1:0) - (keys.KeyS?1:0)) + tin.y);
+  input.up = clamp1(((keys.Space?1:0) - ((keys.ControlLeft||keys.KeyC)?1:0)) + tin.up);
+  input.boost = (keys.ShiftLeft||keys.ShiftRight) ? 1 : tin.boost;
+  input.brake = keys.KeyX ? 1 : tin.brake;
 }
-let anyKey = false;
-addEventListener('keydown', () => anyKey = true, { once:true });
 
 // mouse look (desktop)
 canvas.addEventListener('click', () => {
@@ -731,7 +783,7 @@ function onTouchMove(e) {
       const l = Math.hypot(dx,dy), m = 52;
       if (l > m) { dx = dx/l*m; dy = dy/l*m; }
       knob.style.left = (33+dx)+'px'; knob.style.top = (33+dy)+'px';
-      input.x = dx/m; input.y = -dy/m;
+      tin.x = dx/m; tin.y = -dy/m;
     } else if (t.identifier === lookId) {
       cam.yaw   -= (t.clientX - lookX) * 0.0042;
       cam.pitch -= (t.clientY - lookY) * 0.0042;
@@ -742,7 +794,7 @@ function onTouchMove(e) {
 }
 function onTouchEnd(e) {
   for (const t of e.changedTouches) {
-    if (t.identifier === stickId) { stickId=-1; input.x=0; input.y=0; stick.style.display='none'; }
+    if (t.identifier === stickId) { stickId=-1; tin.x=0; tin.y=0; stick.style.display='none'; }
     if (t.identifier === lookId) lookId=-1;
   }
 }
@@ -751,9 +803,9 @@ canvas.addEventListener('touchmove',  onTouchMove,  { passive:false });
 canvas.addEventListener('touchend',   onTouchEnd);
 canvas.addEventListener('touchcancel',onTouchEnd);
 function bindBtn(el, prop) {
-  el.addEventListener('touchstart', e => { e.preventDefault(); input[prop]=1; el.classList.add('held'); }, { passive:false });
-  el.addEventListener('touchend',   e => { e.preventDefault(); input[prop]=0; el.classList.remove('held'); });
-  el.addEventListener('touchcancel',e => { input[prop]=0; el.classList.remove('held'); });
+  el.addEventListener('touchstart', e => { e.preventDefault(); tin[prop]=1; el.classList.add('held'); }, { passive:false });
+  el.addEventListener('touchend',   e => { e.preventDefault(); tin[prop]=0; el.classList.remove('held'); });
+  el.addEventListener('touchcancel',e => { tin[prop]=0; el.classList.remove('held'); });
 }
 bindBtn($('boost'), 'boost'); bindBtn($('brake'), 'brake');
 $('scream').addEventListener('touchstart', e => { e.preventDefault(); doScream(); }, { passive:false });
@@ -833,7 +885,7 @@ window.__scream = doScream;
 let thrustLvl = 0;
 function updateAudio(dt, ctx) {
   screamCD -= dt;
-  if (!AC) return;
+  if (!AC || !thrustGain || !thrustFilter) return;   // audio graph may have failed mid-init
   const want = Math.min(1, Math.hypot(input.x, input.y, input.up) + input.boost*0.6) * 0.22;
   thrustLvl += (want - thrustLvl) * Math.min(1, dt*3);
   thrustGain.gain.value = thrustLvl;
@@ -909,6 +961,8 @@ function updateWhispers(dt, ctx) {
 // ---------------------------------------------------------- supernova
 const nova = { state:0, t:0, dir:[0.5,0.25,-0.82], next:110, bright:0, size:0 };
 function updateNova(t, dt) {
+  // a nova due while dead is pushed back so it never lands on the respawn beat
+  if (death.state) nova.next = Math.max(nova.next, t + 30);
   if (nova.state === 0 && t > nova.next) {
     nova.state = 1; nova.t = 0;
     const a = Math.random()*Math.PI*2, b = (Math.random()-0.5)*1.6;
@@ -984,7 +1038,10 @@ function updateDeath(dt) {
     $('hud').style.opacity = 1; $('labels').style.opacity = 1;
     respawn();
     if (AC && masterGain) masterGain.gain.linearRampToValueAtTime(0.55, AC.currentTime+4);
-    setTimeout(() => whisper('again.', 6), 3000);
+    clearTimeout(updateDeath._again);
+    updateDeath._again = setTimeout(() => {
+      if (!death.state && !$('whisper').classList.contains('on')) whisper('again.', 6);
+    }, 3000);
   }
 }
 window.__death = () => ({ ...death });
@@ -1067,10 +1124,12 @@ let W=0, H=0, renderScale = Math.min(devicePixelRatio||1, 2), started=false;
 function resize() {
   W = innerWidth; H = innerHeight;
   const w = Math.round(W*renderScale), h = Math.round(H*renderScale);
+  if (fbo && canvas.width === w && canvas.height === h) return;   // don't wipe the buffer for nothing
   canvas.width = w; canvas.height = h;
   ensureFbo(w, h);
 }
-addEventListener('resize', () => setTimeout(resize, 60));
+let resizeTO = 0;
+addEventListener('resize', () => { clearTimeout(resizeTO); resizeTO = setTimeout(resize, 80); });
 resize();
 
 function persp(out, fovy, asp, n, f) {
@@ -1081,6 +1140,7 @@ function persp(out, fovy, asp, n, f) {
 }
 const proj = new Float32Array(16);
 const view = new Float32Array(9);
+const VIEW_RET = [0,0,0, 0,0,0, 0,0,0];   // reused scratch — consume before the next call
 function buildView() {
   const cy=Math.cos(cam.yaw), sy=Math.sin(cam.yaw), cp=Math.cos(cam.pitch), sp=Math.sin(cam.pitch);
   // rows of R^T where R = Ry(yaw)*Rx(pitch): view = transpose(rotation of camera)
@@ -1092,7 +1152,10 @@ function buildView() {
   view[0]=rx; view[3]=ry; view[6]=rz;
   view[1]=upx; view[4]=upy; view[7]=upz;
   view[2]=-fx; view[5]=-fy; view[8]=-fz;
-  return [fx,fy,fz, rx,ry,rz, upx,upy,upz];
+  VIEW_RET[0]=fx; VIEW_RET[1]=fy; VIEW_RET[2]=fz;
+  VIEW_RET[3]=rx; VIEW_RET[4]=ry; VIEW_RET[5]=rz;
+  VIEW_RET[6]=upx; VIEW_RET[7]=upy; VIEW_RET[8]=upz;
+  return VIEW_RET;
 }
 
 function rel(p) { return [p[0]-cam.pos[0], p[1]-cam.pos[1], p[2]-cam.pos[2]]; }
@@ -1104,6 +1167,7 @@ function mat3TiltXZ(tx, tz) {
 const IDENT3 = new Float32Array([1,0,0, 0,1,0, 0,0,1]);
 
 let drawCount = 0;
+const VD = [0,0,0];
 function draw(t) {
   drawCount = 0;
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -1114,18 +1178,23 @@ function draw(t) {
   persp(proj, cam.fov, fboW/fboH, NEAR, FAR);
   buildView();
 
-  // sky
+  // sky (pre-baked cubemap)
   gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   gl.useProgram(pSky.p);
   gl.uniformMatrix4fv(pSky.u.uProj, false, proj);
   gl.uniformMatrix3fv(pSky.u.uView, false, view);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_CUBE_MAP, skyCube);
+  gl.uniform1i(pSky.u.uSky, 0);
   gl.bindVertexArray(sphereLo.v);
   gl.drawElements(gl.TRIANGLES, sphereLo.n, gl.UNSIGNED_SHORT, 0); drawCount++;
 
   // stars, aberrated by velocity
   const spd = Math.hypot(...cam.vel);
   const aber = Math.min(spd/C_KM*0.30, 0.82);
-  const vd = spd > 1 ? [cam.vel[0]/spd*aber, cam.vel[1]/spd*aber, cam.vel[2]/spd*aber] : [0,0,0];
+  if (spd > 1) { VD[0]=cam.vel[0]/spd*aber; VD[1]=cam.vel[1]/spd*aber; VD[2]=cam.vel[2]/spd*aber; }
+  else { VD[0]=0; VD[1]=0; VD[2]=0; }
+  const vd = VD;
   gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
   gl.useProgram(pStar.p);
   gl.uniformMatrix4fv(pStar.u.uProj, false, proj);
@@ -1303,7 +1372,7 @@ function draw(t) {
     gl.uniform3f(pRing.u.uSunDir, sd[0]/sl, sd[1]/sl, sd[2]/sl);
     gl.uniform3fv(pRing.u.uRel, r);
     gl.uniform3fv(pRing.u.uPlanetRel, r);
-    gl.uniformMatrix3fv(pRing.u.uModel, false, mat3TiltXZ(b.ring.tiltX, b.ring.tiltZ));
+    gl.uniformMatrix3fv(pRing.u.uModel, false, b.ring.mat);
     gl.uniform1f(pRing.u.uR0, b.r*b.ring.r0);
     gl.uniform1f(pRing.u.uR1, b.r*b.ring.r1);
     gl.uniform1f(pRing.u.uSeed, b.ring.seed);
@@ -1321,7 +1390,7 @@ function draw(t) {
     gl.uniformMatrix3fv(pDisk.u.uView, false, view);
     gl.uniform1f(pDisk.u.uLogF, LOGF);
     gl.uniform3fv(pDisk.u.uRel, bhRel);
-    gl.uniformMatrix3fv(pDisk.u.uModel, false, mat3TiltXZ(BH.disk.tiltX, BH.disk.tiltZ));
+    gl.uniformMatrix3fv(pDisk.u.uModel, false, BH.disk.mat);
     gl.uniform1f(pDisk.u.uR0, BH.r*BH.disk.r0);
     gl.uniform1f(pDisk.u.uR1, BH.r*BH.disk.r1);
     gl.uniform1f(pDisk.u.uTime, t);
@@ -1369,7 +1438,11 @@ function draw(t) {
     bhU = px*0.5+0.5; bhV = py*0.5+0.5;
     bhR = (BH.r*2.6/bhDist) / (2*Math.tan(cam.fov/2)); // photon sphere angular size / vertical fov
     if (death.state === 1 && death.cause === 'gorgon') bhR *= 1 + death.t*1.4;  // it takes the sky with it
-    if (bhU > -0.6 && bhU < 1.6 && bhV > -0.6 && bhV < 1.6 && bhR > 0.0006) bhOn = 1;
+    // fade the whole lens by how far its center sits outside the frame — no pop
+    const ox = Math.max(0, -bhU, bhU-1), oy = Math.max(0, -bhV, bhV-1);
+    const fade = Math.min(1, Math.max(0, 1 - Math.hypot(ox, oy)/(bhR*16)));
+    const tiny = Math.min(1, Math.max(0, (bhR - 0.0004)/0.0004));
+    bhOn = fade * tiny;
   }
   gl.uniform2f(pPost.u.uBH, bhU, bhV);
   gl.uniform1f(pPost.u.uBHr, bhR);
@@ -1392,6 +1465,7 @@ function draw(t) {
   }
   gl.uniform2f(pPost.u.uSun, sunU, sunV);
   gl.uniform1f(pPost.u.uSunI, sunI);
+  gl.uniform1f(pPost.u.uBHfront, bhDist < Math.hypot(sunRel[0],sunRel[1],sunRel[2]) ? 1 : 0);
   gl.uniform1f(pPost.u.uDark, death.dark);
   gl.uniform1f(pPost.u.uWhite, death.white);
   gl.bindVertexArray(quadVao);
@@ -1400,15 +1474,20 @@ function draw(t) {
 
 // ---------------------------------------------------------- sim loop
 let last = 0, simT = 0, fpsAcc = 0, fpsN = 0, hudT = 0, adaptT = 0;
+let dispMs = 16.7, probing = false, preProbe = 0, goodRun = 0;
+// static list of live references — positions mutate in place each tick
+const NEAREST_LIST = [{name:SUN.name, pos:SUN.pos, r:SUN.r}, ...bodies,
+  {name:BH.name, pos:BH.pos, r:BH.r}, {name:COMET.name, pos:COMET.pos, r:30},
+  {name:PROBE.name, pos:PROBE.pos, r:0.02}];
+const NEAREST_RET = { body:null, dist:0 };
 function nearestBody() {
   let best=null, bd=Infinity;
-  const all = [{name:SUN.name, pos:SUN.pos, r:SUN.r}, ...bodies, {name:BH.name, pos:BH.pos, r:BH.r},
-    {name:COMET.name, pos:COMET.pos, r:30}, {name:PROBE.name, pos:PROBE.pos, r:0.02}];
-  for (const b of all) {
+  for (const b of NEAREST_LIST) {
     const d = Math.hypot(b.pos[0]-cam.pos[0], b.pos[1]-cam.pos[1], b.pos[2]-cam.pos[2]) - b.r;
     if (d < bd) { bd = d; best = b; }
   }
-  return { body:best, dist:Math.max(bd, 0) };
+  NEAREST_RET.body = best; NEAREST_RET.dist = Math.max(bd, 0);
+  return NEAREST_RET;
 }
 function step(dt) {
   simT += dt;
@@ -1417,7 +1496,7 @@ function step(dt) {
   updateDeath(dt);
   const near = nearestBody();
   const bdx = BH.pos[0]-cam.pos[0], bdy = BH.pos[1]-cam.pos[1], bdz = BH.pos[2]-cam.pos[2];
-  const bhD = Math.hypot(bdx, bdy, bdz);
+  const bhD = Math.max(Math.hypot(bdx, bdy, bdz), 1);   // never divide by the singularity
   // the hole pulls. close in, your engines stop mattering.
   if (bhD < 3e6 && death.state < 2) {
     const g = 5.5e14/(bhD*bhD);
@@ -1483,9 +1562,11 @@ function step(dt) {
   return { near, sp };
 }
 
+function setText(el, s) { if (el.__t !== s) { el.__t = s; el.textContent = s; } }
 function updateHud(st) {
-  $('speed').innerHTML = fmtSpeed(st.sp);
-  $('near').textContent = st.near.body.name + ' — ' + fmtDist(st.near.dist);
+  const spTxt = fmtSpeed(st.sp);
+  if ($('speed').__t !== spTxt) { $('speed').__t = spTxt; $('speed').innerHTML = spTxt; }
+  setText($('near'), st.near.body.name + ' — ' + fmtDist(st.near.dist));
   // labels
   buildView();
   // the black hole's *visible* footprint (lensed disk) is ~5x its horizon
@@ -1520,7 +1601,7 @@ function updateHud(st) {
     c.el.style.opacity = 0.9;
     c.el.style.left = (c.x/W*100) + '%';
     c.el.style.top  = (c.y/H*100) + '%';
-    c.el.textContent = c.text;
+    setText(c.el, c.text);
   }
 }
 
@@ -1530,20 +1611,37 @@ function frame(now) {
   let dt = (now - last)/1000; last = now;
   if (dt > 0.1) dt = 0.1;
   if (dt <= 0) return;
-  pollKeys();
+  gatherInput();
   const st = step(dt);
   draw(simT);
   // metrics + adaptive resolution
   fpsAcc += dt; fpsN++;
-  hudT -= dt; adaptT -= dt;
-  if (hudT <= 0) { updateHud(st); hudT = 0.2; }
+  adaptT -= dt;
+  updateHud(st);   // every frame — labels must track their bodies at multi-c
   if (adaptT <= 0 && fpsN > 20) {
-    const avg = fpsAcc/fpsN;
-    METRICS.fps = Math.round(1/avg); METRICS.ms = +(avg*1000).toFixed(2);
+    const avgMs = fpsAcc/fpsN*1000;
+    METRICS.fps = Math.round(1000/avgMs); METRICS.ms = +avgMs.toFixed(2);
     METRICS.scale = +renderScale.toFixed(2); METRICS.draws = drawCount;
-    if (avg > 1/42 && renderScale > 0.55) { renderScale = Math.max(0.55, renderScale-0.15); resize(); }
-    else if (avg < 1/57 && renderScale < Math.min(devicePixelRatio||1, 2)) {
-      renderScale = Math.min(Math.min(devicePixelRatio||1,2), renderScale+0.1); resize(); }
+    // a frame interval alone can't distinguish "rAF-capped, GPU idle" (iOS Low
+    // Power Mode: 30 Hz) from "GPU-bound at 33 ms" — so downscaling is run as
+    // an experiment: if it doesn't make frames faster, revert and accept the
+    // observed cadence as the display rate.
+    const maxScale = Math.min(devicePixelRatio||1, 2);
+    dispMs = Math.min(dispMs, Math.max(avgMs, 6));           // rates only reveal themselves downward
+    if (probing) {
+      probing = false;
+      if (avgMs > preProbe*0.92) {                           // bought nothing: we were vsync-capped
+        renderScale = Math.min(maxScale, renderScale + 0.15);
+        dispMs = Math.max(dispMs, avgMs*0.98);
+        resize();
+      }
+    } else if (avgMs > dispMs*1.5 && renderScale > 0.55) {
+      preProbe = avgMs; probing = true; goodRun = 0;
+      renderScale = Math.max(0.55, renderScale - 0.15);
+      resize();
+    } else if (avgMs < dispMs*1.25 && renderScale < maxScale) {
+      if (++goodRun >= 3) { goodRun = 0; renderScale = Math.min(maxScale, renderScale + 0.1); resize(); }
+    } else goodRun = 0;
     fpsAcc = 0; fpsN = 0; adaptT = 2.0;
   }
 }
@@ -1557,15 +1655,22 @@ function begin() {
   $('start').classList.add('gone');
   if (isTouch) { $('boost').style.display='block'; $('brake').style.display='block'; $('scream').style.display='block'; }
   initAudio();
-  setTimeout(() => whisper('you are awake. no one else is, for a very long way.', 10), 3500);
+  setTimeout(() => {
+    if (!$('whisper').classList.contains('on')) whisper('you are awake. no one else is, for a very long way.', 10);
+  }, 3500);
 }
 $('begin').addEventListener('click', begin);
 $('begin').addEventListener('touchend', e => { e.preventDefault(); begin(); }, { passive:false });
 window.__begin = begin;
 
 document.addEventListener('visibilitychange', () => {
-  if (AC) { document.hidden ? AC.suspend() : AC.resume(); }
+  if (AC) { (document.hidden ? AC.suspend() : AC.resume()).catch(() => {}); }
 });
+// iOS can leave the context 'interrupted' after calls/Siri/lock; a resume()
+// outside a gesture may be rejected — retry inside the next touch.
+document.addEventListener('touchstart', () => {
+  if (AC && AC.state !== 'running') AC.resume().catch(() => {});
+}, { passive:true });
 canvas.addEventListener('webglcontextlost', e => {
   e.preventDefault();
   $('err').style.display='flex';
