@@ -52,6 +52,12 @@
   #begin:active { background:rgba(190,200,220,.08); }
   #err { position:absolute; inset:0; display:none; z-index:20; background:#000; color:#889;
     font:300 13px/1.8 -apple-system,sans-serif; padding:20%; text-align:center; letter-spacing:.1em; }
+  #death { position:absolute; inset:0; background:#000; opacity:0; pointer-events:none; z-index:5;
+    display:flex; align-items:center; justify-content:center; transition:opacity 2.2s ease; }
+  #death.on { opacity:1; }
+  #epitaph { color:rgba(205,210,225,.0); font:300 15px/2.1 Georgia,serif; font-style:italic;
+    letter-spacing:.18em; text-align:center; padding:0 10%; transition:color 3s ease; }
+  #death.on #epitaph { color:rgba(205,210,225,.8); }
 </style>
 </head>
 <body>
@@ -65,6 +71,7 @@
 <div id="stick"><div id="knob"></div></div>
 <div id="boost" class="btn">THRUST</div>
 <div id="brake" class="btn">HALT</div>
+<div id="death"><div id="epitaph"></div></div>
 <div id="start">
   <h1>ADRIFT</h1>
   <div class="sub">a first-person account of your own insignificance</div>
@@ -508,6 +515,7 @@ uniform float uBHon;
 uniform vec2 uAspect;
 uniform float uTime; uniform float uFlash;
 uniform vec2 uSun; uniform float uSunI;
+uniform float uDark; uniform float uWhite;
 out vec4 o;
 vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0); }
 void main(){
@@ -556,9 +564,11 @@ void main(){
   vec2 q = vUv*2.0-1.0;
   col *= 1.0 - dot(q,q)*0.16;
   col = aces(col);
+  col = mix(col, vec3(1.0), uWhite);
   // grain
   float g = fract(sin(dot(vUv*vec2(917.13,533.7)+uTime, vec2(12.9898,78.233)))*43758.5453);
   col += (g-0.5)*0.015;
+  col *= 1.0 - uDark;
   o = vec4(col, 1.0);
 }`;
 
@@ -662,7 +672,7 @@ window.__lookAt = (x,y,z) => {
   cam.yaw = Math.atan2(-to[0], -to[2]);
   cam.pitch = Math.atan2(to[1], Math.hypot(to[0], to[2]));
 };
-window.__bodies = () => ({ sun:SUN.pos, bh:BH.pos, list:bodies.map(b=>({n:b.name,p:[...b.pos],r:b.r})) });
+window.__bodies = () => ({ sun:SUN.pos, bh:BH.pos, comet:[...COMET.pos], list:bodies.map(b=>({n:b.name,p:[...b.pos],r:b.r})) });
 window.__forceNova = () => { nova.state = 0; nova.next = -1; };
 window.__novaState = () => ({ state: nova.state, t: nova.t, bright: nova.bright, dir: [...nova.dir] });
 window.__getState = () => ({ pos:[...cam.pos], yaw:cam.yaw, pitch:cam.pitch,
@@ -753,12 +763,13 @@ function bindBtn(el, prop) {
 bindBtn($('boost'), 'boost'); bindBtn($('brake'), 'brake');
 
 // ---------------------------------------------------------- audio (all procedural)
-let AC=null, droneGain=null, thrustGain=null, thrustFilter=null, bhGain=null, novaGain=null;
+let AC=null, masterGain=null, droneGain=null, thrustGain=null, thrustFilter=null, bhGain=null, novaGain=null;
 function initAudio() {
   try {
     AC = new (window.AudioContext || window.webkitAudioContext)();
     if (AC.state === 'suspended') AC.resume();
     const master = AC.createGain(); master.gain.value = 0.0; master.connect(AC.destination);
+    masterGain = master;
     // fade in slowly — waking up
     master.gain.setValueAtTime(0.0, AC.currentTime);
     master.gain.linearRampToValueAtTime(0.55, AC.currentTime + 6);
@@ -830,6 +841,7 @@ function whisper(text, hold) {
   whisper._t = setTimeout(() => w.classList.remove('on'), (hold||9)*1000);
 }
 function updateWhispers(dt, ctx) {
+  if (death.state) return;
   whisperLock -= dt; sunCD -= dt; bhCD -= dt; beltCD -= dt;
   // staring at things long enough earns a reply
   lookSunT = (ctx.lookSun && ctx.sunDist > 2.5e6) ? lookSunT + dt : 0;
@@ -874,6 +886,116 @@ function updateNova(t, dt) {
     if (T > 48) { nova.state = 0; nova.next = t + 240 + Math.random()*260; nova.bright = 0; }
   }
 }
+
+// ---------------------------------------------------------- death
+const EPITAPHS = {
+  gorgon: [
+    'your mass has joined it. nothing else about the universe has changed.',
+    'you crossed a line that does not know it is a line.',
+  ],
+  furnace: [
+    'in eight light-minutes, home will register a flicker. no one will be looking.',
+    'the furnace did not notice. matter is matter.',
+  ],
+};
+const death = { state:0, t:0, cause:'', dark:1, white:0 };
+let capWhispered = false;
+function beginDeath(cause) {
+  if (death.state) return;
+  death.state = 1; death.t = 0; death.cause = cause;
+  clearTimeout(whisper._t); $('whisper').classList.remove('on');
+  $('hud').style.opacity = 0; $('labels').style.opacity = 0;
+}
+function respawn() {
+  const h = bodies[2];
+  const away = [h.pos[0], h.pos[1], h.pos[2]];
+  const l = Math.hypot(...away); away[0]/=l; away[1]/=l; away[2]/=l;
+  cam.pos = [h.pos[0]+away[0]*h.r*3.4, h.pos[1]+h.r*1.1, h.pos[2]+away[2]*h.r*3.4];
+  cam.vel = [0,0,0];
+  const to = [h.pos[0]-cam.pos[0], h.pos[1]-cam.pos[1], h.pos[2]-cam.pos[2]];
+  cam.yaw = Math.atan2(-to[0], -to[2]); cam.pitch = Math.atan2(to[1], Math.hypot(to[0],to[2]));
+  capWhispered = false;
+}
+function updateDeath(dt) {
+  if (!death.state) {
+    death.dark = Math.max(0, death.dark - dt/3.5);   // waking / rebirth fade-in
+    death.white = Math.max(0, death.white - dt*0.5);
+    return;
+  }
+  death.t += dt;
+  if (death.state === 1) {
+    if (death.cause === 'gorgon') {
+      death.dark = Math.min(1, death.t/3.4);
+      cam.yaw   += (Math.random()-0.5)*0.0045*death.t;   // tidal shudder
+      cam.pitch += (Math.random()-0.5)*0.0045*death.t;
+    } else death.white = Math.min(1, death.t/1.6);
+    if (death.t > (death.cause === 'gorgon' ? 3.6 : 1.8)) {
+      death.state = 2; death.t = 0;
+      death.white = 0; death.dark = 1;
+      const list = EPITAPHS[death.cause] || EPITAPHS.gorgon;
+      $('epitaph').textContent = list[Math.floor(Math.random()*list.length)];
+      $('death').classList.add('on');
+      if (AC && masterGain) masterGain.gain.linearRampToValueAtTime(0.05, AC.currentTime+2.5);
+    }
+  } else if (death.state === 2 && death.t > 7.5) {
+    death.state = 0; death.t = 0; death.dark = 1;
+    $('death').classList.remove('on');
+    $('hud').style.opacity = 1; $('labels').style.opacity = 1;
+    respawn();
+    if (AC && masterGain) masterGain.gain.linearRampToValueAtTime(0.55, AC.currentTime+4);
+    setTimeout(() => whisper('again.', 6), 3000);
+  }
+}
+window.__death = () => ({ ...death });
+
+// ---------------------------------------------------------- comet
+const COMET = { name:'wanderer', a:1.35e7, e:0.82, om:2.6e-5, tilt:0.22, ph:2.1, pos:[0,0,0] };
+function updateComet(t) {
+  const E = COMET.ph + COMET.om*t;
+  const a = COMET.a, e = COMET.e, b = a*Math.sqrt(1-e*e);
+  const x = a*(Math.cos(E)-e), z = b*Math.sin(E);
+  COMET.pos[0] = x;
+  COMET.pos[1] = z*Math.sin(COMET.tilt);
+  COMET.pos[2] = z*Math.cos(COMET.tilt);
+}
+updateComet(0);
+const N_TAIL = 620;
+const tailBuf = new Float32Array(N_TAIL*3);
+for (let i=0;i<N_TAIL;i++) {
+  tailBuf[i*3]   = Math.pow(Math.random(), 1.6);        // along
+  tailBuf[i*3+1] = (Math.random()*2-1);                 // jitter a
+  tailBuf[i*3+2] = (Math.random()*2-1);                 // jitter b
+}
+const tailVao = gl.createVertexArray(); gl.bindVertexArray(tailVao);
+const tb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, tb);
+gl.bufferData(gl.ARRAY_BUFFER, tailBuf, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,12,0);
+gl.bindVertexArray(null);
+const VS_TAIL = `
+layout(location=0) in vec3 aT;   // along, jitterA, jitterB
+uniform mat4 uProj; uniform mat3 uView; uniform float uLogF;
+uniform vec3 uNucleus; uniform vec3 uDir; uniform vec3 uPA; uniform vec3 uPB;
+uniform float uLen; uniform float uH;
+out float vA;
+void main(){
+  float along = aT.x;
+  vec3 w = uNucleus + uDir*(along*uLen) + (uPA*aT.y + uPB*aT.z)*(along*uLen*0.14 + 900.0);
+  float d = length(w);
+  gl_Position = uProj * vec4(uView * w, 1.0);
+  ${''}${LOGDEPTH}
+  gl_PointSize = clamp((uLen*0.028)/max(d,1.0)*uH, 1.0, 5.5);
+  vA = (1.0-along)*(1.0-along) * 0.32;
+}`;
+const FS_TAIL = `
+in float vA;
+out vec4 o;
+void main(){
+  vec2 dd = gl_PointCoord*2.0-1.0;
+  float r = dot(dd,dd);
+  if (r > 1.0) discard;
+  o = vec4(vec3(0.55,0.75,1.0) * vA * exp(-r*2.5), 1.0);
+}`;
+const pTail = prog(VS_TAIL, FS_TAIL);
 
 // ---------------------------------------------------------- HUD
 function fmtDist(km) {
@@ -1035,6 +1157,45 @@ function draw(t) {
     }
   }
 
+  // comet: ion tail streaming away from the sun
+  {
+    const comRel = rel(COMET.pos);
+    const comD = Math.hypot(...comRel);
+    const comSunD = Math.hypot(...COMET.pos);
+    const tailLen = Math.min(2.2e6, 9e5 * Math.max(0.15, 4.5e6/comSunD));
+    if (tailLen/comD > 0.0015) {
+      const td = [COMET.pos[0]/comSunD, COMET.pos[1]/comSunD, COMET.pos[2]/comSunD];
+      let pa = [-td[1], td[0], 0]; let pl = Math.hypot(...pa);
+      if (pl < 0.01) { pa = [1,0,0]; pl = 1; }
+      pa = [pa[0]/pl, pa[1]/pl, pa[2]/pl];
+      const pb = [td[1]*pa[2]-td[2]*pa[1], td[2]*pa[0]-td[0]*pa[2], td[0]*pa[1]-td[1]*pa[0]];
+      gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false);
+      gl.useProgram(pTail.p);
+      gl.uniformMatrix4fv(pTail.u.uProj, false, proj);
+      gl.uniformMatrix3fv(pTail.u.uView, false, view);
+      gl.uniform1f(pTail.u.uLogF, LOGF);
+      gl.uniform3fv(pTail.u.uNucleus, comRel);
+      gl.uniform3fv(pTail.u.uDir, td);
+      gl.uniform3fv(pTail.u.uPA, pa);
+      gl.uniform3fv(pTail.u.uPB, pb);
+      gl.uniform1f(pTail.u.uLen, tailLen);
+      gl.uniform1f(pTail.u.uH, fboH);
+      gl.bindVertexArray(tailVao);
+      gl.drawArrays(gl.POINTS, 0, N_TAIL); drawCount++;
+      gl.useProgram(pGlow.p);
+      gl.uniformMatrix4fv(pGlow.u.uProj, false, proj);
+      gl.uniformMatrix3fv(pGlow.u.uView, false, view);
+      gl.uniform1f(pGlow.u.uLogF, LOGF);
+      gl.uniform3fv(pGlow.u.uRel, comRel);
+      gl.uniform1f(pGlow.u.uSize, tailLen*0.045);
+      gl.uniform3f(pGlow.u.uColor, 0.5, 0.68, 0.9);
+      gl.uniform1f(pGlow.u.uHollow, 0.0);
+      gl.bindVertexArray(quadVao);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); drawCount++;
+      gl.depthMask(true); gl.disable(gl.BLEND);
+    }
+  }
+
   // atmosphere shells (additive)
   gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false);
   gl.enable(gl.CULL_FACE); gl.cullFace(gl.FRONT);
@@ -1138,6 +1299,7 @@ function draw(t) {
     const px = proj[0]*vx / -vz, py = proj[5]*vy / -vz;
     bhU = px*0.5+0.5; bhV = py*0.5+0.5;
     bhR = (BH.r*2.6/bhDist) / (2*Math.tan(cam.fov/2)); // photon sphere angular size / vertical fov
+    if (death.state === 1 && death.cause === 'gorgon') bhR *= 1 + death.t*1.4;  // it takes the sky with it
     if (bhU > -0.6 && bhU < 1.6 && bhV > -0.6 && bhV < 1.6 && bhR > 0.0006) bhOn = 1;
   }
   gl.uniform2f(pPost.u.uBH, bhU, bhV);
@@ -1161,6 +1323,8 @@ function draw(t) {
   }
   gl.uniform2f(pPost.u.uSun, sunU, sunV);
   gl.uniform1f(pPost.u.uSunI, sunI);
+  gl.uniform1f(pPost.u.uDark, death.dark);
+  gl.uniform1f(pPost.u.uWhite, death.white);
   gl.bindVertexArray(quadVao);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); drawCount++;
 }
@@ -1169,7 +1333,8 @@ function draw(t) {
 let last = 0, simT = 0, fpsAcc = 0, fpsN = 0, hudT = 0, adaptT = 0;
 function nearestBody() {
   let best=null, bd=Infinity;
-  const all = [{name:SUN.name, pos:SUN.pos, r:SUN.r}, ...bodies, {name:BH.name, pos:BH.pos, r:BH.r}];
+  const all = [{name:SUN.name, pos:SUN.pos, r:SUN.r}, ...bodies, {name:BH.name, pos:BH.pos, r:BH.r},
+    {name:COMET.name, pos:COMET.pos, r:30}];
   for (const b of all) {
     const d = Math.hypot(b.pos[0]-cam.pos[0], b.pos[1]-cam.pos[1], b.pos[2]-cam.pos[2]) - b.r;
     if (d < bd) { bd = d; best = b; }
@@ -1179,29 +1344,49 @@ function nearestBody() {
 function step(dt) {
   simT += dt;
   updateOrbits(simT);
+  updateComet(simT);
+  updateDeath(dt);
   const near = nearestBody();
+  const bdx = BH.pos[0]-cam.pos[0], bdy = BH.pos[1]-cam.pos[1], bdz = BH.pos[2]-cam.pos[2];
+  const bhD = Math.hypot(bdx, bdy, bdz);
+  // the hole pulls. close in, your engines stop mattering.
+  if (bhD < 3e6 && death.state < 2) {
+    const g = 5.5e14/(bhD*bhD);
+    cam.vel[0] += bdx/bhD*g*dt; cam.vel[1] += bdy/bhD*g*dt; cam.vel[2] += bdz/bhD*g*dt;
+  }
+  const authority = death.state ? 0 : Math.min(1, Math.max(0, (bhD - BH.r*2.0)/(BH.r*2.0)));
+  const freefall = bhD < BH.r*10;
+  if (bhD < BH.r*2.5 && !death.state && !capWhispered) {
+    capWhispered = true;
+    whisper('you are past the last place where "away" meant anything.', 8);
+  }
+  if (bhD < BH.r*1.05) beginDeath('gorgon');
+  if (death.state === 1 && bhD < BH.r*0.6) { cam.vel[0]=0; cam.vel[1]=0; cam.vel[2]=0; }
   // speed scales with emptiness: crawl near worlds, streak across the void
   const maxV = Math.min(Math.max(near.dist*0.55, 20), 9e6);
-  const acc = maxV * (input.boost ? 2.6 : 0.9);
+  const acc = maxV * (input.boost ? 2.6 : 0.9) * authority;
   const [fx,fy,fz, rx,ry,rz, ux,uy,uz] = buildView();
   const ax = (fx*input.y + rx*input.x + ux*input.up);
   const ay = (fy*input.y + ry*input.x + uy*input.up);
   const az = (fz*input.y + rz*input.x + uz*input.up);
   const al = Math.hypot(ax,ay,az);
-  if (al > 0.01) {
+  if (al > 0.01 && acc > 0) {
     cam.vel[0] += ax/al*acc*dt; cam.vel[1] += ay/al*acc*dt; cam.vel[2] += az/al*acc*dt;
   }
   let sp = Math.hypot(...cam.vel);
-  if (sp > maxV*(input.boost?1.0:0.6) && sp > 0) {
+  if (!freefall && sp > maxV*(input.boost?1.0:0.6) && sp > 0) {
     const k = Math.max(0.2, 1 - dt*1.2);
     cam.vel[0]*=k; cam.vel[1]*=k; cam.vel[2]*=k;
     sp = Math.hypot(...cam.vel);
   }
-  const drag = input.brake ? 3.2 : (al > 0.01 ? 0.0 : 0.35);
+  const drag = freefall ? 0 : (input.brake ? 3.2 : (al > 0.01 ? 0.0 : 0.35));
   if (drag > 0) { const k = Math.exp(-drag*dt); cam.vel[0]*=k; cam.vel[1]*=k; cam.vel[2]*=k; }
+  if (death.state === 2) { cam.vel[0]=0; cam.vel[1]=0; cam.vel[2]=0; }
   cam.pos[0]+=cam.vel[0]*dt; cam.pos[1]+=cam.vel[1]*dt; cam.pos[2]+=cam.vel[2]*dt;
-  // soft collision: never enter a body
-  const all = [{pos:SUN.pos,r:SUN.r},...bodies,{pos:BH.pos,r:BH.r}];
+  const sunD = Math.hypot(...cam.pos);
+  if (sunD < SUN.r*1.1) beginDeath('furnace');
+  // soft collision: never enter a world (the sun and the hole take you instead)
+  const all = bodies;
   for (const b of all) {
     const dx=cam.pos[0]-b.pos[0], dy=cam.pos[1]-b.pos[1], dz=cam.pos[2]-b.pos[2];
     const d = Math.hypot(dx,dy,dz), min = b.r*1.02 + 2;
@@ -1231,7 +1416,8 @@ function updateHud(st) {
   // labels
   buildView();
   // the black hole's *visible* footprint (lensed disk) is ~5x its horizon
-  const targets = [{name:SUN.name,pos:SUN.pos,r:SUN.r},...bodies.filter(b=>b.parent===undefined),{name:BH.name,pos:BH.pos,r:BH.r*5.5}];
+  const targets = [{name:SUN.name,pos:SUN.pos,r:SUN.r},...bodies.filter(b=>b.parent===undefined),
+    {name:BH.name,pos:BH.pos,r:BH.r*5.5},{name:COMET.name,pos:COMET.pos,r:9000}];
   const cand = [];
   for (const b of targets) {
     const r = rel(b.pos);
