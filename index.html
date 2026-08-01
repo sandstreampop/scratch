@@ -189,6 +189,47 @@ gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,1,gl.FLOAT,false,20,12);
 gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2,1,gl.FLOAT,false,20,16);
 gl.bindVertexArray(null);
 
+// warp streak lines: two vertices per star (end flag 0/1) for a subset
+const N_STREAK = 5000;
+const streakBuf = new Float32Array(N_STREAK*2*6);
+for (let i=0;i<N_STREAK;i++) {
+  const s = i*5;
+  for (let e=0;e<2;e++) {
+    const o = (i*2+e)*6;
+    streakBuf[o]=starBuf[s]; streakBuf[o+1]=starBuf[s+1]; streakBuf[o+2]=starBuf[s+2];
+    streakBuf[o+3]=starBuf[s+3]; streakBuf[o+4]=starBuf[s+4]; streakBuf[o+5]=e;
+  }
+}
+const streakVao = gl.createVertexArray(); gl.bindVertexArray(streakVao);
+const stb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, stb);
+gl.bufferData(gl.ARRAY_BUFFER, streakBuf, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,24,0);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,1,gl.FLOAT,false,24,12);
+gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2,1,gl.FLOAT,false,24,16);
+gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3,1,gl.FLOAT,false,24,20);
+gl.bindVertexArray(null);
+
+// asteroid belt: a torus of drifting rubble between halcyon and tyrant
+const N_BELT = 3500, BELT_R = 1.06e7, BELT_SPREAD = 9e5, BELT_H = 1.6e5;
+const beltBuf = new Float32Array(N_BELT*5);
+for (let i=0;i<N_BELT;i++) {
+  const th = Math.random()*Math.PI*2;
+  const rr = BELT_R + (Math.random()+Math.random()+Math.random()-1.5)/1.5*BELT_SPREAD;
+  const o = i*5;
+  beltBuf[o]   = Math.cos(th)*rr;
+  beltBuf[o+1] = (Math.random()*2-1)*BELT_H;
+  beltBuf[o+2] = Math.sin(th)*rr;
+  beltBuf[o+3] = 6 + Math.pow(Math.random(),2.5)*70;   // rock radius, km
+  beltBuf[o+4] = Math.random();
+}
+const beltVao = gl.createVertexArray(); gl.bindVertexArray(beltVao);
+const bb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bb);
+gl.bufferData(gl.ARRAY_BUFFER, beltBuf, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,20,0);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,1,gl.FLOAT,false,20,12);
+gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2,1,gl.FLOAT,false,20,16);
+gl.bindVertexArray(null);
+
 // ---------------------------------------------------------- shaders
 const VS_BODY = `
 layout(location=0) in vec3 aPos;
@@ -337,14 +378,58 @@ void main(){
 
 const VS_STARS = `
 layout(location=0) in vec3 aDir; layout(location=1) in float aMag; layout(location=2) in float aTemp;
-uniform mat4 uProj; uniform mat3 uView; uniform float uPx;
+uniform mat4 uProj; uniform mat3 uView; uniform float uPx; uniform vec3 uVelC;
 out float vB; out float vTemp;
 void main(){
-  vec3 v = uView * aDir;
+  vec3 d = normalize(aDir + uVelC);      // relativistic aberration: stars crowd ahead
+  vec3 v = uView * d;
   gl_Position = uProj * vec4(v*100.0, 1.0);
   gl_Position.z = gl_Position.w * 0.99999;
   gl_PointSize = (0.7 + aMag*aMag*3.2) * uPx;
   vB = 0.12 + aMag*1.4; vTemp = aTemp;
+}`;
+const VS_STREAK = `
+layout(location=0) in vec3 aDir; layout(location=1) in float aMag; layout(location=2) in float aTemp;
+layout(location=3) in float aEnd;
+uniform mat4 uProj; uniform mat3 uView; uniform vec3 uVelC; uniform float uStretch;
+out float vB; out float vTemp;
+void main(){
+  vec3 d = normalize(aDir + uVelC * (1.0 + uStretch*aEnd));
+  vec3 v = uView * d;
+  gl_Position = uProj * vec4(v*100.0, 1.0);
+  gl_Position.z = gl_Position.w * 0.99999;
+  vB = 0.1 + aMag; vTemp = aTemp;
+}`;
+const FS_STREAK = `
+in float vB; in float vTemp;
+uniform float uAlpha;
+out vec4 o;
+void main(){
+  vec3 col = mix(vec3(0.62,0.74,1.0), vec3(1.0,0.72,0.5), vTemp);
+  o = vec4(mix(col, vec3(1.0), 0.5) * vB * uAlpha, 1.0);
+}`;
+const VS_BELT = `
+layout(location=0) in vec3 aPos; layout(location=1) in float aSize; layout(location=2) in float aShade;
+uniform mat4 uProj; uniform mat3 uView; uniform vec3 uOrigin; uniform float uH; uniform float uLogF;
+out float vA; out float vShade;
+void main(){
+  vec3 w = uOrigin + aPos;
+  float d = length(w);
+  vec3 v = uView * w;
+  gl_Position = uProj * vec4(v, 1.0);
+  ${''}${LOGDEPTH}
+  float px = aSize / max(d, 1.0) * uH;
+  gl_PointSize = clamp(px, 0.75, 7.0);
+  vA = smoothstep(0.25, 1.2, px) * smoothstep(2.5e6, 4e5, d);
+  vShade = aShade;
+}`;
+const FS_BELT = `
+in float vA; in float vShade;
+out vec4 o;
+void main(){
+  vec2 dd = gl_PointCoord*2.0-1.0;
+  if (dot(dd,dd) > 1.0) discard;
+  o = vec4(vec3(0.42,0.4,0.38) * (0.35 + vShade*0.65) * vA, 1.0);
 }`;
 const FS_STARS = `
 in float vB; in float vTemp;
@@ -422,6 +507,7 @@ uniform float uBHr;      // photon-sphere screen radius (uv units, aspect-correc
 uniform float uBHon;
 uniform vec2 uAspect;
 uniform float uTime; uniform float uFlash;
+uniform vec2 uSun; uniform float uSunI;
 out vec4 o;
 vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0); }
 void main(){
@@ -451,6 +537,20 @@ void main(){
   } else {
     col = texture(uTex, uv).rgb;
   }
+  // sun glare — only when the sun's pixels are actually visible (not eclipsed)
+  if (uSunI > 0.001) {
+    vec3 sc = texture(uTex, uSun).rgb + texture(uTex, uSun+vec2(0.004,0.0)).rgb
+            + texture(uTex, uSun-vec2(0.004,0.0)).rgb;
+    float lum = dot(sc, vec3(0.33));
+    float vis = smoothstep(1.6, 3.6, lum) * uSunI;
+    if (vis > 0.001) {
+      vec2 sd = (vUv - uSun) * uAspect;
+      float sr = length(sd);
+      float halo = exp(-sr*5.0);
+      float streak = exp(-abs(sd.y)*70.0) * exp(-abs(sd.x)*3.5);
+      col += vec3(1.0,0.75,0.5) * (halo*0.5 + streak*0.4) * vis;
+    }
+  }
   col *= 1.0 + uFlash;
   // vignette
   vec2 q = vUv*2.0-1.0;
@@ -468,6 +568,8 @@ const pAtmo = prog(VS_BODY, FS_ATMO);
 const pRing = prog(VS_RING, FS_RING);
 const pDisk = prog(VS_RING, FS_DISK);
 const pStar = prog(VS_STARS, FS_STARS);
+const pStreak = prog(VS_STREAK, FS_STREAK);
+const pBelt = prog(VS_BELT, FS_BELT);
 const pSky  = prog(VS_SKY, FS_SKY);
 const pGlow = prog(VS_GLOW, FS_GLOW);
 const pPost = prog(VS_POST, FS_POST);
@@ -561,6 +663,8 @@ window.__lookAt = (x,y,z) => {
   cam.pitch = Math.atan2(to[1], Math.hypot(to[0], to[2]));
 };
 window.__bodies = () => ({ sun:SUN.pos, bh:BH.pos, list:bodies.map(b=>({n:b.name,p:[...b.pos],r:b.r})) });
+window.__forceNova = () => { nova.state = 0; nova.next = -1; };
+window.__novaState = () => ({ state: nova.state, t: nova.t, bright: nova.bright, dir: [...nova.dir] });
 window.__getState = () => ({ pos:[...cam.pos], yaw:cam.yaw, pitch:cam.pitch,
   vel:[...cam.vel], speed:Math.hypot(...cam.vel) });
 
@@ -649,7 +753,7 @@ function bindBtn(el, prop) {
 bindBtn($('boost'), 'boost'); bindBtn($('brake'), 'brake');
 
 // ---------------------------------------------------------- audio (all procedural)
-let AC=null, droneGain=null, thrustGain=null, thrustFilter=null;
+let AC=null, droneGain=null, thrustGain=null, thrustFilter=null, bhGain=null, novaGain=null;
 function initAudio() {
   try {
     AC = new (window.AudioContext || window.webkitAudioContext)();
@@ -675,15 +779,32 @@ function initAudio() {
     thrustGain = AC.createGain(); thrustGain.gain.value = 0.0;
     src.connect(thrustFilter); thrustFilter.connect(thrustGain); thrustGain.connect(master);
     src.start();
+    // the black hole's voice: a sub-audible beat that swells with proximity
+    bhGain = AC.createGain(); bhGain.gain.value = 0; bhGain.connect(master);
+    const b1 = AC.createOscillator(); b1.frequency.value = 21;
+    const b2 = AC.createOscillator(); b2.frequency.value = 26.2;
+    const bg1 = AC.createGain(); bg1.gain.value = 0.6;
+    b1.connect(bg1); b2.connect(bg1); bg1.connect(bhGain); b1.start(); b2.start();
+    // supernova wash
+    const src2 = AC.createBufferSource(); src2.buffer = buf; src2.loop = true;
+    const bp = AC.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=420; bp.Q.value=0.6;
+    novaGain = AC.createGain(); novaGain.gain.value = 0;
+    src2.connect(bp); bp.connect(novaGain); novaGain.connect(master);
+    src2.start();
   } catch(e) { /* silence is also true to the theme */ }
 }
 let thrustLvl = 0;
-function updateAudio(dt) {
+function updateAudio(dt, ctx) {
   if (!AC) return;
   const want = Math.min(1, Math.hypot(input.x, input.y, input.up) + input.boost*0.6) * 0.22;
   thrustLvl += (want - thrustLvl) * Math.min(1, dt*3);
   thrustGain.gain.value = thrustLvl;
   thrustFilter.frequency.value = 90 + thrustLvl*700;
+  if (bhGain && ctx) {
+    const g = Math.min(1, 2.5e6/Math.max(ctx.bhDist,1));
+    bhGain.gain.value = g*g*0.34;                    // the hole hums when you get close
+    if (novaGain) novaGain.gain.value = (ctx.novaBright||0)*0.16;
+  }
 }
 
 // ---------------------------------------------------------- whispers
@@ -700,6 +821,7 @@ const WHISPERS = [
   'nothing out here has a name until you give it one. the names die with you.',
 ];
 let whisperT = 14, whisperIdx = 0, whisperLock = 0;
+let lookSunT = 0, lookBHT = 0, sunCD = 0, bhCD = 0, beltCD = 0;
 function whisper(text, hold) {
   const w = $('whisper');
   w.textContent = text;
@@ -708,11 +830,23 @@ function whisper(text, hold) {
   whisper._t = setTimeout(() => w.classList.remove('on'), (hold||9)*1000);
 }
 function updateWhispers(dt, ctx) {
-  whisperLock -= dt;
+  whisperLock -= dt; sunCD -= dt; bhCD -= dt; beltCD -= dt;
+  // staring at things long enough earns a reply
+  lookSunT = (ctx.lookSun && ctx.sunDist > 2.5e6) ? lookSunT + dt : 0;
+  lookBHT  = (ctx.lookBH && ctx.bhDist > 1.5e7)  ? lookBHT + dt  : 0;
+  if (lookSunT > 2.6 && sunCD <= 0) {
+    whisper('it has been burning for four billion years. it will not notice when you stop.', 10);
+    sunCD = 220; whisperT = 50; lookSunT = 0; return;
+  }
+  if (lookBHT > 2.6 && bhCD <= 0) {
+    whisper('that is not a hole in the stars. it is a door that only opens inward.', 10);
+    bhCD = 220; whisperT = 50; lookBHT = 0; return;
+  }
   whisperT -= dt;
   if (whisperT > 0) return;
   if (whisperLock > 0) return;
   // contextual first
+  if (ctx.inBelt && beltCD <= 0) { whisper('this rubble has drifted for four billion years without once needing a witness.', 10); beltCD = 300; whisperT = 55; return; }
   if (ctx.bhDist < 8e6) { whisper('it was here before your sun ignited. it will be here after the last star gutters out.', 11); whisperT = 60; return; }
   if (ctx.speedC > 4 && ctx.nearDist > 8e6) { whisper('faster than light, and still the emptiness outpaces you', 10); whisperT = 55; return; }
   if (ctx.sunDist > 7e7) { whisper('behind you, everything you have ever known is a dot among the dots', 11); whisperT = 70; return; }
@@ -818,14 +952,30 @@ function draw(t) {
   gl.bindVertexArray(sphereLo.v);
   gl.drawElements(gl.TRIANGLES, sphereLo.n, gl.UNSIGNED_SHORT, 0); drawCount++;
 
-  // stars
+  // stars, aberrated by velocity
+  const spd = Math.hypot(...cam.vel);
+  const aber = Math.min(spd/C_KM*0.30, 0.82);
+  const vd = spd > 1 ? [cam.vel[0]/spd*aber, cam.vel[1]/spd*aber, cam.vel[2]/spd*aber] : [0,0,0];
   gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
   gl.useProgram(pStar.p);
   gl.uniformMatrix4fv(pStar.u.uProj, false, proj);
   gl.uniformMatrix3fv(pStar.u.uView, false, view);
   gl.uniform1f(pStar.u.uPx, renderScale);
+  gl.uniform3fv(pStar.u.uVelC, vd);
   gl.bindVertexArray(starVao);
   gl.drawArrays(gl.POINTS, 0, N_STARS); drawCount++;
+  // warp streaks past 0.4c
+  const warpA = Math.min(Math.max((spd/C_KM - 0.4)/4.0, 0), 0.5);
+  if (warpA > 0.005) {
+    gl.useProgram(pStreak.p);
+    gl.uniformMatrix4fv(pStreak.u.uProj, false, proj);
+    gl.uniformMatrix3fv(pStreak.u.uView, false, view);
+    gl.uniform3fv(pStreak.u.uVelC, vd);
+    gl.uniform1f(pStreak.u.uStretch, 0.35 + warpA*0.8);
+    gl.uniform1f(pStreak.u.uAlpha, warpA);
+    gl.bindVertexArray(streakVao);
+    gl.drawArrays(gl.LINES, 0, N_STREAK*2); drawCount++;
+  }
 
   gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
   gl.disable(gl.BLEND);
@@ -866,6 +1016,23 @@ function draw(t) {
     const px = b.r / d * fboH;             // rough screen size in px
     gl.bindVertexArray(px > 14 ? sphereHi.v : sphereLo.v);
     gl.drawElements(gl.TRIANGLES, px > 14 ? sphereHi.n : sphereLo.n, gl.UNSIGNED_SHORT, 0); drawCount++;
+  }
+
+  // asteroid belt (only worth drawing when we're near its torus)
+  {
+    const rr = Math.hypot(cam.pos[0], cam.pos[2]);
+    if (Math.abs(rr - BELT_R) < 4.5e6 && Math.abs(cam.pos[1]) < 3.5e6) {
+      gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false);
+      gl.useProgram(pBelt.p);
+      gl.uniformMatrix4fv(pBelt.u.uProj, false, proj);
+      gl.uniformMatrix3fv(pBelt.u.uView, false, view);
+      gl.uniform1f(pBelt.u.uLogF, LOGF);
+      gl.uniform3f(pBelt.u.uOrigin, -cam.pos[0], -cam.pos[1], -cam.pos[2]);
+      gl.uniform1f(pBelt.u.uH, fboH);
+      gl.bindVertexArray(beltVao);
+      gl.drawArrays(gl.POINTS, 0, N_BELT); drawCount++;
+      gl.depthMask(true); gl.disable(gl.BLEND);
+    }
   }
 
   // atmosphere shells (additive)
@@ -979,6 +1146,21 @@ function draw(t) {
   gl.uniform2f(pPost.u.uAspect, fboW/fboH, 1.0);
   gl.uniform1f(pPost.u.uTime, t % 61.7);
   gl.uniform1f(pPost.u.uFlash, nova.bright*0.55);
+  // sun screen position for glare
+  const svx = view[0]*sunRel[0]+view[3]*sunRel[1]+view[6]*sunRel[2];
+  const svy = view[1]*sunRel[0]+view[4]*sunRel[1]+view[7]*sunRel[2];
+  const svz = view[2]*sunRel[0]+view[5]*sunRel[1]+view[8]*sunRel[2];
+  let sunI = 0, sunU = 0.5, sunV = 0.5;
+  if (svz < -NEAR) {
+    const px = proj[0]*svx/-svz, py = proj[5]*svy/-svz;
+    sunU = px*0.5+0.5; sunV = py*0.5+0.5;
+    if (sunU > -0.2 && sunU < 1.2 && sunV > -0.2 && sunV < 1.2) {
+      const edge = Math.min(1, Math.max(0, 1.6 - 2.2*Math.max(Math.abs(px), Math.abs(py))));
+      sunI = edge;
+    }
+  }
+  gl.uniform2f(pPost.u.uSun, sunU, sunV);
+  gl.uniform1f(pPost.u.uSunI, sunI);
   gl.bindVertexArray(quadVao);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); drawCount++;
 }
@@ -1030,10 +1212,16 @@ function step(dt) {
     }
   }
   updateNova(simT, dt);
+  // speed widens the eye
+  const fovT = (72 + 16*Math.min(sp/(3*C_KM), 1)) * Math.PI/180;
+  cam.fov += (fovT - cam.fov) * Math.min(1, dt*2.5);
   const sunDist = Math.hypot(...cam.pos);
   const bhDist = Math.hypot(BH.pos[0]-cam.pos[0], BH.pos[1]-cam.pos[1], BH.pos[2]-cam.pos[2]);
-  updateWhispers(dt, { speedC: sp/C_KM, nearDist: near.dist, sunDist, bhDist });
-  updateAudio(dt);
+  const lookSun = (-(fx*cam.pos[0]+fy*cam.pos[1]+fz*cam.pos[2])/Math.max(sunDist,1)) > 0.9987;
+  const lookBH = ((fx*(BH.pos[0]-cam.pos[0])+fy*(BH.pos[1]-cam.pos[1])+fz*(BH.pos[2]-cam.pos[2]))/Math.max(bhDist,1)) > 0.9987;
+  const inBelt = Math.abs(Math.hypot(cam.pos[0],cam.pos[2]) - BELT_R) < 1.3e6 && Math.abs(cam.pos[1]) < 4.5e5;
+  updateWhispers(dt, { speedC: sp/C_KM, nearDist: near.dist, sunDist, bhDist, lookSun, lookBH, inBelt });
+  updateAudio(dt, { bhDist, novaBright: nova.bright });
   return { near, sp };
 }
 
@@ -1042,7 +1230,8 @@ function updateHud(st) {
   $('near').textContent = st.near.body.name + ' — ' + fmtDist(st.near.dist);
   // labels
   buildView();
-  const targets = [{name:SUN.name,pos:SUN.pos,r:SUN.r},...bodies.filter(b=>b.parent===undefined),{name:BH.name,pos:BH.pos,r:BH.r}];
+  // the black hole's *visible* footprint (lensed disk) is ~5x its horizon
+  const targets = [{name:SUN.name,pos:SUN.pos,r:SUN.r},...bodies.filter(b=>b.parent===undefined),{name:BH.name,pos:BH.pos,r:BH.r*5.5}];
   const cand = [];
   for (const b of targets) {
     const r = rel(b.pos);
@@ -1055,18 +1244,21 @@ function updateHud(st) {
     el.style.opacity = 0;
     if (vz > -NEAR || ang > 0.045) continue;
     const px = proj[0]*vx/-vz, py = proj[5]*vy/-vz;
-    if (px < -0.98 || px > 0.98 || py < -0.95 || py > 0.95) continue;
-    cand.push({ el, d, x:(px*0.5+0.5)*W, y:(-py*0.5+0.5)*H, text:b.name+' · '+fmtDist(d) });
+    if (px < -0.88 || px > 0.88 || py < -0.86 || py > 0.9) continue;
+    const pxR = ang / (2*Math.tan(cam.fov/2)) * H;      // body's on-screen radius
+    const ly = (-py*0.5+0.5)*H + Math.max(24, pxR*1.7+16);
+    if (isTouch && ly > H - 175) continue;              // keep clear of the thumb controls
+    cand.push({ el, d, x:(px*0.5+0.5)*W, y:ly, text:b.name+' · '+fmtDist(d) });
   }
   // nearest first; drop any label that would overlap one already placed
   cand.sort((a,b) => a.d - b.d);
   const placed = [];
   for (const c of cand) {
-    if (placed.some(p => Math.abs(p.x-c.x) < 130 && Math.abs(p.y-c.y) < 36)) continue;
+    if (placed.some(p => Math.abs(p.x-c.x) < 170 && Math.abs(p.y-c.y) < 48)) continue;
     placed.push(c);
     c.el.style.opacity = 0.9;
     c.el.style.left = (c.x/W*100) + '%';
-    c.el.style.top  = (c.y/H*100 - 3) + '%';
+    c.el.style.top  = (c.y/H*100) + '%';
     c.el.textContent = c.text;
   }
 }
