@@ -49,6 +49,15 @@
   #stickUI > b { position:absolute; width:40px; height:40px; left:26px; top:26px; border-radius:50%;
     background:rgba(200,210,170,.25); border:2px solid rgba(200,210,170,.4); }
   /*INPUT-CSS*/
+  #gl, #stickL, #stickUI, .tbtn { touch-action:none; }
+  #gl { cursor:crosshair; }
+  #stickUI { left:0; top:0; will-change:transform; }
+  #stickUI.on { display:block; }
+  #stickUI > b { will-change:transform; }
+  #stickUI.run { border-color:rgba(255,215,106,.65); box-shadow:0 0 14px rgba(255,190,80,.3); }
+  #stickUI.run > b { background:rgba(255,215,106,.45); border-color:rgba(255,225,140,.85); }
+  .tbtn.held { transform:scale(.92); }
+  #btnAtk.held { background:rgba(220,120,60,.3); border-color:rgba(255,170,90,.75); }
   /* --- start screen --- */
   #start { position:absolute; inset:0; z-index:10; background:
     radial-gradient(ellipse at 50% 30%, #3a2c18 0%, #120d06 70%);
@@ -390,65 +399,1286 @@ var Geo = JK.Geo = {
 })();
 
 /* ===== 10_terrain.js ===== */
-/* JK.Terrain — STUB, replaced by terrain agent. */
+/* JK.Terrain — open desert: analytic dune heightfield, rocks, mesas, wreck, sun.
+   Owner: terrain agent. */
 (function(){
 'use strict';
-var mesh = null;
+var M = JK.M, Geo = JK.Geo;
+
+/* ---------- deterministic PRNG (mulberry32) ---------- */
+var SEED = 0x0DE5E27; /* fixed seed: same dunes every load */
+function mulberry32(a){
+  a = a >>> 0;
+  return function(){
+    a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- smooth value noise on a hashed lattice ---------- */
+var PERM = new Uint8Array(512);
+var VALS = new Float32Array(256);
+(function(){
+  var r = mulberry32(SEED), i, j, t;
+  for (i = 0; i < 256; i++){ PERM[i] = i; VALS[i] = r(); }
+  for (i = 255; i > 0; i--){
+    j = (r() * (i + 1)) | 0;
+    t = PERM[i]; PERM[i] = PERM[j]; PERM[j] = t;
+  }
+  for (i = 0; i < 256; i++) PERM[i + 256] = PERM[i];
+})();
+
+/* value noise, returns 0..1, C1-continuous (smoothstep-interpolated) */
+function vn(x, z){
+  var ix = Math.floor(x), iz = Math.floor(z);
+  var fx = x - ix, fz = z - iz;
+  ix &= 255; iz &= 255;
+  var ux = fx * fx * (3 - 2 * fx), uz = fz * fz * (3 - 2 * fz);
+  var p0 = PERM[ix], p1 = PERM[ix + 1];
+  var a = VALS[PERM[p0 + iz]], b = VALS[PERM[p1 + iz]];
+  var c = VALS[PERM[p0 + iz + 1]], d = VALS[PERM[p1 + iz + 1]];
+  return a + (b - a) * ux + (c - a) * uz + (a - b - c + d) * ux * uz;
+}
+
+/* ---------- THE contract: analytic ground height ----------
+   Long rolling dune ridges (two rotated sine trains, wavelengths ~90-150m,
+   phase-warped so crests wander) + broad value noise + fine ripple.
+   Relief ~= +/-5m, slopes gentle enough to sprint over. */
+function height(x, z){
+  var u = x * 0.831 + z * 0.556;        /* rotated dune-ridge axes */
+  var v = z * 0.831 - x * 0.556;
+  var h = 2.6 * Math.sin(u * 0.0430 + 1.6 * Math.sin(v * 0.0110 + 0.7));
+  h += 1.35 * Math.sin(v * 0.0700 + 2.1 + 0.8 * Math.sin(u * 0.0170 + 3.0));
+  h += 3.9  * (vn(x * 0.0082 + 91.3, z * 0.0082 + 47.8) - 0.5);
+  h += 1.7  * (vn(x * 0.0270 + 13.1, z * 0.0270 + 71.7) - 0.5);
+  h += 0.45 * (vn(x * 0.0900 + 55.5, z * 0.0900 + 23.9) - 0.5);
+  return h;
+}
+
+/* ---------- module state ---------- */
+var terrainMesh = null, sceneryMesh = null, sunMesh = null, haloMesh = null;
+var OBST = [];
+var SUN_DIR = [0.71, 0.573, 0.409];   /* normalized; points UP toward the sun */
+var SUN_OPTS  = { emissive: 1, nofog: true };
+var HALO_OPTS = { emissive: 1, nofog: true, additive: true, alpha: 0.45 };
+
+/* sand palette: #b8905a -> #d2aa6d, banded */
+var SAND_LO = [0.722, 0.565, 0.353];
+var SAND_HI = [0.824, 0.667, 0.427];
+
+/* ---------- terrain grid: 128x128 quads over 760x760m ----------
+   Mesh samples height() exactly => visuals == collision. */
+function buildTerrainGeo(){
+  var N = 128, V = N + 1, EXT = 760, half = EXT / 2, step = EXT / N;
+  var pos = new Float32Array(V * V * 3);
+  var nrm = new Float32Array(V * V * 3);
+  var col = new Float32Array(V * V * 3);
+  var idx = new Uint16Array(N * N * 6);
+  var jr = mulberry32(SEED ^ 0x51AB);
+  var e = 2.0;
+  var gx, gz, x, z, y, i3, nx, ny, nz, il, t, slopeK, j, a, b, c, d, io;
+
+  for (gz = 0; gz < V; gz++){
+    z = -half + gz * step;
+    for (gx = 0; gx < V; gx++){
+      x = -half + gx * step;
+      y = height(x, z);
+      i3 = (gz * V + gx) * 3;
+      pos[i3] = x; pos[i3 + 1] = y; pos[i3 + 2] = z;
+
+      /* central-difference normal from the same height() */
+      nx = height(x - e, z) - height(x + e, z);
+      nz = height(x, z - e) - height(x, z + e);
+      ny = 2 * e;
+      il = 1 / Math.sqrt(nx * nx + ny * ny + nz * nz);
+      nx *= il; ny *= il; nz *= il;
+      nrm[i3] = nx; nrm[i3 + 1] = ny; nrm[i3 + 2] = nz;
+
+      /* two-tone banding by height, pushed darker on slopes, quantized retro */
+      t = (y + 5.5) / 11;
+      if (t < 0) t = 0; else if (t > 1) t = 1;
+      slopeK = (1 - ny) * 26;
+      if (slopeK < 0) slopeK = 0; else if (slopeK > 1) slopeK = 1;
+      t -= slopeK * 0.45;
+      if (t < 0) t = 0;
+      t = Math.round(t * 4) / 4;          /* 5 hard bands */
+      j = (jr() - 0.5) * 0.05;            /* deterministic grain */
+      col[i3]     = SAND_LO[0] + (SAND_HI[0] - SAND_LO[0]) * t + j;
+      col[i3 + 1] = SAND_LO[1] + (SAND_HI[1] - SAND_LO[1]) * t + j;
+      col[i3 + 2] = SAND_LO[2] + (SAND_HI[2] - SAND_LO[2]) * t + j * 0.8;
+    }
+  }
+
+  io = 0;
+  for (gz = 0; gz < N; gz++){
+    for (gx = 0; gx < N; gx++){
+      a = gz * V + gx; b = a + 1; c = a + V; d = c + 1;
+      if ((gx + gz) & 1){  /* alternate the diagonal — chunkier dune shading */
+        idx[io++] = a; idx[io++] = c; idx[io++] = b;
+        idx[io++] = b; idx[io++] = c; idx[io++] = d;
+      } else {
+        idx[io++] = a; idx[io++] = c; idx[io++] = d;
+        idx[io++] = a; idx[io++] = d; idx[io++] = b;
+      }
+    }
+  }
+  return { pos: pos, nrm: nrm, col: col, idx: idx };
+}
+
+/* helper: boxed part placed by T*Ry*Rx*Rz, appended to list */
+var TM = M.make();
+function part(list, sx, sy, sz, r, g, b, x, y, z, ry, rx, rz){
+  M.ident(TM);
+  M.tr(TM, x, y, z);
+  if (ry) M.ry(TM, ry);
+  if (rx) M.rx(TM, rx);
+  if (rz) M.rz(TM, rz);
+  list.push(Geo.tf(Geo.box(sx, sy, sz, r, g, b), TM));
+}
+
+/* ---------- scenery: rocks + mesas + crashed cruisers, one merged mesh ---------- */
+function buildSceneryGeo(){
+  var parts = [];
+  var rand = mulberry32(SEED ^ 0x9E3779B9);
+  var i, k, n, cx, cz, guard, placed;
+
+  /* --- rock outcrops: 34 clusters of 2-5 tilted boxes, off the spawn zone --- */
+  placed = 0; guard = 0;
+  while (placed < 34 && guard++ < 800){
+    cx = (rand() * 2 - 1) * 330;
+    cz = (rand() * 2 - 1) * 330;
+    if (cx * cx + cz * cz < 42 * 42) continue;   /* keep ~30m spawn zone clear */
+    n = 2 + ((rand() * 4) | 0);                  /* 2..5 rocks */
+    var shade = 0.42 + rand() * 0.14;            /* grey-brown per cluster */
+    var maxExt = 0;
+    for (k = 0; k < n; k++){
+      var s  = 1 + rand() * 5;                   /* 1..6 m */
+      var sy = s * (0.6 + rand() * 0.7);
+      var sz2 = s * (0.7 + rand() * 0.6);
+      var dx = (rand() - 0.5) * 6, dz = (rand() - 0.5) * 6;
+      var px = cx + dx, pz = cz + dz;
+      var jc = (rand() - 0.5) * 0.06;
+      part(parts, s, sy, sz2,
+        shade + 0.06 + jc, shade + 0.01 + jc, shade - 0.05 + jc,
+        px, height(px, pz) + sy * 0.30, pz,
+        rand() * 6.283, (rand() - 0.5) * 0.5, (rand() - 0.5) * 0.5);
+      var ext = Math.sqrt(dx * dx + dz * dz) + s * 0.75;
+      if (ext > maxExt) maxExt = ext;
+    }
+    var rr = maxExt;
+    if (rr < 1.6) rr = 1.6; if (rr > 8.5) rr = 8.5;
+    OBST.push({ x: cx, z: cz, r: rr });
+    placed++;
+  }
+
+  /* --- 5 giant mesas outside the playable area (radius 430-650) --- */
+  var ang0 = rand() * 6.283;
+  for (i = 0; i < 5; i++){
+    var ang = ang0 + i * 1.2566 + (rand() - 0.5) * 0.5;
+    var dist = 465 + rand() * 195;               /* 465..660 from origin */
+    var mx = Math.cos(ang) * dist, mz = Math.sin(ang) * dist;
+    var totH = 40 + rand() * 50;                 /* 40..90 m */
+    var w = 60 + rand() * 80;
+    var yb = height(mx, mz) - 4;
+    var fr = [0.55, 0.32, 0.22], wf = [1.0, 0.78, 0.58];
+    var rot = rand() * 6.283, yy = yb;
+    OBST.push({ x: mx, z: mz, r: w * 0.75 });    /* keep corner-reach out of mesa */
+    for (k = 0; k < 3; k++){
+      var lh = totH * fr[k];
+      var lw = w * wf[k] * (0.9 + rand() * 0.2);
+      var cR = (k === 2) ? 0.76 : (k === 1 ? 0.60 : 0.70);
+      var cG = (k === 2) ? 0.58 : (k === 1 ? 0.43 : 0.50);
+      var cB = (k === 2) ? 0.40 : (k === 1 ? 0.32 : 0.36);
+      part(parts, lw, lh, lw * (0.8 + rand() * 0.4), cR, cG, cB,
+        mx + (rand() - 0.5) * 8, yy + lh / 2, mz + (rand() - 0.5) * 8,
+        rot + (rand() - 0.5) * 0.3, 0, 0);
+      yy += lh * 0.92;
+    }
+  }
+
+  /* --- crashed star-cruiser hulls, half-buried --- */
+  var P3 = [0, 0, 0], PM = M.make();
+  for (i = 0; i < 2; i++){
+    var ca = rand() * 6.283;
+    var cd = (i === 0 ? 150 : 240) + rand() * 50;
+    var wx = Math.cos(ca) * cd, wz = Math.sin(ca) * cd;
+    if (wx > 300) wx = 300; if (wx < -300) wx = -300;
+    if (wz > 300) wz = 300; if (wz < -300) wz = -300;
+    var yaw = rand() * 6.283;
+    var wy = height(wx, wz) + 0.8;
+    M.ident(PM); M.tr(PM, wx, wy, wz); M.ry(PM, yaw);
+    M.rx(PM, 0.16 + rand() * 0.08); M.rz(PM, (rand() - 0.5) * 0.5);
+
+    var hull = [];
+    var scale = (i === 0) ? 1 : 0.7;
+    hull.push(Geo.tf(Geo.box(8 * scale, 6.5 * scale, 34 * scale, 0.45, 0.47, 0.50), M.make()));
+    M.ident(TM); M.tr(TM, 0, 3.2 * scale, -2 * scale);
+    hull.push(Geo.tf(Geo.box(5 * scale, 2.4 * scale, 19 * scale, 0.38, 0.40, 0.43), TM));
+    M.ident(TM); M.tr(TM, 0, 7 * scale, 12 * scale); M.rx(TM, -0.15);
+    hull.push(Geo.tf(Geo.box(0.9 * scale, 10 * scale, 7 * scale, 0.40, 0.42, 0.46), TM)); /* fin */
+    M.ident(TM); M.tr(TM, 0, 0, 17.5 * scale);
+    hull.push(Geo.tf(Geo.box(6.6 * scale, 4.2 * scale, 4.5 * scale, 0.24, 0.25, 0.28), TM)); /* engines */
+    if (i === 0){ /* torn-off nose chunk a bit ahead */
+      M.ident(TM); M.tr(TM, 3, -1.2, -24); M.ry(TM, 0.7); M.rz(TM, 0.4);
+      hull.push(Geo.tf(Geo.box(6, 4.5, 8, 0.42, 0.44, 0.47), TM));
+    }
+    for (k = 0; k < hull.length; k++) parts.push(Geo.tf(hull[k], PM));
+
+    /* collision circles: 4 along the hull axis (spaced/sized to reach the
+       4x17m half-extent corners), plus engine block, plus torn-off nose */
+    for (k = 0; k < 4; k++){
+      M.xp(P3, PM, 0, 0, (k * 9.5 - 14.25) * scale);
+      OBST.push({ x: P3[0], z: P3[2], r: 6.25 * scale });
+    }
+    M.xp(P3, PM, 0, 0, 17.5 * scale);
+    OBST.push({ x: P3[0], z: P3[2], r: 4.6 * scale });
+    if (i === 0){
+      M.xp(P3, PM, 3, -1.2, -24);
+      OBST.push({ x: P3[0], z: P3[2], r: 5.4 });
+    }
+  }
+
+  return Geo.merge(parts);
+}
+
+/* ---------- JK.Terrain ---------- */
 JK.Terrain = {
-  SIZE: 200,
-  height: function(x, z){ return 0; },
+  SIZE: 350,                 /* playable half-extent; player/bots clamp to this */
+  height: height,            /* analytic, continuous, cheap */
+  obstacles: OBST,           /* [{x,z,r}, ...] filled during init */
+
   init: function(){
-    var g = JK.Geo.box(400, 1, 400, 0.80, 0.66, 0.44);
-    var m = JK.M.make(); JK.M.tr(m, 0, -0.5, 0);
-    mesh = JK.GL.mesh(JK.Geo.tf(g, m));
-    JK.GL.fog([0.86, 0.72, 0.52], 0.0035);
-    JK.GL.sun([0.45, 0.75, 0.35], [1.0, 0.93, 0.78], [0.38, 0.34, 0.30]);
+    terrainMesh = JK.GL.mesh(buildTerrainGeo());
+    sceneryMesh = JK.GL.mesh(buildSceneryGeo());
+
+    /* sun billboard blob 1400m out along SUN_DIR (already unit length) */
+    var sp = [SUN_DIR[0] * 1400, SUN_DIR[1] * 1400, SUN_DIR[2] * 1400];
+    M.ident(TM); M.tr(TM, sp[0], sp[1], sp[2]); M.ry(TM, 0.5); M.rz(TM, 0.4);
+    sunMesh = JK.GL.mesh(Geo.tf(Geo.box(58, 58, 58, 1.0, 0.97, 0.86), TM));
+    M.ident(TM); M.tr(TM, sp[0], sp[1], sp[2]); M.ry(TM, 1.1); M.rx(TM, 0.6);
+    haloMesh = JK.GL.mesh(Geo.tf(Geo.box(125, 125, 125, 1.0, 0.80, 0.52), TM));
+
+    /* warm desert atmosphere: visibility ~400-600m, mesas hazy on the horizon */
+    JK.GL.fog([0.86, 0.72, 0.52], 0.0016);
+    JK.GL.sun(SUN_DIR, [1.0, 0.92, 0.74], [0.42, 0.36, 0.30]);
   },
-  draw: function(){ JK.GL.draw(mesh, null); }
+
+  draw: function(){
+    JK.GL.draw(terrainMesh, null);
+    JK.GL.draw(sceneryMesh, null);
+    JK.GL.draw(sunMesh, null, SUN_OPTS);
+    JK.GL.draw(haloMesh, null, HALO_OPTS);
+  }
 };
 })();
 
 /* ===== 20_input.js ===== */
-/* JK.Input — STUB, replaced by input agent. */
+/* JK.Input — touch-first controls + desktop fallback. Owner: input agent.
+ *
+ * FINAL STATE SHAPE — JK.Input.state, snapshotted exactly once per update(dt).
+ * Consumers read it after Input.update has run for the frame (main runs Input
+ * before Player). Same object identity forever — safe to cache a reference.
+ *
+ *   {
+ *     moveX, moveY   // -1..1 virtual stick. moveY = +1 means FORWARD (away
+ *                    //   from camera). Keyboard diagonals are normalized.
+ *     lookDX, lookDY // look-drag pixels accumulated since the LAST update,
+ *                    //   then reset each snapshot. +DX = drag right, +DY = drag down.
+ *     jump,          // edge: TRUE only on the first frame after a press
+ *     attack,        //   (touch button touchstart / key down / mouse down;
+ *     force,         //   never repeat-fires while held)
+ *     stanceTap,     // edge: stance-cycle tap (Q / #btnStance)
+ *     forceTap,      // edge: force-select tap (R / mousewheel)
+ *     attackHeld,    // held: TRUE while #btnAtk is touched or LMB is down
+ *     runHeld,       // held: TRUE while sprinting (stick deflection > 0.92
+ *                    //   of radius, or Shift on desktop)
+ *     run,           // legacy alias, always === runHeld
+ *     stance,        // running tap counter for stance cycling (consumers
+ *     forceSel       //   take modulo; monotonically increasing ints)
+ *   }
+ *
+ * Touch: #stickL (left 45%) = dynamic virtual stick (origin where the finger
+ * lands, #stickUI shown there). Right half of the canvas = look drag. Buttons
+ * #btnJump #btnAtk #btnForce #btnStance. Multi-touch tracked by identifier so
+ * move + look + ATK all work at once. Desktop: WASD/arrows, Shift run,
+ * Space jump, mouse-drag look, LMB attack, E force, Q stance, R/wheel force-select.
+ */
 (function(){
 'use strict';
+
+var RADIUS = 48;          /* stick radius, px */
+var RUN_FRAC = 0.92;      /* deflection fraction beyond which we sprint */
+var KNOB_SCALE = 28 / 48; /* knob visual travel so it stays inside the ring */
+var WHEEL_MS = 200;       /* mousewheel forceTap throttle */
+
+var state = {
+  moveX: 0, moveY: 0,
+  lookDX: 0, lookDY: 0,
+  jump: false, attack: false, force: false, stanceTap: false, forceTap: false,
+  attackHeld: false, runHeld: false,
+  run: false,
+  stance: 0, forceSel: 0
+};
+
+/* --- pending edges: set by events, copied into state then cleared each update --- */
+var pJump = false, pAttack = false, pForce = false, pStance = false, pForceTap = false;
+var accDX = 0, accDY = 0;           /* look pixels accumulated between updates */
+var cStance = 0, cForceSel = 0;     /* running tap counters */
+
+/* --- touch stick --- */
+var stickId = null, stickOX = 0, stickOY = 0;
+var stickMX = 0, stickMY = 0, stickRun = false;
+/* --- touch look --- */
+var lookId = null, lookLX = 0, lookLY = 0;
+/* --- touch buttons (attack hold) --- */
+var touchAtk = false;
+var btns = [];  /* {el, tid, mdown, down, up} */
+/* --- mouse --- */
+var mouseLook = false, mouseLX = 0, mouseLY = 0, mouseAtk = false;
+var lastWheel = 0;
+/* --- keyboard --- */
+var kFwd = false, kBack = false, kLeft = false, kRight = false, kShift = false;
+var keyHeld = {};   /* keyCode -> bool, our own repeat guard */
+
+var elStick = null, elUI = null, elKnob = null, elCanvas = null, elStart = null;
+
+function overlayUp(){
+  return !!(elStart && !elStart.classList.contains('gone'));
+}
+
+/* Did this Touch actually land on el? Guards against same-event multi-touch:
+ * when two fingers start in one touchstart, changedTouches can contain BOTH,
+ * and claiming ts[0] blindly can steal another zone's finger (e.g. #btnAtk
+ * grabbing the stick finger's identifier => stuck button + stuck attackHeld). */
+function ownsTouch(el, t){
+  var n = t.target;
+  if (!n) return true;  /* ancient UA without Touch.target: trust dispatch */
+  return n === el || !!(el.contains && el.contains(n));
+}
+
+/* ---------- touch: virtual stick ---------- */
+function stickStart(e){
+  if (overlayUp()) return;
+  e.preventDefault();
+  var ts = e.changedTouches;
+  for (var i = 0; i < ts.length; i++){
+    var t = ts[i];
+    if (stickId === null && ownsTouch(elStick, t)){
+      stickId = t.identifier;
+      stickOX = t.clientX; stickOY = t.clientY;
+      stickMX = 0; stickMY = 0; stickRun = false;
+      if (elUI){
+        elUI.style.transform = 'translate(' + (stickOX - 48) + 'px,' + (stickOY - 48) + 'px)';
+        elUI.classList.add('on');
+        elUI.classList.remove('run');
+        if (elKnob) elKnob.style.transform = 'translate(0px,0px)';
+      }
+    }
+  }
+}
+
+/* ---------- touch: look drag (right half of canvas, not on a button) ---------- */
+function lookStart(e){
+  if (overlayUp()) return;
+  e.preventDefault();
+  var ts = e.changedTouches;
+  for (var i = 0; i < ts.length; i++){
+    var t = ts[i];
+    if (lookId === null && t.clientX >= window.innerWidth * 0.5 && ownsTouch(elCanvas, t)){
+      lookId = t.identifier;
+      lookLX = t.clientX; lookLY = t.clientY;
+    }
+  }
+}
+
+/* ---------- document-level move/end routing by touch identifier ---------- */
+function touchMove(e){
+  if (overlayUp()) return;
+  if (e.cancelable) e.preventDefault();
+  var ts = e.changedTouches;
+  for (var i = 0; i < ts.length; i++){
+    var t = ts[i];
+    if (t.identifier === stickId){
+      var dx = t.clientX - stickOX, dy = t.clientY - stickOY;
+      var len = Math.sqrt(dx * dx + dy * dy);
+      var cl = len > RADIUS ? RADIUS / len : 1;
+      var cx = dx * cl, cy = dy * cl;
+      stickMX = cx / RADIUS;
+      stickMY = -cy / RADIUS;          /* drag up = forward = +1 */
+      stickRun = len > RADIUS * RUN_FRAC;
+      if (elKnob) elKnob.style.transform =
+        'translate(' + (cx * KNOB_SCALE) + 'px,' + (cy * KNOB_SCALE) + 'px)';
+      if (elUI){
+        if (stickRun) elUI.classList.add('run');
+        else elUI.classList.remove('run');
+      }
+    } else if (t.identifier === lookId){
+      accDX += t.clientX - lookLX;
+      accDY += t.clientY - lookLY;
+      lookLX = t.clientX; lookLY = t.clientY;
+    }
+  }
+}
+
+function touchEnd(e){
+  if (overlayUp()) return;
+  if (e.cancelable) e.preventDefault();
+  var ts = e.changedTouches;
+  for (var i = 0; i < ts.length; i++){
+    var id = ts[i].identifier;
+    if (id === stickId){
+      stickId = null;
+      stickMX = 0; stickMY = 0; stickRun = false;
+      if (elUI){ elUI.classList.remove('on'); elUI.classList.remove('run'); }
+    } else if (id === lookId){
+      lookId = null;
+    } else {
+      for (var b = 0; b < btns.length; b++){
+        if (btns[b].tid === id){
+          btns[b].tid = null;
+          if (!btns[b].mdown) btns[b].el.classList.remove('held');
+          if (btns[b].up) btns[b].up();
+        }
+      }
+    }
+  }
+}
+
+/* ---------- touch buttons ---------- */
+function bindBtn(el, down, up){
+  if (!el) return;
+  var b = { el: el, tid: null, mdown: false, down: down, up: up };
+  btns.push(b);
+  el.addEventListener('touchstart', function(e){
+    if (overlayUp()) return;
+    e.preventDefault();               /* kills iOS synthetic click / text select */
+    if (b.tid !== null) return;
+    var ts = e.changedTouches;
+    for (var i = 0; i < ts.length; i++){
+      if (ownsTouch(el, ts[i])){ b.tid = ts[i].identifier; break; }
+    }
+    if (b.tid === null) return;       /* none of the new touches landed on us */
+    el.classList.add('held');
+    if (down) down();
+  }, {passive:false});
+  /* desktop nicety: buttons also clickable with the mouse (LMB only) */
+  el.addEventListener('mousedown', function(e){
+    if (overlayUp() || e.button !== 0) return;
+    e.preventDefault();
+    if (b.mdown) return;
+    b.mdown = true;
+    el.classList.add('held');
+    if (down) down();
+  });
+}
+
+/* ---------- desktop mouse (down-drag look on canvas) ---------- */
+function mouseDown(e){
+  if (overlayUp()) return;
+  e.preventDefault();
+  mouseLook = true;
+  mouseLX = e.clientX; mouseLY = e.clientY;
+  if (e.button === 0){ pAttack = true; mouseAtk = true; }
+}
+function mouseMove(e){
+  if (!mouseLook) return;
+  accDX += e.clientX - mouseLX;
+  accDY += e.clientY - mouseLY;
+  mouseLX = e.clientX; mouseLY = e.clientY;
+}
+function mouseUp(e){
+  mouseLook = false;
+  if (e.button !== 0) return;         /* buttons are LMB-only, matching mousedown */
+  mouseAtk = false;
+  for (var i = 0; i < btns.length; i++){
+    if (btns[i].mdown){
+      btns[i].mdown = false;
+      if (btns[i].tid === null) btns[i].el.classList.remove('held');
+      if (btns[i].up) btns[i].up();
+    }
+  }
+}
+function wheel(e){
+  e.preventDefault();
+  if (overlayUp()) return;
+  var now = Date.now();
+  if (now - lastWheel < WHEEL_MS) return;
+  lastWheel = now;
+  pForceTap = true; cForceSel++;
+}
+
+/* ---------- keyboard ---------- */
+function keyDown(e){
+  var k = e.keyCode;
+  var eat = (k === 32 || (k >= 37 && k <= 40));
+  if (keyHeld[k]){ if (eat) e.preventDefault(); return; }  /* repeat guard */
+  keyHeld[k] = true;
+  switch (k){
+    case 87: case 38: kFwd = true; break;    /* W / Up */
+    case 83: case 40: kBack = true; break;   /* S / Down */
+    case 65: case 37: kLeft = true; break;   /* A / Left */
+    case 68: case 39: kRight = true; break;  /* D / Right */
+    case 16: kShift = true; break;           /* Shift = run */
+    case 32: if (!overlayUp()) pJump = true; break;                    /* Space */
+    case 69: if (!overlayUp()) pForce = true; break;                   /* E */
+    case 81: if (!overlayUp()){ pStance = true; cStance++; } break;    /* Q */
+    case 82: if (!overlayUp()){ pForceTap = true; cForceSel++; } break;/* R */
+  }
+  if (eat) e.preventDefault();
+}
+function keyUp(e){
+  var k = e.keyCode;
+  keyHeld[k] = false;
+  switch (k){
+    case 87: case 38: kFwd = false; break;
+    case 83: case 40: kBack = false; break;
+    case 65: case 37: kLeft = false; break;
+    case 68: case 39: kRight = false; break;
+    case 16: kShift = false; break;
+  }
+}
+
+/* ---------- safety: drop everything held when we lose focus ---------- */
+function releaseAll(){
+  var k;
+  for (k in keyHeld) keyHeld[k] = false;
+  kFwd = kBack = kLeft = kRight = kShift = false;
+  mouseLook = false; mouseAtk = false; touchAtk = false;
+  stickId = null; stickMX = 0; stickMY = 0; stickRun = false;
+  lookId = null;
+  /* rAF is paused while hidden — drop pending edges + look deltas so the
+   * player doesn't get a phantom jump/attack/camera-jerk on refocus */
+  pJump = pAttack = pForce = pStance = pForceTap = false;
+  accDX = 0; accDY = 0;
+  if (elUI){ elUI.classList.remove('on'); elUI.classList.remove('run'); }
+  for (var i = 0; i < btns.length; i++){
+    btns[i].tid = null; btns[i].mdown = false;
+    btns[i].el.classList.remove('held');
+  }
+}
+
 JK.Input = {
-  state: { moveX:0, moveY:0, lookDX:0, lookDY:0, jump:false, attack:false,
-           force:false, run:false, stance:0, forceSel:0 },
-  init: function(){},
-  update: function(dt, t){}
+  state: state,
+
+  init: function(){
+    elCanvas = document.getElementById('gl');
+    elStick  = document.getElementById('stickL');
+    elUI     = document.getElementById('stickUI');
+    elKnob   = elUI ? elUI.getElementsByTagName('b')[0] : null;
+    elStart  = document.getElementById('start');
+
+    if (elStick) elStick.addEventListener('touchstart', stickStart, {passive:false});
+    if (elCanvas) elCanvas.addEventListener('touchstart', lookStart, {passive:false});
+    document.addEventListener('touchmove', touchMove, {passive:false});
+    document.addEventListener('touchend', touchEnd, {passive:false});
+    document.addEventListener('touchcancel', touchEnd, {passive:false});
+
+    bindBtn(document.getElementById('btnJump'),
+      function(){ pJump = true; }, null);
+    bindBtn(document.getElementById('btnAtk'),
+      function(){ pAttack = true; touchAtk = true; },
+      function(){ touchAtk = false; });
+    bindBtn(document.getElementById('btnForce'),
+      function(){ pForce = true; }, null);
+    bindBtn(document.getElementById('btnStance'),
+      function(){ pStance = true; cStance++; }, null);
+
+    if (elCanvas) elCanvas.addEventListener('mousedown', mouseDown);
+    window.addEventListener('mousemove', mouseMove);
+    window.addEventListener('mouseup', mouseUp);
+    window.addEventListener('wheel', wheel, {passive:false});
+
+    window.addEventListener('keydown', keyDown);
+    window.addEventListener('keyup', keyUp);
+    window.addEventListener('blur', releaseAll);
+    document.addEventListener('visibilitychange', function(){
+      if (document.hidden) releaseAll();
+    });
+  },
+
+  update: function(dt, t){
+    /* move: touch stick wins while active, else keyboard */
+    var mx, my;
+    if (stickId !== null){
+      mx = stickMX; my = stickMY;
+    } else {
+      mx = (kRight ? 1 : 0) - (kLeft ? 1 : 0);
+      my = (kFwd ? 1 : 0) - (kBack ? 1 : 0);
+      if (mx !== 0 && my !== 0){ mx *= 0.7071; my *= 0.7071; }
+    }
+    state.moveX = mx;
+    state.moveY = my;
+
+    /* holds */
+    state.runHeld = stickRun || kShift;
+    state.run = state.runHeld;                 /* legacy alias */
+    state.attackHeld = touchAtk || mouseAtk;
+
+    /* edges: pending -> state, then clear */
+    state.jump = pJump;
+    state.attack = pAttack;
+    state.force = pForce;
+    state.stanceTap = pStance;
+    state.forceTap = pForceTap;
+    pJump = pAttack = pForce = pStance = pForceTap = false;
+
+    /* look: accumulated pixels since last snapshot, then reset */
+    state.lookDX = accDX;
+    state.lookDY = accDY;
+    accDX = 0; accDY = 0;
+
+    /* running tap counters */
+    state.stance = cStance;
+    state.forceSel = cForceSel;
+  }
 };
 })();
 
 /* ===== 30_player.js ===== */
-/* JK.Player — STUB, replaced by player agent. */
+/* JK.Player — third-person movement physics + orbit camera. Owner: player agent.
+ *
+ * EXPORTS (stable identities — other modules read these every frame):
+ *   pos [x,y,z]      FEET position, meters (same array object forever)
+ *   yaw              facing, radians, 0 = -Z (character model heading)
+ *   vel [x,y,z]      velocity m/s (same array object forever)
+ *   onGround         bool
+ *   speed2D          horizontal speed m/s
+ *   anim             'idle' | 'run' | 'sprint' | 'jump' | 'fall'
+ *   camEye/camTarget vec3 arrays (reused, never reallocated)
+ *   camYaw/camPitch  camera orbit angles, radians (for aiming modules)
+ *   stanceIdx        0 LIGHT / 1 MEDIUM / 2 STRONG (cycled by stance tap)
+ *   attackQueued     set true on attack edge; saber module consumes+clears.
+ *
+ * Feel: JK2-ish — fast accel, heroic 8.5 m/s jump under 22 m/s^2 gravity,
+ * camera-relative stick, body turns toward travel at 12 rad/s.
+ */
 (function(){
 'use strict';
+
+/* ---------------- tuning ---------------- */
+var WALK_SPEED   = 5.0;    /* m/s */
+var SPRINT_SPEED = 8.0;    /* m/s */
+var ACCEL_GND    = 40;     /* m/s^2 toward desired vel on ground */
+var ACCEL_AIR    = 12;     /* ~30% air control */
+var DECEL_GND    = 30;     /* m/s^2 friction when no input on ground */
+var TURN_RATE    = 12;     /* rad/s body yaw toward move dir */
+var GRAVITY      = 22;     /* m/s^2 */
+var JUMP_VY      = 8.5;    /* m/s — heroic */
+var BODY_R       = 0.55;   /* player capsule radius vs obstacle circles */
+var SNAP_DOWN    = 0.6;    /* max ground drop we glue to before going airborne */
+var STEEP_TAN    = 0.7;    /* uphill grade where slow-down starts (~35 deg) */
+var LOOK_SENS    = 0.0045; /* rad per pixel */
+var PITCH_MIN    = -1.1, PITCH_MAX = 0.5;
+var CAM_DIST     = 4.2, CAM_DIST_SPRINT = 4.8;
+var CAM_UP       = 1.55;   /* target height above feet */
+var CAM_SMOOTH   = 10;     /* /s exp smoothing on eye */
+var DIST_SMOOTH  = 4;      /* /s easing on orbit distance */
+var CAM_CLEAR    = 0.35;   /* eye min height above terrain */
+var EDGE_SPRING  = 10;     /* /s soft pushback at world border */
+var PI = Math.PI, TWO_PI = PI * 2;
+
+/* ---------------- exported arrays (allocated once) ---------------- */
+var pos = [0, 0, 6];
+var vel = [0, 0, 0];
+var camEye = [0, 3, 11];
+var camTarget = [0, 1.55, 6];
+
+/* ---------------- internal state ---------------- */
+var yaw = 0, camYaw = 0, camPitch = -0.26, camDist = CAM_DIST;
+var onGround = true, speed2D = 0, anim = 'idle';
+var stanceIdx = 1;              /* template default: MEDIUM */
+var lastStanceCt = 0;
+var stanceEl = null;
+var STANCE_NAMES = ['LIGHT STANCE', 'MEDIUM STANCE', 'STRONG STANCE'];
+var EMPTY = [];
+var NULL_STATE = { moveX: 0, moveY: 0, lookDX: 0, lookDY: 0,
+  jump: false, attack: false, force: false, run: false, stance: 0 };
+var DES_EYE = [0, 0, 0];        /* scratch: desired eye before smoothing */
+
+/* ---------------- helpers ---------------- */
+function gh(x, z){                       /* defensive ground height */
+  var T = JK.Terrain;
+  return (T && T.height) ? T.height(x, z) : 0;
+}
+
+function softEdge(i, S, dt){             /* soft pushback on axis i (0 or 2) */
+  var p = pos[i], over = 0;
+  if (p > S) over = p - S; else if (p < -S) over = p + S;
+  if (over !== 0){
+    var k = EDGE_SPRING * dt; if (k > 1) k = 1;
+    pos[i] = p - over * k;
+    if (over * vel[i] > 0) vel[i] *= 1 - k;         /* bleed outward speed */
+    if (pos[i] > S + 8) pos[i] = S + 8;             /* hard sanity cap */
+    else if (pos[i] < -S - 8) pos[i] = -S - 8;
+  }
+}
+
+/* camera pose from camYaw/camPitch/camDist. snap=true skips smoothing. */
+function placeCamera(dt, snap){
+  camTarget[0] = pos[0];
+  camTarget[1] = pos[1] + CAM_UP;
+  camTarget[2] = pos[2];
+  var cp = Math.cos(camPitch), sp = Math.sin(camPitch);
+  var fx = -Math.sin(camYaw) * cp, fy = sp, fz = -Math.cos(camYaw) * cp;
+  DES_EYE[0] = camTarget[0] - fx * camDist;
+  DES_EYE[1] = camTarget[1] - fy * camDist;
+  DES_EYE[2] = camTarget[2] - fz * camDist;
+  var k = snap ? 1 : 1 - Math.exp(-CAM_SMOOTH * dt);
+  camEye[0] += (DES_EYE[0] - camEye[0]) * k;
+  camEye[1] += (DES_EYE[1] - camEye[1]) * k;
+  camEye[2] += (DES_EYE[2] - camEye[2]) * k;
+  var floor = gh(camEye[0], camEye[2]) + CAM_CLEAR;  /* never under the sand */
+  if (camEye[1] < floor) camEye[1] = floor;
+}
+
+function mirror(P){                      /* copy scalars onto the export */
+  P.yaw = yaw; P.onGround = onGround; P.speed2D = speed2D; P.anim = anim;
+  P.camYaw = camYaw; P.camPitch = camPitch; P.stanceIdx = stanceIdx;
+}
+
+/* ---------------- module ---------------- */
 JK.Player = {
-  pos: [0, 0, 0], yaw: 0, vel: [0, 0, 0], onGround: true, speed2D: 0, anim: 'idle',
-  camEye: [0, 3, 6], camTarget: [0, 1.2, 0],
-  init: function(){},
+  pos: pos, yaw: 0, vel: vel, onGround: true, speed2D: 0, anim: 'idle',
+  camEye: camEye, camTarget: camTarget,
+  camYaw: 0, camPitch: -0.26,
+  stanceIdx: 1,
+  attackQueued: false,
+
+  init: function(){
+    pos[0] = 0; pos[2] = 6;                      /* spawn facing origin (-Z) */
+    pos[1] = gh(pos[0], pos[2]);                 /* ground at the ACTUAL spawn xz */
+    vel[0] = 0; vel[1] = 0; vel[2] = 0;
+    yaw = 0; camYaw = 0; camPitch = -0.26; camDist = CAM_DIST;
+    onGround = true; speed2D = 0; anim = 'idle';
+    stanceIdx = 1; this.attackQueued = false;
+    stanceEl = document.getElementById('stanceTag');
+    if (stanceEl) stanceEl.textContent = STANCE_NAMES[stanceIdx];
+    var st = JK.Input && JK.Input.state;
+    lastStanceCt = st ? (st.stance | 0) : 0;
+    placeCamera(0, true);
+    mirror(this);
+    JK.GL.setCamera(camEye, camTarget, 72);
+  },
+
   update: function(dt, t){
-    JK.GL.setCamera(this.camEye, this.camTarget, 70);
+    var P = JK.Player;
+    var st = (JK.Input && JK.Input.state) || NULL_STATE;
+    var i;
+
+    /* ---- orbit look: drag right => orbit right, drag up => look up ---- */
+    camYaw -= (st.lookDX || 0) * LOOK_SENS;
+    if (camYaw > PI) camYaw -= TWO_PI; else if (camYaw < -PI) camYaw += TWO_PI;
+    camPitch -= (st.lookDY || 0) * LOOK_SENS;
+    if (camPitch < PITCH_MIN) camPitch = PITCH_MIN;
+    else if (camPitch > PITCH_MAX) camPitch = PITCH_MAX;
+
+    /* ---- camera-relative desired move ---- */
+    var mx = st.moveX || 0, my = st.moveY || 0;
+    var mag = Math.sqrt(mx * mx + my * my);
+    if (mag > 1){ mx /= mag; my /= mag; mag = 1; }
+    var hasMove = mag > 0.12;
+    var sprinting = !!(st.runHeld !== undefined ? st.runHeld : st.run);
+    var fwdX = -Math.sin(camYaw), fwdZ = -Math.cos(camYaw);
+    /* right = fwd x up = (-fwdZ, 0, fwdX) */
+    var dirX = fwdX * my - fwdZ * mx;
+    var dirZ = fwdZ * my + fwdX * mx;
+
+    var dvx = 0, dvz = 0;
+    if (hasMove){
+      var spd = (sprinting ? SPRINT_SPEED : WALK_SPEED) * mag;
+      if (onGround){
+        /* uphill grade along move dir; >~50deg gets heavily slowed */
+        var e = 0.4;
+        var hx = (gh(pos[0] + e, pos[2]) - gh(pos[0] - e, pos[2])) / (2 * e);
+        var hz = (gh(pos[0], pos[2] + e) - gh(pos[0], pos[2] - e)) / (2 * e);
+        var uph = (dirX * hx + dirZ * hz) / mag;
+        if (uph > STEEP_TAN){
+          var kSlope = 1 - (uph - STEEP_TAN) * 1.4;  /* ~0.3 at 50deg grade */
+          if (kSlope < 0.15) kSlope = 0.15;
+          spd *= kSlope;
+        }
+      }
+      var s = spd / mag;
+      dvx = dirX * s; dvz = dirZ * s;
+    }
+
+    /* ---- accelerate toward desired horizontal velocity ---- */
+    var ax = dvx - vel[0], az = dvz - vel[2];
+    var al = Math.sqrt(ax * ax + az * az);
+    var rate = hasMove ? (onGround ? ACCEL_GND : ACCEL_AIR)
+                       : (onGround ? DECEL_GND : 0);
+    if (al > 1e-6 && rate > 0){
+      var step = rate * dt;
+      if (step >= al){ vel[0] = dvx; vel[2] = dvz; }
+      else { vel[0] += ax / al * step; vel[2] += az / al * step; }
+    }
+
+    /* ---- body yaw eases toward travel direction (shortest arc) ---- */
+    if (hasMove){
+      var tYaw = Math.atan2(-dirX, -dirZ);           /* fwd(yaw)=(-sin,-cos) */
+      var d = tYaw - yaw;
+      d -= TWO_PI * Math.round(d / TWO_PI);
+      var mt = TURN_RATE * dt;
+      if (d > mt) d = mt; else if (d < -mt) d = -mt;
+      yaw += d;
+      if (yaw > PI) yaw -= TWO_PI; else if (yaw < -PI) yaw += TWO_PI;
+    }
+
+    /* ---- jump / gravity / integrate ---- */
+    if (st.jump && onGround){ vel[1] = JUMP_VY; onGround = false; }
+    if (onGround) vel[1] = 0; else vel[1] -= GRAVITY * dt;
+    pos[0] += vel[0] * dt;
+    pos[1] += vel[1] * dt;
+    pos[2] += vel[2] * dt;
+
+    /* ---- world border: soft pushback at +/-SIZE ---- */
+    var S = (JK.Terrain && JK.Terrain.SIZE) || 350;
+    softEdge(0, S, dt);
+    softEdge(2, S, dt);
+
+    /* ---- push out of obstacle circles ---- */
+    var obs = (JK.Terrain && JK.Terrain.obstacles) || EMPTY;
+    for (i = 0; i < obs.length; i++){
+      var o = obs[i];
+      var dx = pos[0] - o.x, dz = pos[2] - o.z;
+      var rr = o.r + BODY_R;
+      var d2 = dx * dx + dz * dz;
+      if (d2 < rr * rr){
+        var dl = Math.sqrt(d2);
+        var nx, nz;
+        if (dl < 1e-4){ nx = 1; nz = 0; } else { nx = dx / dl; nz = dz / dl; }
+        pos[0] = o.x + nx * rr;
+        pos[2] = o.z + nz * rr;
+        var vn = vel[0] * nx + vel[2] * nz;
+        if (vn < 0){ vel[0] -= vn * nx; vel[2] -= vn * nz; }  /* slide */
+      }
+    }
+
+    /* ---- ground collide / follow ---- */
+    var gy = gh(pos[0], pos[2]);
+    if (onGround){
+      if (gy >= pos[1] - SNAP_DOWN) pos[1] = gy;     /* glue to the dunes */
+      else onGround = false;                          /* crest launched us */
+    } else if (pos[1] <= gy){
+      pos[1] = gy; vel[1] = 0; onGround = true;       /* land: snap */
+    }
+
+    /* ---- derived: speed + anim hint ---- */
+    speed2D = Math.sqrt(vel[0] * vel[0] + vel[2] * vel[2]);
+    if (!onGround) anim = vel[1] > 0.5 ? 'jump' : 'fall';
+    else if (speed2D > 6.2) anim = 'sprint';
+    else if (speed2D > 0.6) anim = 'run';
+    else anim = 'idle';
+
+    /* ---- combat edges (do not consume beyond this) ---- */
+    if (st.attack) P.attackQueued = true;             /* saber module clears */
+    var stanceEdge;
+    if (st.stanceTap !== undefined) stanceEdge = !!st.stanceTap;
+    else stanceEdge = (st.stance | 0) !== lastStanceCt;
+    lastStanceCt = st.stance | 0;
+    if (stanceEdge){
+      stanceIdx = (stanceIdx + 1) % 3;
+      if (stanceEl) stanceEl.textContent = STANCE_NAMES[stanceIdx];
+    }
+
+    /* ---- camera: springy orbit, pulls back while sprinting ---- */
+    var wantDist = speed2D > 6.2 ? CAM_DIST_SPRINT : CAM_DIST;
+    camDist += (wantDist - camDist) * (1 - Math.exp(-DIST_SMOOTH * dt));
+    placeCamera(dt, false);
+
+    mirror(P);
+    JK.GL.setCamera(camEye, camTarget, 72);           /* END of update */
   }
 };
 })();
 
 /* ===== 40_character.js ===== */
-/* JK.Rig — STUB, replaced by character agent. */
+/* JK.Rig — low-poly humanoid rig + procedural animation + lightsaber.
+ * Owner: character agent.
+ *
+ * Shared geometry: ONE set of white part meshes built once (buildMeshes); every
+ * instance draws them with per-instance palette tints — bots reuse everything.
+ *
+ * Instance API (for bots iteration):
+ *   var rig = JK.Rig.create(palette);
+ *     palette: {skin,tunic,pants,boots,belt,hair} each [r,g,b]; null => Kyle-ish.
+ *   rig.draw(pos, yaw, anim, phaseInfo)
+ *     pos [x,y,z] feet, yaw radians. If phaseInfo {dt,t,speed} is given, the rig
+ *     advances animation first (anim: 'idle'|'run'|'sprint'|'jump'|'fall'), then
+ *     renders. Omit anim/phaseInfo to just render the current pose.
+ *   rig.advance(dt, t, anim, speed2D)  — step animation without rendering.
+ *   rig.setSaber(rgb, on)              — blade color / ignite state.
+ *   rig.startSwing()                   — 0.38 s slash (chains when >60% done).
+ *   rig.swingT (-1 idle, else seconds), rig.pose (eased joint angles),
+ *   rig.basePos / rig.tipPos (Float32Array(3), world blade ends, set each draw).
+ *
+ * JK.Rig itself is the player's bridge: init/update/draw run the player rig off
+ * JK.Player state; JK.Rig.tipPos/basePos alias the player rig's blade ends.
+ */
 (function(){
 'use strict';
-var mesh = null, mm = null;
-JK.Rig = {
-  init: function(){
-    mesh = JK.GL.mesh(JK.Geo.box(0.6, 1.8, 0.4, 0.45, 0.35, 0.28));
-    mm = JK.M.make();
-  },
-  draw: function(){
-    var p = JK.Player.pos;
-    JK.M.ident(mm); JK.M.tr(mm, p[0], p[1] + 0.9, p[2]); JK.M.ry(mm, JK.Player.yaw);
-    JK.GL.draw(mesh, mm);
+var M = JK.M;
+
+/* ---------------- skeleton constants ---------------- */
+var HIP_Y = 0.92;          /* pelvis height above feet */
+var PELV2TORSO = 0.10, NECK_Y = 0.52;
+var SH_X = 0.26, SH_Y = 0.44;      /* shoulder offset in torso frame */
+var UARM = 0.30, LARM = 0.28;      /* arm segment lengths */
+var HIP_X = 0.105, HIP_DY = -0.06; /* leg sockets in pelvis frame */
+var ULEG = 0.42, LLEG = 0.38;
+var HILT_TOP = 0.17, BLADE_LEN = 1.25;
+var SWING_DUR = 0.38, CHAIN_FRAC = 0.6;
+var TWO_PI = Math.PI * 2;
+
+var DEF_PAL = {
+  skin:  [0.85, 0.64, 0.47],
+  tunic: [0.76, 0.60, 0.38],
+  pants: [0.38, 0.26, 0.17],
+  boots: [0.16, 0.13, 0.11],
+  belt:  [0.28, 0.19, 0.11],
+  hair:  [0.33, 0.21, 0.11]
+};
+
+/* ---------------- shared meshes (built once, white; tinted per draw) -------- */
+var MESH = null;
+var TB = M.make();
+function bakedBox(sx, sy, sz, r, g, b, x, y, z){
+  M.ident(TB); M.tr(TB, x, y, z);
+  return JK.Geo.tf(JK.Geo.box(sx, sy, sz, r, g, b), TB);
+}
+function buildMeshes(){
+  if (MESH) return;
+  var G = JK.Geo, GL = JK.GL;
+  MESH = {
+    head: GL.mesh(G.merge([
+      bakedBox(0.10, 0.10, 0.10, 1,1,1, 0, 0.03, 0),          /* neck */
+      bakedBox(0.22, 0.26, 0.24, 1,1,1, 0, 0.17, 0.01)])),    /* skull */
+    hair: GL.mesh(G.merge([
+      bakedBox(0.24, 0.09, 0.26, 1,1,1, 0, 0.315, -0.005),    /* cap */
+      bakedBox(0.24, 0.15, 0.05, 1,1,1, 0, 0.235, -0.145)])), /* back */
+    torso: GL.mesh(bakedBox(0.40, 0.50, 0.24, 1,1,1, 0, 0.28, 0)),
+    hips:  GL.mesh(bakedBox(0.32, 0.18, 0.21, 1,1,1, 0, -0.035, 0)),
+    belt:  GL.mesh(bakedBox(0.36, 0.09, 0.25, 1,1,1, 0, 0.075, 0)),
+    uarm:  GL.mesh(bakedBox(0.12, 0.34, 0.13, 1,1,1, 0, -0.13, 0)),
+    larm:  GL.mesh(bakedBox(0.10, 0.30, 0.11, 1,1,1, 0, -0.12, 0)),
+    hand:  GL.mesh(bakedBox(0.095, 0.11, 0.10, 1,1,1, 0, -0.01, 0)),
+    uleg:  GL.mesh(bakedBox(0.15, 0.46, 0.16, 1,1,1, 0, -0.19, 0)),
+    lleg:  GL.mesh(bakedBox(0.125, 0.42, 0.135, 1,1,1, 0, -0.17, 0)),
+    boot: GL.mesh(G.merge([
+      bakedBox(0.13, 0.16, 0.15, 1,1,1, 0, 0.03, 0),          /* shaft */
+      bakedBox(0.135, 0.07, 0.26, 1,1,1, 0, -0.045, -0.055)])),/* toe fwd -Z */
+    hilt: GL.mesh(G.merge([                                    /* baked colors */
+      bakedBox(0.045, 0.24, 0.045, 0.60, 0.61, 0.65, 0, 0.02, 0),
+      bakedBox(0.06, 0.05, 0.06, 0.18, 0.18, 0.21, 0, -0.115, 0),
+      bakedBox(0.062, 0.07, 0.062, 0.42, 0.43, 0.48, 0, 0.14, 0)])),
+    core:  GL.mesh(bakedBox(0.04, BLADE_LEN, 0.04, 1,1,1, 0, HILT_TOP + BLADE_LEN/2, 0)),
+    glow1: GL.mesh(bakedBox(0.11, BLADE_LEN + 0.08, 0.11, 1,1,1, 0, HILT_TOP + BLADE_LEN/2 + 0.02, 0)),
+    glow2: GL.mesh(bakedBox(0.21, BLADE_LEN + 0.18, 0.21, 1,1,1, 0, HILT_TOP + BLADE_LEN/2 + 0.04, 0)),
+    /* shadow: emissive dark-sand patch (core shader only blends in additive
+       mode, so a thin "pre-shaded" opaque box reads as a shadow with zero
+       core edits). */
+    shadow: GL.mesh(bakedBox(0.95, 0.02, 1.05, 0.33, 0.25, 0.155, 0, 0, 0))
+  };
+}
+var CORE_OPTS = { emissive: 1, nofog: true };
+var SHADOW_OPTS = { emissive: 1 };
+
+/* ---------------- swing keyframes: [shoulder swing, spread, elbow, wrist, torso twist] */
+var SW_T = [0, 0.30, 0.62, 1.0];
+var SW_K = [
+  [ 0.45,  0.15, 0.60, -0.60,  0.00],   /* guard              */
+  [ 2.25, -0.55, 1.00, -0.35, -0.45],   /* windup: up, across body */
+  [-0.55,  0.95, 0.15,  0.55,  0.45],   /* slashed down-right */
+  [ 0.45,  0.15, 0.60, -0.60,  0.00]    /* recover            */
+];
+var SWV = [0, 0, 0, 0, 0];
+function swingEval(u){
+  var i = 0;
+  while (i < 2 && u > SW_T[i + 1]) i++;
+  var a = SW_K[i], b = SW_K[i + 1];
+  var s = (u - SW_T[i]) / (SW_T[i + 1] - SW_T[i]);
+  if (s < 0) s = 0; else if (s > 1) s = 1;
+  s = s * s * (3 - 2 * s);
+  for (var j = 0; j < 5; j++) SWV[j] = a[j] + (b[j] - a[j]) * s;
+  return SWV;
+}
+
+function max0(x){ return x > 0 ? x : 0; }
+function ez(c, t, k){ return c + (t - c) * k; }
+
+/* ---------------- per-instance animation step ---------------- */
+function advance(dt, t, anim, speed){
+  var p = this.pose;
+  var sp = speed || 0;
+
+  var stride = 2.2 + sp * 0.16;
+  if (stride < 2.4) stride = 2.4; else if (stride > 3.6) stride = 3.6;
+  this.phase += sp * dt * TWO_PI / stride;
+  if (this.phase > TWO_PI) this.phase -= TWO_PI;
+  var ph = this.phase;
+
+  var lSwL, lSwR, kneeL, kneeR, aSwL, aSwR, sprL, sprR, elbL, elbR, wrist;
+  var lean, twist, bob, head;
+
+  if (anim === 'run' || anim === 'sprint'){
+    var fast = anim === 'sprint';
+    var A = fast ? 0.96 : 0.70;               /* +-55 deg / +-40 deg hips */
+    var s1 = Math.sin(ph);
+    var kAmp = fast ? 1.35 : 1.05;
+    lSwL = A * s1;             lSwR = -A * s1;
+    kneeL = -(0.22 + kAmp * max0(Math.cos(ph + 0.5)));
+    kneeR = -(0.22 + kAmp * max0(-Math.cos(ph + 0.5)));
+    aSwL = 0.06 - (fast ? 0.85 : 0.55) * s1;  /* counter-swing */
+    aSwR = 0.35 + (fast ? 0.50 : 0.30) * s1;  /* saber arm swings less */
+    sprL = 0.14; sprR = 0.16;
+    elbL = 0.60; elbR = 0.55;
+    wrist = -0.55;
+    lean = fast ? 0.26 : 0.14;                /* ~15 / ~8 deg forward */
+    bob = (fast ? 0.045 : 0.030) * (0.5 - 0.5 * Math.cos(2 * ph));
+    twist = (fast ? 0.12 : 0.08) * s1;
+    head = -lean * 0.6;
+  } else if (anim === 'jump'){                /* tucked / trailing legs */
+    lSwL = 0.55; lSwR = 0.10;
+    kneeL = -1.50; kneeR = -0.75;
+    aSwL = -0.55; aSwR = -0.35;               /* arms up-back */
+    sprL = 0.85; sprR = 0.70;
+    elbL = 0.45; elbR = 0.50;
+    wrist = -0.35;
+    lean = -0.06; bob = 0; twist = 0; head = 0.10;
+  } else if (anim === 'fall'){                /* limbs spread */
+    lSwL = 0.35; lSwR = -0.18;
+    kneeL = -0.45; kneeR = -0.25;
+    aSwL = -0.15; aSwR = -0.05;
+    sprL = 1.05; sprR = 0.90;
+    elbL = 0.35; elbR = 0.40;
+    wrist = -0.50;
+    lean = 0.07; bob = 0; twist = 0; head = 0.18;
+  } else {                                    /* idle: breathe, saber relaxed */
+    lSwL = 0.05; lSwR = -0.05;
+    kneeL = -0.09; kneeR = -0.09;
+    aSwL = 0.10; aSwR = 0.38;
+    sprL = 0.10; sprR = 0.14;
+    elbL = 0.28; elbR = 0.55;
+    wrist = -0.60 + 0.05 * Math.sin(t * 1.1);
+    lean = 0.04; twist = 0;
+    bob = 0.013 * Math.sin(t * 1.7);
+    head = 0.03 * Math.sin(t * 0.7);
   }
+
+  /* attack swing overlays the right arm + torso twist */
+  if (this.swingT >= 0){
+    this.swingT += dt;
+    if (this.swingT >= SWING_DUR){
+      this.swingT = -1;
+    } else {
+      var kv = swingEval(this.swingT / SWING_DUR);
+      aSwR = kv[0]; sprR = kv[1]; elbR = kv[2]; wrist = kv[3];
+      twist += kv[4];
+      sprL += 0.25;                           /* off arm counterbalances */
+    }
+  }
+
+  /* exponential ease toward targets (~0.12 s blend) */
+  var kA = 1 - Math.exp(-26 * dt);            /* limbs */
+  var kB = 1 - Math.exp(-14 * dt);            /* body mass */
+  var kR = this.swingT >= 0 ? 1 - Math.exp(-45 * dt) : kA;  /* saber arm snaps */
+  p.lSwL = ez(p.lSwL, lSwL, kA);   p.lSwR = ez(p.lSwR, lSwR, kA);
+  p.kneeL = ez(p.kneeL, kneeL, kA); p.kneeR = ez(p.kneeR, kneeR, kA);
+  p.aSwL = ez(p.aSwL, aSwL, kA);   p.sprL = ez(p.sprL, sprL, kA);
+  p.elbL = ez(p.elbL, elbL, kA);
+  p.aSwR = ez(p.aSwR, aSwR, kR);   p.sprR = ez(p.sprR, sprR, kR);
+  p.elbR = ez(p.elbR, elbR, kR);   p.wrist = ez(p.wrist, wrist, kR);
+  p.bob = ez(p.bob, bob, kB);      p.lean = ez(p.lean, lean, kB);
+  p.twist = ez(p.twist, twist, kR); p.head = ez(p.head, head, kB);
+}
+
+function startSwing(){
+  if (this.swingT < 0 || this.swingT > SWING_DUR * CHAIN_FRAC) this.swingT = 0;
+}
+
+function setSaber(rgb, on){
+  if (rgb){ this.saberCol[0] = rgb[0]; this.saberCol[1] = rgb[1]; this.saberCol[2] = rgb[2]; }
+  if (on !== undefined) this.saberOn = !!on;
+}
+
+/* ---------------- render (module-scope matrix pool: zero alloc) ------------- */
+var mRoot = M.make(), mPelv = M.make(), mTorso = M.make(), mA = M.make(), mS = M.make();
+
+function renderRig(r, pos, yaw){
+  var GL = JK.GL, p = r.pose;
+
+  /* --- ground shadow first (also guarantees frame starts non-additive) --- */
+  var gx = pos[0], gz = pos[2], gy = 0, dhx = 0, dhz = 0, e = 0.6;
+  if (JK.Terrain && JK.Terrain.height){
+    gy = JK.Terrain.height(gx, gz);
+    dhx = (JK.Terrain.height(gx + e, gz) - JK.Terrain.height(gx - e, gz)) / (2 * e);
+    dhz = (JK.Terrain.height(gx, gz + e) - JK.Terrain.height(gx, gz - e)) / (2 * e);
+  }
+  var alt = pos[1] - gy; if (alt < 0) alt = 0;
+  var shs = 1 - alt * 0.22; if (shs < 0.35) shs = 0.35;   /* shrinks mid-air */
+  M.ident(mS); M.tr(mS, gx, gy + 0.03, gz);
+  M.rx(mS, -Math.atan(dhz)); M.rz(mS, Math.atan(dhx));    /* hug the slope */
+  M.sc(mS, shs, 1, shs);
+  GL.draw(MESH.shadow, mS, SHADOW_OPTS);
+
+  /* --- hierarchy --- */
+  M.ident(mRoot); M.tr(mRoot, pos[0], pos[1], pos[2]); M.ry(mRoot, yaw);
+
+  M.copy(mPelv, mRoot); M.tr(mPelv, 0, HIP_Y + p.bob, 0);
+  GL.draw(MESH.hips, mPelv, r.oPants);
+  GL.draw(MESH.belt, mPelv, r.oBelt);
+
+  M.copy(mTorso, mPelv); M.tr(mTorso, 0, PELV2TORSO, 0);
+  M.ry(mTorso, p.twist); M.rx(mTorso, p.lean);
+  GL.draw(MESH.torso, mTorso, r.oTunic);
+
+  /* head */
+  M.copy(mA, mTorso); M.tr(mA, 0, NECK_Y, 0); M.rx(mA, p.head);
+  GL.draw(MESH.head, mA, r.oSkin);
+  GL.draw(MESH.hair, mA, r.oHair);
+
+  /* left arm */
+  M.copy(mA, mTorso); M.tr(mA, -SH_X, SH_Y, 0); M.rz(mA, -p.sprL); M.rx(mA, p.aSwL);
+  GL.draw(MESH.uarm, mA, r.oTunic);
+  M.tr(mA, 0, -UARM, 0); M.rx(mA, p.elbL);
+  GL.draw(MESH.larm, mA, r.oTunic);
+  M.tr(mA, 0, -LARM, 0);
+  GL.draw(MESH.hand, mA, r.oSkin);
+
+  /* left leg */
+  M.copy(mA, mPelv); M.tr(mA, -HIP_X, HIP_DY, 0); M.rx(mA, p.lSwL);
+  GL.draw(MESH.uleg, mA, r.oPants);
+  M.tr(mA, 0, -ULEG, 0); M.rx(mA, p.kneeL);
+  GL.draw(MESH.lleg, mA, r.oPants);
+  M.tr(mA, 0, -LLEG, 0); M.rx(mA, -(p.lSwL + p.kneeL) * 0.6);  /* fake ankle */
+  GL.draw(MESH.boot, mA, r.oBoots);
+
+  /* right leg */
+  M.copy(mA, mPelv); M.tr(mA, HIP_X, HIP_DY, 0); M.rx(mA, p.lSwR);
+  GL.draw(MESH.uleg, mA, r.oPants);
+  M.tr(mA, 0, -ULEG, 0); M.rx(mA, p.kneeR);
+  GL.draw(MESH.lleg, mA, r.oPants);
+  M.tr(mA, 0, -LLEG, 0); M.rx(mA, -(p.lSwR + p.kneeR) * 0.6);
+  GL.draw(MESH.boot, mA, r.oBoots);
+
+  /* right (saber) arm — hand frame ends up in mA */
+  M.copy(mA, mTorso); M.tr(mA, SH_X, SH_Y, 0); M.rz(mA, p.sprR); M.rx(mA, p.aSwR);
+  GL.draw(MESH.uarm, mA, r.oTunic);
+  M.tr(mA, 0, -UARM, 0); M.rx(mA, p.elbR);
+  GL.draw(MESH.larm, mA, r.oTunic);
+  M.tr(mA, 0, -LARM, 0); M.rx(mA, p.wrist);
+  GL.draw(MESH.hand, mA, r.oSkin);
+  GL.draw(MESH.hilt, mA, null);
+
+  /* world blade ends for combat (valid every frame, on or off) */
+  M.xp(r.basePos, mA, 0, HILT_TOP, 0);
+  M.xp(r.tipPos, mA, 0, HILT_TOP + BLADE_LEN, 0);
+
+  if (r.saberOn){
+    GL.draw(MESH.glow2, mA, r.oGlow2);        /* faint outer shell */
+    GL.draw(MESH.glow1, mA, r.oGlow1);        /* hot inner shell */
+    GL.draw(MESH.core, mA, CORE_OPTS);        /* opaque core LAST: restores
+                                                 blend/depthMask state */
+  }
+}
+
+function instanceDraw(pos, yaw, anim, phaseInfo){
+  if (phaseInfo){
+    this.advance(phaseInfo.dt || 0, phaseInfo.t || 0, anim || 'idle',
+      phaseInfo.speed !== undefined ? phaseInfo.speed : (phaseInfo.speed2D || 0));
+  }
+  renderRig(this, pos, yaw);
+}
+
+/* ---------------- factory ---------------- */
+function col3(a, d){
+  var o = new Float32Array(3);
+  a = a || d;
+  o[0] = a[0]; o[1] = a[1]; o[2] = a[2];
+  return o;
+}
+
+function create(palette){
+  buildMeshes();
+  var pal = palette || {};
+  var rig = {
+    pose: { bob: 0, lean: 0.04, twist: 0, head: 0,
+      lSwL: 0.05, lSwR: -0.05, kneeL: -0.09, kneeR: -0.09,
+      aSwL: 0.10, aSwR: 0.38, sprL: 0.10, sprR: 0.14,
+      elbL: 0.28, elbR: 0.55, wrist: -0.60 },
+    phase: 0,
+    swingT: -1,
+    saberOn: true,
+    saberCol: col3(null, [0.2, 0.9, 0.3]),
+    basePos: new Float32Array(3),
+    tipPos: new Float32Array(3),
+    advance: advance,
+    draw: instanceDraw,
+    startSwing: startSwing,
+    setSaber: setSaber
+  };
+  /* per-instance draw opts, allocated once (tint arrays live for rig lifetime) */
+  rig.oSkin  = { tint: col3(pal.skin,  DEF_PAL.skin)  };
+  rig.oTunic = { tint: col3(pal.tunic, DEF_PAL.tunic) };
+  rig.oPants = { tint: col3(pal.pants, DEF_PAL.pants) };
+  rig.oBoots = { tint: col3(pal.boots, DEF_PAL.boots) };
+  rig.oBelt  = { tint: col3(pal.belt,  DEF_PAL.belt)  };
+  rig.oHair  = { tint: col3(pal.hair,  DEF_PAL.hair)  };
+  rig.oGlow1 = { emissive: 1, nofog: true, additive: true, alpha: 0.55, tint: rig.saberCol };
+  rig.oGlow2 = { emissive: 1, nofog: true, additive: true, alpha: 0.25, tint: rig.saberCol };
+  return rig;
+}
+
+/* ---------------- module = player instance bridge ---------------- */
+var player = null;
+
+JK.Rig = {
+  create: create,
+  SWING_DUR: SWING_DUR,
+  player: null,
+  pose: null,
+  tipPos: null,
+  basePos: null,
+
+  init: function(){
+    buildMeshes();
+    player = create(null);
+    this.player = player;
+    this.pose = player.pose;
+    this.tipPos = player.tipPos;
+    this.basePos = player.basePos;
+  },
+
+  update: function(dt, t){
+    if (!player) return;
+    var P = JK.Player;
+    var anim = 'idle', sp = 0;
+    if (P){
+      anim = P.anim || 'idle';
+      sp = P.speed2D || 0;
+      /* consume queued attacks; keep buffered until the current swing chains */
+      if (P.attackQueued){
+        if (player.swingT < 0 || player.swingT > SWING_DUR * CHAIN_FRAC){
+          P.attackQueued = false;
+          player.startSwing();
+        }
+      } else if (P.attackQueued === undefined &&
+                 JK.Input && JK.Input.state && JK.Input.state.attack){
+        player.startSwing();   /* fallback until player module queues attacks */
+      }
+    }
+    player.advance(dt, t, anim, sp);
+  },
+
+  draw: function(){
+    if (!player || !JK.Player || !JK.Player.pos) return;
+    renderRig(player, JK.Player.pos, JK.Player.yaw || 0);
+  },
+
+  setSaber: function(rgb, on){ if (player) player.setSaber(rgb, on); },
+  startSwing: function(){ if (player) player.startSwing(); }
 };
 })();
 
