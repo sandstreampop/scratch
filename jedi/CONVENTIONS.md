@@ -339,3 +339,58 @@ name. You must open the strip images and describe what you actually see.
 ### Facing (already done by core in 30_player.js — do not re-implement)
 While a swing is active or an attack was just queued, the body turns toward `camYaw` at
 26 rad/s, overriding movement facing. Swings therefore land where the camera looks.
+
+## SMART CAMERA CONTRACT (auto-follow) — FROZEN
+
+GOAL (player's words): "it should not snap but move to a new good place so I see where I go
+without having to micromanage my camera", like a state-of-the-art 3D mobile game.
+
+Owner: 30_player.js (the camera lives there). No other file changes.
+
+### THE SPIRAL TRAP — read this before writing a line
+Movement is CAMERA-RELATIVE: `worldMoveDir = R(camYaw) * stick`. So if you naively ease camYaw
+toward the travel direction, the travel direction rotates with it and the player runs in a slow
+circle forever. Hold the stick hard left and you will orbit. This is the default outcome of the
+obvious implementation and the probe tests for it explicitly (`headingDriftDeg`).
+
+The fix is to preserve the player's WORLD heading while the camera recenters. Recommended
+approach: keep an accumulator of the auto-recenter rotation applied while the stick is held, and
+convert stick -> world direction using `camYaw - autoAccum` rather than raw `camYaw`. Manual
+look input changes camYaw and the movement basis TOGETHER (dragging the camera must still steer
+you — that is expected in third-person games); only the AUTOMATIC rotation is compensated out.
+Reset the accumulator when the stick returns to neutral. At convergence the compensation is a
+no-op, so releasing and re-pushing the stick causes no jump. Any other scheme is acceptable if
+it passes the probe, but it must solve this problem deliberately, not by accident.
+
+### Behaviour
+- Only auto-follow while actually moving (speed above ~1.5 m/s). Standing still must NOT drift.
+- Ease with a rate proportional to the angular error and to speed; sprinting recenters faster.
+  Never snap: the probe caps a single 60fps frame at 4 degrees of camera yaw.
+- Deadzone of roughly 8-12 degrees so the camera does not micro-jitter when nearly aligned.
+- Respect the player: suspend auto-follow while the look finger is down and for a grace period
+  of about 0.7-1.2 s after the last manual look input. The probe checks the camera has NOT
+  snapped back 0.4 s after a drag.
+- SUSPEND auto-follow while a saber swing is active. 30_player.js already turns the BODY toward
+  camYaw while attacking; if the camera simultaneously chases the body you create a feedback
+  loop. Attacking must feel stable.
+- Pitch: gently ease toward a neutral framing (about -0.2 rad) when moving and unattended, so
+  the player sees the ground ahead. Same grace-period rules. Never fight a manual pitch.
+- Keep everything that already works: spring smoothing on the eye, terrain clipping so the
+  camera never goes under the dunes, the sprint distance ease, and setCamera at the end of
+  update with fov 72.
+- Zero per-frame allocations.
+
+### Acceptance test — THE gate
+```
+node jedi/test/preview.js  <scratch>/mine.html
+node jedi/test/camera_probe.js <outdir> <scratch>/mine.html
+```
+Exits non-zero on failure. Runs a forward run, a hard sideways run, a diagonal run, and a
+manual-drag-then-keep-running case. Required:
+- `strafeLeft` and `diagonal`: alignDeg <= 18, alignSeconds <= 2.5, headingDriftDeg <= 25,
+  oscillations <= 6, maxStepDeg <= 4.0
+- `forward`: headingDriftDeg <= 25, maxStepDeg <= 4.0
+- `manualHeldDeg >= 25`
+- zero console errors
+BASELINE before the work (no auto-follow at all): strafeLeft alignDeg 90 / never converges,
+diagonal 45 / never converges. Those two converging is the whole deliverable.

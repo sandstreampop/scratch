@@ -15,12 +15,17 @@
  *                                                      'gripRelease' 12 (throw along camera)
  *   PUSH/PULL share a 0.55 s per-power cooldown. Not enough force (or no grip
  *   target) => JK.Audio.play('forceFail') + the selected slot flashes red.
+ *   Entities WITHOUT onForce (the training droids) still react: push/pull knock
+ *   them via onHit(10 / 6, dir, 'force'), lightning and grip choke them through
+ *   onHit as well — GRIP prefers an onForce target and only falls back to a
+ *   plain one when the cone holds nothing liftable.
  *
  * AIMING: everything aims down the CAMERA yaw (JK.Player.camYaw), not the body
  * yaw — you throw people where you are LOOKING, which is what JKO feels like.
  * Cone tests are horizontal (chest-to-chest for the direction handed to bots).
  *
- * INPUT: JK.Input.state.forceTap (or the forceSel counter) cycles the selection;
+ * INPUT: JK.Input.state.forceTap (or the forceSel counter) cycles the selection
+ * (desktop R / wheel; this module also binds 1..5 for direct picks);
  * state.force (edge) casts an instant power / STARTS a channel; state.forceHeld
  * keeps a channel alive. A channel ends on release, on empty force, when the
  * power is switched, or when JK.Hero dies — every exit path restores
@@ -552,6 +557,14 @@ function build(){
     stKey[i] = -1;
     bindSlot(s, i);
   }
+
+  /* desktop nicety: 1..5 pick a power directly (20_input.js leaves these free) */
+  if (typeof window !== 'undefined' && window.addEventListener){
+    window.addEventListener('keydown', function(e){
+      var k = e.keyCode;
+      if (k >= 49 && k <= 53) select(k - 49);
+    });
+  }
 }
 
 function select(i){
@@ -606,8 +619,8 @@ var Powers = JK.Powers = {
 
   update: function(dt, t){
     var g = game(), i;
-    if (!PL) PL = JK.Player || null;
-    if (!PL) return;
+    if (!PL || !PL.pos) PL = JK.Player || null;
+    if (!PL || !PL.pos) return;        /* player module not up yet: nothing to aim */
     var st = (JK.Input && JK.Input.state) || NULL_STATE;
 
     updateAim();

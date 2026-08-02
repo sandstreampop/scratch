@@ -58,6 +58,15 @@ var lastAtkId = 0, wasLit = false, wasGround = true, prevVy = 0;
 var lastHp = -1, wasDead = false, lastStance = -1, lastHitT = -1e9;
 var resumeTry = 0;
 
+/* scratch opt for our own self-driven play() calls: zero allocation per event */
+var SOPT = { pos: null, vol: 1, rate: 1 };
+function so(pos, vol, rate){
+  SOPT.pos = pos || null;
+  SOPT.vol = vol === undefined ? 1 : vol;
+  SOPT.rate = rate || 1;
+  return SOPT;
+}
+
 /* ============================ tiny helpers ============================= */
 function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
 
@@ -479,8 +488,8 @@ function spatial(pos){
   var dx = pos[0] - eye[0], dy = pos[1] - eye[1], dz = pos[2] - eye[2];
   var d = Math.sqrt(dx * dx + dy * dy + dz * dz);
   if (d >= ROLLOFF){ SPG = 0; return; }
-  var fade = 1 - d / ROLLOFF;
-  SPG = (REF_D / (REF_D + d)) * fade * fade * 1.25;
+  var fade = 1 - d / ROLLOFF;              /* linear taper to true silence */
+  SPG = (REF_D / (REF_D + d)) * fade * 1.1;
   if (SPG > 1) SPG = 1;
   var hl = Math.sqrt(dx * dx + dz * dz);
   if (hl < 0.001) return;
@@ -526,7 +535,7 @@ function hum(on, intensity){
   if (!(i >= 0)) i = 0; else if (i > 2) i = 2;
   humOn = !!on;
   var t = ctx.currentTime;
-  var wantG = (humOn && !muted) ? (0.055 + 0.075 * i) : 0;
+  var wantG = (humOn && !muted) ? (0.048 + 0.070 * i) : 0;
   var wantF = 320 + 640 * i;
   var wantP = 61 + 10 * i;
   var wantD = 9 + 26 * i;
@@ -795,15 +804,14 @@ var Audio = JK.Audio = {
       lastAtkId = S.attackId;
       if (lastAtkId > 0){
         var si = P ? (P.stanceIdx | 0) : 1;
-        var rate = si === 0 ? 1.30 : (si === 2 ? 0.72 : 1.0);
-        play('swing', { rate: rate });
+        play('swing', so(null, 1, si === 0 ? 1.30 : (si === 2 ? 0.72 : 1.0)));
       }
     }
 
     /* ---- saber connecting with something ---- */
     if (C && C.lastHit && C.lastHit.t !== lastHitT){
       lastHitT = C.lastHit.t;
-      play('hit', C.hitPos ? { pos: C.hitPos } : null);
+      play('hit', C.hitPos ? so(C.hitPos, 1, 1) : null);
     }
 
     /* ---- jump / land ---- */
@@ -812,19 +820,20 @@ var Audio = JK.Audio = {
       var g = !!P.onGround;
       if (g && !wasGround){
         var iv = prevVy < 0 ? -prevVy : 0;
-        play('land', { vol: clamp(0.25 + iv / 12, 0.25, 1) });
+        play('land', so(null, clamp(0.25 + iv / 12, 0.25, 1), 1));
       }
       wasGround = g;
       prevVy = P.vel ? P.vel[1] : 0;
 
       var sc = P.stanceIdx | 0;
-      if (sc !== lastStance){ lastStance = sc; play('select', { vol: 0.75 }); }
+      if (sc !== lastStance){ lastStance = sc; play('select', so(null, 0.75, 1)); }
     }
 
     /* ---- hurt / die (Hero owns hp; it never calls us) ---- */
     if (G){
       if (lastHp < 0) lastHp = G.hp;
-      if (G.hp < lastHp - 0.75) play('hurt', { vol: clamp(0.5 + (lastHp - G.hp) / 40, 0.5, 1) });
+      if (G.hp < lastHp - 0.75)
+        play('hurt', so(null, clamp(0.5 + (lastHp - G.hp) / 40, 0.5, 1), 1));
       lastHp = G.hp;
     }
     if (H){
