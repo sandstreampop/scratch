@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#1a130c">
+<title>DUNE RAIDER</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { width:100%; height:100%; overflow:hidden; background:#000; touch-action:none;
+    overscroll-behavior:none; position:fixed; -webkit-user-select:none; user-select:none;
+    -webkit-touch-callout:none; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
+  #hud { position:absolute; inset:0; pointer-events:none; z-index:3;
+    font:700 12px/1.3 "Trebuchet MS","Verdana",sans-serif; color:#d8e0c8;
+    text-shadow:1px 1px 0 #000, 0 0 6px rgba(0,0,0,.8); letter-spacing:.06em; }
+  /* --- 2000s LucasArts-ish HUD corners --- */
+  #hpBox { position:absolute; left:calc(12px + env(safe-area-inset-left));
+    bottom:calc(12px + env(safe-area-inset-bottom)); }
+  #fpBox { position:absolute; right:calc(12px + env(safe-area-inset-right));
+    bottom:calc(12px + env(safe-area-inset-bottom)); text-align:right; }
+  .bar { width:120px; height:10px; border:2px solid #6a705a; background:#101408; margin-top:3px; }
+  .bar > i { display:block; height:100%; background:linear-gradient(#aef07a,#4f9f2f); }
+  #fpBox .bar > i { background:linear-gradient(#8ad4ff,#2f6f9f); }
+  #stanceTag { position:absolute; top:calc(10px + env(safe-area-inset-top)); left:50%;
+    transform:translateX(-50%); font-size:11px; color:#e8d9a0; opacity:.9; }
+  #forceTag { position:absolute; top:calc(28px + env(safe-area-inset-top)); left:50%;
+    transform:translateX(-50%); font-size:10px; color:#9fd4ff; opacity:.85; }
+  #msg { position:absolute; top:30%; left:0; right:0; text-align:center; font-size:14px;
+    color:#f0e6c0; opacity:0; transition:opacity .5s; }
+  #msg.on { opacity:1; }
+  /* --- touch controls --- */
+  .tbtn { position:absolute; z-index:4; width:64px; height:64px; border-radius:50%;
+    border:2px solid rgba(200,210,170,.35); background:rgba(20,26,12,.35);
+    color:rgba(220,228,190,.85); font:700 10px/60px "Trebuchet MS",sans-serif;
+    text-align:center; letter-spacing:.08em; pointer-events:auto;
+    -webkit-user-select:none; user-select:none; }
+  .tbtn.held { background:rgba(160,200,90,.25); border-color:rgba(200,240,140,.7); }
+  #btnJump  { right:calc(16px + env(safe-area-inset-right)); bottom:calc(120px + env(safe-area-inset-bottom)); }
+  #btnAtk   { right:calc(96px + env(safe-area-inset-right)); bottom:calc(48px + env(safe-area-inset-bottom)); width:76px; height:76px; line-height:72px; }
+  #btnForce { right:calc(20px + env(safe-area-inset-right)); bottom:calc(210px + env(safe-area-inset-bottom)); width:56px; height:56px; line-height:52px; }
+  #btnStance{ left:calc(16px + env(safe-area-inset-left)); bottom:calc(150px + env(safe-area-inset-bottom)); width:52px; height:52px; line-height:48px; font-size:9px; }
+  #stickL { position:absolute; z-index:2; left:0; bottom:0; width:45%; height:70%; pointer-events:auto; }
+  #stickUI { position:absolute; z-index:3; width:96px; height:96px; border:2px solid rgba(200,210,170,.25);
+    border-radius:50%; display:none; pointer-events:none; }
+  #stickUI > b { position:absolute; width:40px; height:40px; left:26px; top:26px; border-radius:50%;
+    background:rgba(200,210,170,.25); border:2px solid rgba(200,210,170,.4); }
+  /*INPUT-CSS*/
+  /* --- start screen --- */
+  #start { position:absolute; inset:0; z-index:10; background:
+    radial-gradient(ellipse at 50% 30%, #3a2c18 0%, #120d06 70%);
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    color:#e8dcb0; font:700 13px/1.8 "Trebuchet MS","Verdana",sans-serif; letter-spacing:.1em;
+    text-align:center; padding:0 8%; transition:opacity .8s; }
+  #start.gone { opacity:0; pointer-events:none; }
+  #start h1 { font-size:34px; letter-spacing:.3em; text-indent:.3em; color:#ffd76a;
+    text-shadow:2px 2px 0 #000, 0 0 18px rgba(255,180,60,.35); margin-bottom:6px; }
+  #start .sub { font-size:11px; color:#b8a878; margin-bottom:30px; }
+  #start .hint { font-size:10px; color:#8f8464; line-height:2; font-weight:400; }
+  #begin { margin-top:34px; padding:14px 46px; border:2px solid #8f8050; background:#241c0e;
+    color:#ffe9a8; font:700 13px "Trebuchet MS",sans-serif; letter-spacing:.3em; text-indent:.3em;
+    cursor:pointer; }
+  #begin:active { background:#3a2e14; }
+  #err { position:absolute; inset:0; display:none; z-index:20; background:#000; color:#a99;
+    font:400 13px/1.8 sans-serif; padding:20%; text-align:center; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hud">
+  <div id="hpBox">HEALTH<div class="bar"><i id="hpFill" style="width:100%"></i></div></div>
+  <div id="fpBox">FORCE<div class="bar"><i id="fpFill" style="width:100%"></i></div></div>
+  <div id="stanceTag">MEDIUM STANCE</div>
+  <div id="forceTag"></div>
+  <div id="msg"></div>
+</div>
+<div id="stickL"></div>
+<div id="stickUI"><b></b></div>
+<div id="btnJump"  class="tbtn">JUMP</div>
+<div id="btnAtk"   class="tbtn">ATK</div>
+<div id="btnForce" class="tbtn">FORCE</div>
+<div id="btnStance"class="tbtn">STANCE</div>
+<div id="start">
+  <h1>DUNE RAIDER</h1>
+  <div class="sub">A TALE OF THE OUTER RIM &middot; 2002</div>
+  <div class="hint" id="hintTouch">left thumb — move &middot; right thumb — camera<br>
+    ATK swings the saber &middot; JUMP leaps &middot; FORCE unleashes power</div>
+  <div id="begin">ENTER THE DUNES</div>
+</div>
+<div id="err"></div>
+<script>
+/*INJECT*/
+</script>
+</body>
+</html>

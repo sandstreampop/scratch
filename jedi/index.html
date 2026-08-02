@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#1a130c">
+<title>DUNE RAIDER</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { width:100%; height:100%; overflow:hidden; background:#000; touch-action:none;
+    overscroll-behavior:none; position:fixed; -webkit-user-select:none; user-select:none;
+    -webkit-touch-callout:none; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
+  #hud { position:absolute; inset:0; pointer-events:none; z-index:3;
+    font:700 12px/1.3 "Trebuchet MS","Verdana",sans-serif; color:#d8e0c8;
+    text-shadow:1px 1px 0 #000, 0 0 6px rgba(0,0,0,.8); letter-spacing:.06em; }
+  /* --- 2000s LucasArts-ish HUD corners --- */
+  #hpBox { position:absolute; left:calc(12px + env(safe-area-inset-left));
+    bottom:calc(12px + env(safe-area-inset-bottom)); }
+  #fpBox { position:absolute; right:calc(12px + env(safe-area-inset-right));
+    bottom:calc(12px + env(safe-area-inset-bottom)); text-align:right; }
+  .bar { width:120px; height:10px; border:2px solid #6a705a; background:#101408; margin-top:3px; }
+  .bar > i { display:block; height:100%; background:linear-gradient(#aef07a,#4f9f2f); }
+  #fpBox .bar > i { background:linear-gradient(#8ad4ff,#2f6f9f); }
+  #stanceTag { position:absolute; top:calc(10px + env(safe-area-inset-top)); left:50%;
+    transform:translateX(-50%); font-size:11px; color:#e8d9a0; opacity:.9; }
+  #forceTag { position:absolute; top:calc(28px + env(safe-area-inset-top)); left:50%;
+    transform:translateX(-50%); font-size:10px; color:#9fd4ff; opacity:.85; }
+  #msg { position:absolute; top:30%; left:0; right:0; text-align:center; font-size:14px;
+    color:#f0e6c0; opacity:0; transition:opacity .5s; }
+  #msg.on { opacity:1; }
+  /* --- touch controls --- */
+  .tbtn { position:absolute; z-index:4; width:64px; height:64px; border-radius:50%;
+    border:2px solid rgba(200,210,170,.35); background:rgba(20,26,12,.35);
+    color:rgba(220,228,190,.85); font:700 10px/60px "Trebuchet MS",sans-serif;
+    text-align:center; letter-spacing:.08em; pointer-events:auto;
+    -webkit-user-select:none; user-select:none; }
+  .tbtn.held { background:rgba(160,200,90,.25); border-color:rgba(200,240,140,.7); }
+  #btnJump  { right:calc(16px + env(safe-area-inset-right)); bottom:calc(120px + env(safe-area-inset-bottom)); }
+  #btnAtk   { right:calc(96px + env(safe-area-inset-right)); bottom:calc(48px + env(safe-area-inset-bottom)); width:76px; height:76px; line-height:72px; }
+  #btnForce { right:calc(20px + env(safe-area-inset-right)); bottom:calc(210px + env(safe-area-inset-bottom)); width:56px; height:56px; line-height:52px; }
+  #btnStance{ left:calc(16px + env(safe-area-inset-left)); bottom:calc(150px + env(safe-area-inset-bottom)); width:52px; height:52px; line-height:48px; font-size:9px; }
+  #stickL { position:absolute; z-index:2; left:0; bottom:0; width:45%; height:70%; pointer-events:auto; }
+  #stickUI { position:absolute; z-index:3; width:96px; height:96px; border:2px solid rgba(200,210,170,.25);
+    border-radius:50%; display:none; pointer-events:none; }
+  #stickUI > b { position:absolute; width:40px; height:40px; left:26px; top:26px; border-radius:50%;
+    background:rgba(200,210,170,.25); border:2px solid rgba(200,210,170,.4); }
+  /*INPUT-CSS*/
+  /* --- start screen --- */
+  #start { position:absolute; inset:0; z-index:10; background:
+    radial-gradient(ellipse at 50% 30%, #3a2c18 0%, #120d06 70%);
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    color:#e8dcb0; font:700 13px/1.8 "Trebuchet MS","Verdana",sans-serif; letter-spacing:.1em;
+    text-align:center; padding:0 8%; transition:opacity .8s; }
+  #start.gone { opacity:0; pointer-events:none; }
+  #start h1 { font-size:34px; letter-spacing:.3em; text-indent:.3em; color:#ffd76a;
+    text-shadow:2px 2px 0 #000, 0 0 18px rgba(255,180,60,.35); margin-bottom:6px; }
+  #start .sub { font-size:11px; color:#b8a878; margin-bottom:30px; }
+  #start .hint { font-size:10px; color:#8f8464; line-height:2; font-weight:400; }
+  #begin { margin-top:34px; padding:14px 46px; border:2px solid #8f8050; background:#241c0e;
+    color:#ffe9a8; font:700 13px "Trebuchet MS",sans-serif; letter-spacing:.3em; text-indent:.3em;
+    cursor:pointer; }
+  #begin:active { background:#3a2e14; }
+  #err { position:absolute; inset:0; display:none; z-index:20; background:#000; color:#a99;
+    font:400 13px/1.8 sans-serif; padding:20%; text-align:center; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hud">
+  <div id="hpBox">HEALTH<div class="bar"><i id="hpFill" style="width:100%"></i></div></div>
+  <div id="fpBox">FORCE<div class="bar"><i id="fpFill" style="width:100%"></i></div></div>
+  <div id="stanceTag">MEDIUM STANCE</div>
+  <div id="forceTag"></div>
+  <div id="msg"></div>
+</div>
+<div id="stickL"></div>
+<div id="stickUI"><b></b></div>
+<div id="btnJump"  class="tbtn">JUMP</div>
+<div id="btnAtk"   class="tbtn">ATK</div>
+<div id="btnForce" class="tbtn">FORCE</div>
+<div id="btnStance"class="tbtn">STANCE</div>
+<div id="start">
+  <h1>DUNE RAIDER</h1>
+  <div class="sub">A TALE OF THE OUTER RIM &middot; 2002</div>
+  <div class="hint" id="hintTouch">left thumb — move &middot; right thumb — camera<br>
+    ATK swings the saber &middot; JUMP leaps &middot; FORCE unleashes power</div>
+  <div id="begin">ENTER THE DUNES</div>
+</div>
+<div id="err"></div>
+<script>
+/* ===== 00_math.js ===== */
+/* JK.M — column-major mat4 + vec3 helpers. Owner: core. */
+var JK = window.JK = window.JK || {};
+(function(){
+'use strict';
+var TMP = new Float32Array(16);
+
+function make(){ var m = new Float32Array(16); m[0]=m[5]=m[10]=m[15]=1; return m; }
+function ident(m){ for(var i=0;i<16;i++) m[i]=0; m[0]=m[5]=m[10]=m[15]=1; return m; }
+function copy(o,a){ o.set(a); return o; }
+
+/* o = a * b  (safe if o aliases a or b) */
+function mul(o,a,b){
+  for(var c=0;c<4;c++){
+    var b0=b[c*4],b1=b[c*4+1],b2=b[c*4+2],b3=b[c*4+3];
+    TMP[c*4]  =a[0]*b0+a[4]*b1+a[8]*b2 +a[12]*b3;
+    TMP[c*4+1]=a[1]*b0+a[5]*b1+a[9]*b2 +a[13]*b3;
+    TMP[c*4+2]=a[2]*b0+a[6]*b1+a[10]*b2+a[14]*b3;
+    TMP[c*4+3]=a[3]*b0+a[7]*b1+a[11]*b2+a[15]*b3;
+  }
+  o.set(TMP); return o;
+}
+
+/* in-place post-multiply composers: m = m * X. Natural for parent->child builds. */
+var B = make();
+function tr(m,x,y,z){ ident(B); B[12]=x; B[13]=y; B[14]=z; return mul(m,m,B); }
+function sc(m,x,y,z){ ident(B); B[0]=x; B[5]=y; B[10]=z; return mul(m,m,B); }
+function rx(m,a){ var c=Math.cos(a),s=Math.sin(a); ident(B); B[5]=c; B[6]=s; B[9]=-s; B[10]=c; return mul(m,m,B); }
+function ry(m,a){ var c=Math.cos(a),s=Math.sin(a); ident(B); B[0]=c; B[2]=-s; B[8]=s; B[10]=c; return mul(m,m,B); }
+function rz(m,a){ var c=Math.cos(a),s=Math.sin(a); ident(B); B[0]=c; B[1]=s; B[4]=-s; B[5]=c; return mul(m,m,B); }
+
+function persp(o,fovy,aspect,near,far){
+  var f=1/Math.tan(fovy/2), nf=1/(near-far);
+  o[0]=f/aspect; o[1]=0; o[2]=0; o[3]=0;
+  o[4]=0; o[5]=f; o[6]=0; o[7]=0;
+  o[8]=0; o[9]=0; o[10]=(far+near)*nf; o[11]=-1;
+  o[12]=0; o[13]=0; o[14]=2*far*near*nf; o[15]=0;
+  return o;
+}
+
+function lookAt(o,eye,ctr,up){
+  var zx=eye[0]-ctr[0], zy=eye[1]-ctr[1], zz=eye[2]-ctr[2];
+  var l=1/(Math.sqrt(zx*zx+zy*zy+zz*zz)||1); zx*=l; zy*=l; zz*=l;
+  var xx=up[1]*zz-up[2]*zy, xy=up[2]*zx-up[0]*zz, xz=up[0]*zy-up[1]*zx;
+  l=1/(Math.sqrt(xx*xx+xy*xy+xz*xz)||1); xx*=l; xy*=l; xz*=l;
+  var yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+  o[0]=xx; o[1]=yx; o[2]=zx; o[3]=0;
+  o[4]=xy; o[5]=yy; o[6]=zy; o[7]=0;
+  o[8]=xz; o[9]=yz; o[10]=zz; o[11]=0;
+  o[12]=-(xx*eye[0]+xy*eye[1]+xz*eye[2]);
+  o[13]=-(yx*eye[0]+yy*eye[1]+yz*eye[2]);
+  o[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]);
+  o[15]=1;
+  return o;
+}
+
+/* transform point [x,y,z,1] by m -> out3 */
+function xp(o,m,x,y,z){
+  o[0]=m[0]*x+m[4]*y+m[8]*z+m[12];
+  o[1]=m[1]*x+m[5]*y+m[9]*z+m[13];
+  o[2]=m[2]*x+m[6]*y+m[10]*z+m[14];
+  return o;
+}
+/* transform direction (no translation) */
+function xd(o,m,x,y,z){
+  o[0]=m[0]*x+m[4]*y+m[8]*z;
+  o[1]=m[1]*x+m[5]*y+m[9]*z;
+  o[2]=m[2]*x+m[6]*y+m[10]*z;
+  return o;
+}
+
+JK.M = { make:make, ident:ident, copy:copy, mul:mul, tr:tr, sc:sc, rx:rx, ry:ry, rz:rz,
+  persp:persp, lookAt:lookAt, xp:xp, xd:xd };
+
+JK.V = {
+  set:function(o,x,y,z){ o[0]=x; o[1]=y; o[2]=z; return o; },
+  copy:function(o,a){ o[0]=a[0]; o[1]=a[1]; o[2]=a[2]; return o; },
+  add:function(o,a,b){ o[0]=a[0]+b[0]; o[1]=a[1]+b[1]; o[2]=a[2]+b[2]; return o; },
+  sub:function(o,a,b){ o[0]=a[0]-b[0]; o[1]=a[1]-b[1]; o[2]=a[2]-b[2]; return o; },
+  scale:function(o,a,s){ o[0]=a[0]*s; o[1]=a[1]*s; o[2]=a[2]*s; return o; },
+  dot:function(a,b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; },
+  cross:function(o,a,b){ var x=a[1]*b[2]-a[2]*b[1], y=a[2]*b[0]-a[0]*b[2], z=a[0]*b[1]-a[1]*b[0];
+    o[0]=x; o[1]=y; o[2]=z; return o; },
+  len:function(a){ return Math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]); },
+  norm:function(o,a){ var l=Math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])||1;
+    o[0]=a[0]/l; o[1]=a[1]/l; o[2]=a[2]/l; return o; },
+  lerp:function(o,a,b,t){ o[0]=a[0]+(b[0]-a[0])*t; o[1]=a[1]+(b[1]-a[1])*t; o[2]=a[2]+(b[2]-a[2])*t; return o; },
+  dist:function(a,b){ var x=a[0]-b[0],y=a[1]-b[1],z=a[2]-b[2]; return Math.sqrt(x*x+y*y+z*z); }
+};
+})();
+
+/* ===== 05_gl.js ===== */
+/* JK.GL + JK.Geo — WebGL1 renderer with one gouraud/fog shader. Owner: core. */
+(function(){
+'use strict';
+var M = JK.M;
+var gl = null, prog = null, canvas = null, dpr = 1;
+var loc = {};
+var proj = M.make(), view = M.make(), IDENT = M.make();
+var sunDir = new Float32Array([0.45, 0.75, 0.35]);
+var sunCol = new Float32Array([1.0, 0.93, 0.78]);
+var amb    = new Float32Array([0.38, 0.34, 0.30]);
+var fogCol = new Float32Array([0.86, 0.72, 0.52]);
+var fogDen = 0.0035;
+var curBlend = false;
+
+var VS =
+'attribute vec3 aP; attribute vec3 aN; attribute vec3 aC;\n'+
+'uniform mat4 uProj, uView, uModel;\n'+
+'uniform vec3 uSunDir, uSunCol, uAmb, uTint;\n'+
+'uniform float uEmissive;\n'+
+'varying vec3 vCol; varying float vDist;\n'+
+'void main(){\n'+
+'  vec4 wp = uModel * vec4(aP, 1.0);\n'+
+'  mat3 nm = mat3(uModel[0].xyz, uModel[1].xyz, uModel[2].xyz);\n'+
+'  vec3 n = normalize(nm * aN);\n'+
+'  float d = max(dot(n, uSunDir), 0.0);\n'+
+'  vec3 base = aC * uTint;\n'+
+'  vec3 lit = (uAmb + uSunCol * d) * base;\n'+
+'  vCol = mix(lit, base, uEmissive);\n'+
+'  vec4 vp = uView * wp;\n'+
+'  vDist = length(vp.xyz);\n'+
+'  gl_Position = uProj * vp;\n'+
+'}';
+var FS =
+'precision mediump float;\n'+
+'varying vec3 vCol; varying float vDist;\n'+
+'uniform vec3 uFogCol; uniform float uFogDen; uniform float uAlpha; uniform float uNoFog;\n'+
+'void main(){\n'+
+'  float f = exp(-uFogDen * uFogDen * vDist * vDist * 1.442695);\n'+
+'  f = clamp(max(f, uNoFog), 0.0, 1.0);\n'+
+'  gl_FragColor = vec4(mix(uFogCol, vCol, f), uAlpha);\n'+
+'}';
+
+function sh(type, src){
+  var s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error('shader: ' + gl.getShaderInfoLog(s));
+  return s;
+}
+
+var GL = JK.GL = {
+  gl: null, eye: new Float32Array(3), aspect: 1, w: 0, h: 0,
+
+  init: function(cv){
+    canvas = cv;
+    gl = cv.getContext('webgl', {antialias:false, alpha:false, depth:true,
+      powerPreference:'high-performance'}) || cv.getContext('experimental-webgl');
+    if (!gl) return false;
+    GL.gl = gl;
+    prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+    gl.bindAttribLocation(prog, 0, 'aP');
+    gl.bindAttribLocation(prog, 1, 'aN');
+    gl.bindAttribLocation(prog, 2, 'aC');
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+      throw new Error('link: ' + gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    ['uProj','uView','uModel','uSunDir','uSunCol','uAmb','uTint','uEmissive',
+     'uFogCol','uFogDen','uAlpha','uNoFog'].forEach(function(n){ loc[n] = gl.getUniformLocation(prog, n); });
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.disable(gl.CULL_FACE);
+    gl.enableVertexAttribArray(0);
+    gl.enableVertexAttribArray(1);
+    gl.enableVertexAttribArray(2);
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    return true;
+  },
+
+  fog: function(col, den){ fogCol.set(col); fogDen = den; },
+  sun: function(dir, col, ambient){
+    var l = Math.sqrt(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]) || 1;
+    sunDir[0]=dir[0]/l; sunDir[1]=dir[1]/l; sunDir[2]=dir[2]/l;
+    sunCol.set(col); amb.set(ambient);
+  },
+
+  beginFrame: function(r, g, b){
+    var w = Math.floor(canvas.clientWidth * dpr), h = Math.floor(canvas.clientHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h){ canvas.width = w; canvas.height = h; }
+    GL.w = w; GL.h = h; GL.aspect = w / (h || 1);
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(r, g, b, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.uniform3fv(loc.uSunDir, sunDir);
+    gl.uniform3fv(loc.uSunCol, sunCol);
+    gl.uniform3fv(loc.uAmb, amb);
+    gl.uniform3fv(loc.uFogCol, fogCol);
+    gl.uniform1f(loc.uFogDen, fogDen);
+  },
+
+  setCamera: function(eye, target, fovDeg){
+    GL.eye[0]=eye[0]; GL.eye[1]=eye[1]; GL.eye[2]=eye[2];
+    M.persp(proj, (fovDeg||70) * Math.PI/180, GL.aspect, 0.1, 2000);
+    M.lookAt(view, eye, target, [0,1,0]);
+    gl.uniformMatrix4fv(loc.uProj, false, proj);
+    gl.uniformMatrix4fv(loc.uView, false, view);
+  },
+
+  /* geo: {pos,nrm,col:Float32Array, idx:Uint16Array} */
+  mesh: function(geo){
+    function buf(target, data){
+      var b = gl.createBuffer(); gl.bindBuffer(target, b);
+      gl.bufferData(target, data, gl.STATIC_DRAW); return b;
+    }
+    return {
+      p: buf(gl.ARRAY_BUFFER, geo.pos),
+      n: buf(gl.ARRAY_BUFFER, geo.nrm),
+      c: buf(gl.ARRAY_BUFFER, geo.col),
+      i: buf(gl.ELEMENT_ARRAY_BUFFER, geo.idx),
+      count: geo.idx.length
+    };
+  },
+
+  draw: function(mesh, model, opts){
+    opts = opts || {};
+    gl.uniformMatrix4fv(loc.uModel, false, model || IDENT);
+    gl.uniform1f(loc.uEmissive, opts.emissive || 0);
+    gl.uniform1f(loc.uAlpha, opts.alpha !== undefined ? opts.alpha : 1);
+    gl.uniform1f(loc.uNoFog, opts.nofog ? 1 : 0);
+    var t = opts.tint;
+    gl.uniform3f(loc.uTint, t ? t[0] : 1, t ? t[1] : 1, t ? t[2] : 1);
+    var add = !!opts.additive;
+    if (add !== curBlend){
+      curBlend = add;
+      if (add){ gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE); gl.depthMask(false); }
+      else { gl.disable(gl.BLEND); gl.depthMask(true); }
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.p); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.n); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.c); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.i);
+    gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0);
+  }
+};
+
+/* ---- CPU geometry builders ---- */
+var Geo = JK.Geo = {
+  box: function(sx, sy, sz, r, g, b){
+    var x = sx/2, y = sy/2, z = sz/2;
+    var P = [], N = [], C = [], I = [];
+    var faces = [
+      [[ 1,0,0],[[ x,-y,-z],[ x, y,-z],[ x, y, z],[ x,-y, z]]],
+      [[-1,0,0],[[-x,-y, z],[-x, y, z],[-x, y,-z],[-x,-y,-z]]],
+      [[0, 1,0],[[-x, y,-z],[-x, y, z],[ x, y, z],[ x, y,-z]]],
+      [[0,-1,0],[[-x,-y, z],[-x,-y,-z],[ x,-y,-z],[ x,-y, z]]],
+      [[0,0, 1],[[-x,-y, z],[ x,-y, z],[ x, y, z],[-x, y, z]]],
+      [[0,0,-1],[[ x,-y,-z],[-x,-y,-z],[-x, y,-z],[ x, y,-z]]]
+    ];
+    for (var f = 0; f < 6; f++){
+      var n = faces[f][0], vs = faces[f][1], base = P.length/3;
+      for (var v = 0; v < 4; v++){
+        P.push(vs[v][0], vs[v][1], vs[v][2]);
+        N.push(n[0], n[1], n[2]);
+        C.push(r, g, b);
+      }
+      I.push(base, base+1, base+2, base, base+2, base+3);
+    }
+    return { pos:new Float32Array(P), nrm:new Float32Array(N),
+             col:new Float32Array(C), idx:new Uint16Array(I) };
+  },
+
+  tf: function(geo, m){
+    var n = geo.pos.length/3;
+    var pos = new Float32Array(geo.pos.length), nrm = new Float32Array(geo.nrm.length);
+    var p = [0,0,0];
+    for (var i = 0; i < n; i++){
+      M.xp(p, m, geo.pos[i*3], geo.pos[i*3+1], geo.pos[i*3+2]);
+      pos[i*3]=p[0]; pos[i*3+1]=p[1]; pos[i*3+2]=p[2];
+      M.xd(p, m, geo.nrm[i*3], geo.nrm[i*3+1], geo.nrm[i*3+2]);
+      var l = Math.sqrt(p[0]*p[0]+p[1]*p[1]+p[2]*p[2]) || 1;
+      nrm[i*3]=p[0]/l; nrm[i*3+1]=p[1]/l; nrm[i*3+2]=p[2]/l;
+    }
+    return { pos:pos, nrm:nrm, col:new Float32Array(geo.col), idx:new Uint16Array(geo.idx) };
+  },
+
+  merge: function(list){
+    var vTot = 0, iTot = 0, i, g;
+    for (i = 0; i < list.length; i++){ vTot += list[i].pos.length/3; iTot += list[i].idx.length; }
+    if (vTot > 65535) throw new Error('Geo.merge: ' + vTot + ' verts > 65535');
+    var pos = new Float32Array(vTot*3), nrm = new Float32Array(vTot*3),
+        col = new Float32Array(vTot*3), idx = new Uint16Array(iTot);
+    var vo = 0, io = 0;
+    for (i = 0; i < list.length; i++){
+      g = list[i];
+      pos.set(g.pos, vo*3); nrm.set(g.nrm, vo*3); col.set(g.col, vo*3);
+      for (var j = 0; j < g.idx.length; j++) idx[io+j] = g.idx[j] + vo;
+      vo += g.pos.length/3; io += g.idx.length;
+    }
+    return { pos:pos, nrm:nrm, col:col, idx:idx };
+  }
+};
+})();
+
+/* ===== 10_terrain.js ===== */
+/* JK.Terrain — STUB, replaced by terrain agent. */
+(function(){
+'use strict';
+var mesh = null;
+JK.Terrain = {
+  SIZE: 200,
+  height: function(x, z){ return 0; },
+  init: function(){
+    var g = JK.Geo.box(400, 1, 400, 0.80, 0.66, 0.44);
+    var m = JK.M.make(); JK.M.tr(m, 0, -0.5, 0);
+    mesh = JK.GL.mesh(JK.Geo.tf(g, m));
+    JK.GL.fog([0.86, 0.72, 0.52], 0.0035);
+    JK.GL.sun([0.45, 0.75, 0.35], [1.0, 0.93, 0.78], [0.38, 0.34, 0.30]);
+  },
+  draw: function(){ JK.GL.draw(mesh, null); }
+};
+})();
+
+/* ===== 20_input.js ===== */
+/* JK.Input — STUB, replaced by input agent. */
+(function(){
+'use strict';
+JK.Input = {
+  state: { moveX:0, moveY:0, lookDX:0, lookDY:0, jump:false, attack:false,
+           force:false, run:false, stance:0, forceSel:0 },
+  init: function(){},
+  update: function(dt, t){}
+};
+})();
+
+/* ===== 30_player.js ===== */
+/* JK.Player — STUB, replaced by player agent. */
+(function(){
+'use strict';
+JK.Player = {
+  pos: [0, 0, 0], yaw: 0, vel: [0, 0, 0], onGround: true, speed2D: 0, anim: 'idle',
+  camEye: [0, 3, 6], camTarget: [0, 1.2, 0],
+  init: function(){},
+  update: function(dt, t){
+    JK.GL.setCamera(this.camEye, this.camTarget, 70);
+  }
+};
+})();
+
+/* ===== 40_character.js ===== */
+/* JK.Rig — STUB, replaced by character agent. */
+(function(){
+'use strict';
+var mesh = null, mm = null;
+JK.Rig = {
+  init: function(){
+    mesh = JK.GL.mesh(JK.Geo.box(0.6, 1.8, 0.4, 0.45, 0.35, 0.28));
+    mm = JK.M.make();
+  },
+  draw: function(){
+    var p = JK.Player.pos;
+    JK.M.ident(mm); JK.M.tr(mm, p[0], p[1] + 0.9, p[2]); JK.M.ry(mm, JK.Player.yaw);
+    JK.GL.draw(mesh, mm);
+  }
+};
+})();
+
+/* ===== 90_main.js ===== */
+/* JK.main — boot + game loop. Owner: core. */
+(function(){
+'use strict';
+var SYSTEMS = ['Terrain', 'Input', 'Player', 'Rig', 'Sabers', 'Powers', 'Bots', 'Fx', 'Hud'];
+var last = 0, t0 = 0, started = false;
+
+JK.game = { hp: 100, hpMax: 100, force: 100, forceMax: 100, over: false, kills: 0 };
+
+JK.msg = function(text, secs){
+  var el = document.getElementById('msg');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.add('on');
+  clearTimeout(JK.msg._t);
+  JK.msg._t = setTimeout(function(){ el.classList.remove('on'); }, (secs || 2) * 1000);
+};
+
+function each(fn){
+  for (var i = 0; i < SYSTEMS.length; i++){
+    var s = JK[SYSTEMS[i]];
+    if (s && s[fn]) s[fn].apply(s, Array.prototype.slice.call(arguments, 1));
+  }
+}
+
+function frame(now){
+  requestAnimationFrame(frame);
+  if (!last) { last = now; t0 = now; return; }
+  var dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  var t = (now - t0) / 1000;
+  each('update', dt, t);
+  JK.GL.beginFrame(0.86, 0.72, 0.52);
+  each('draw');
+}
+
+function fail(msg){
+  var el = document.getElementById('err');
+  el.style.display = 'block';
+  el.textContent = msg;
+}
+
+function boot(){
+  if (started) return;
+  started = true;
+  try {
+    if (!JK.GL.init(document.getElementById('gl'))) { fail('WebGL unavailable on this device.'); return; }
+    each('init');
+    document.getElementById('start').classList.add('gone');
+    requestAnimationFrame(frame);
+  } catch (e) {
+    fail('Boot error: ' + (e && e.message ? e.message : e));
+  }
+}
+
+window.addEventListener('error', function(ev){
+  if (!started) return;
+  var el = document.getElementById('err');
+  if (el.style.display !== 'block'){ el.style.display = 'block'; el.textContent = 'Error: ' + ev.message; }
+});
+
+document.addEventListener('DOMContentLoaded', function(){
+  var b = document.getElementById('begin');
+  b.addEventListener('click', boot);
+  b.addEventListener('touchend', function(e){ e.preventDefault(); boot(); }, {passive:false});
+});
+document.addEventListener('gesturestart', function(e){ e.preventDefault(); });
+document.addEventListener('contextmenu', function(e){ e.preventDefault(); });
+})();
+
+</script>
+</body>
+</html>
