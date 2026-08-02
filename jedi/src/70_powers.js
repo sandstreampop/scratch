@@ -633,15 +633,14 @@ var Powers = JK.Powers = {
       else if (speedOn) setSpeed(false);
     } else {
       var held = st.forceHeld === undefined ? !!st.force : !!st.forceHeld;
-      if (mode >= 0){
+      if (mode < 0 && st.force) fire(sel);       /* instant cast or channel start */
+      if (mode >= 0){                            /* a channel started NOW also ticks */
         if (!held){ endChannel(); }
         else if (!tickChannel(dt, t)){
           var wasEmpty = g.force <= 0;
           endChannel();
           if (wasEmpty){ snd('forceFail'); failFlash(sel); }
         }
-      } else if (st.force){
-        fire(sel);
       }
     }
 
