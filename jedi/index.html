@@ -692,6 +692,7 @@ JK.Terrain = {
  *     stanceTap,     // edge: stance-cycle tap (Q / #btnStance)
  *     forceTap,      // edge: force-select tap (R / mousewheel)
  *     attackHeld,    // held: TRUE while #btnAtk is touched or LMB is down
+ *     forceHeld,     // held: TRUE while #btnForce is touched or E is down
  *     runHeld,       // held: TRUE while sprinting (stick deflection > 0.92
  *                    //   of radius, or Shift on desktop)
  *     run,           // legacy alias, always === runHeld
@@ -717,7 +718,7 @@ var state = {
   moveX: 0, moveY: 0,
   lookDX: 0, lookDY: 0,
   jump: false, attack: false, force: false, stanceTap: false, forceTap: false,
-  attackHeld: false, runHeld: false,
+  attackHeld: false, runHeld: false, forceHeld: false,
   run: false,
   stance: 0, forceSel: 0
 };
@@ -734,12 +735,14 @@ var stickMX = 0, stickMY = 0, stickRun = false;
 var lookId = null, lookLX = 0, lookLY = 0;
 /* --- touch buttons (attack hold) --- */
 var touchAtk = false;
+var touchForce = false;   /* #btnForce held (channelled force powers) */
 var btns = [];  /* {el, tid, mdown, down, up} */
 /* --- mouse --- */
 var mouseLook = false, mouseLX = 0, mouseLY = 0, mouseAtk = false;
 var lastWheel = 0;
 /* --- keyboard --- */
 var kFwd = false, kBack = false, kLeft = false, kRight = false, kShift = false;
+var kForce = false;       /* E held */
 var keyHeld = {};   /* keyCode -> bool, our own repeat guard */
 
 var elStick = null, elUI = null, elKnob = null, elCanvas = null, elStart = null;
@@ -922,7 +925,7 @@ function keyDown(e){
     case 68: case 39: kRight = true; break;  /* D / Right */
     case 16: kShift = true; break;           /* Shift = run */
     case 32: if (!overlayUp()) pJump = true; break;                    /* Space */
-    case 69: if (!overlayUp()) pForce = true; break;                   /* E */
+    case 69: if (!overlayUp()){ pForce = true; kForce = true; } break;   /* E */
     case 81: if (!overlayUp()){ pStance = true; cStance++; } break;    /* Q */
     case 82: if (!overlayUp()){ pForceTap = true; cForceSel++; } break;/* R */
   }
@@ -937,6 +940,7 @@ function keyUp(e){
     case 65: case 37: kLeft = false; break;
     case 68: case 39: kRight = false; break;
     case 16: kShift = false; break;
+    case 69: kForce = false; break;          /* E */
   }
 }
 
@@ -946,6 +950,7 @@ function releaseAll(){
   for (k in keyHeld) keyHeld[k] = false;
   kFwd = kBack = kLeft = kRight = kShift = false;
   mouseLook = false; mouseAtk = false; touchAtk = false;
+  touchForce = false; kForce = false;
   stickId = null; stickMX = 0; stickMY = 0; stickRun = false;
   lookId = null;
   /* rAF is paused while hidden — drop pending edges + look deltas so the
@@ -981,7 +986,8 @@ JK.Input = {
       function(){ pAttack = true; touchAtk = true; },
       function(){ touchAtk = false; });
     bindBtn(document.getElementById('btnForce'),
-      function(){ pForce = true; }, null);
+      function(){ pForce = true; touchForce = true; },
+      function(){ touchForce = false; });
     bindBtn(document.getElementById('btnStance'),
       function(){ pStance = true; cStance++; }, null);
 
@@ -1015,6 +1021,7 @@ JK.Input = {
     state.runHeld = stickRun || kShift;
     state.run = state.runHeld;                 /* legacy alias */
     state.attackHeld = touchAtk || mouseAtk;
+    state.forceHeld = touchForce || kForce;
 
     /* edges: pending -> state, then clear */
     state.jump = pJump;
@@ -1146,6 +1153,18 @@ JK.Player = {
   stanceIdx: 1,
   attackQueued: false,
 
+  /* --- hooks for JK.Powers / JK.Bots (iteration 3+) ---
+   * speedMul  multiplies walk/sprint target speed (Force Speed). Default 1.
+   * jumped    true only on the frame the player left the ground by jumping.
+   * impulse() adds world-space velocity (knockback, Force Jump); an upward
+   *           impulse also unsticks the player from the ground the same frame. */
+  speedMul: 1,
+  jumped: false,
+  impulse: function(vx, vy, vz){
+    vel[0] += vx || 0; vel[1] += vy || 0; vel[2] += vz || 0;
+    if (vy > 0){ onGround = false; pos[1] += 0.02; }
+  },
+
   init: function(){
     pos[0] = 0; pos[2] = 6;                      /* spawn facing origin (-Z) */
     pos[1] = gh(pos[0], pos[2]);                 /* ground at the ACTUAL spawn xz */
@@ -1153,6 +1172,7 @@ JK.Player = {
     yaw = 0; camYaw = 0; camPitch = -0.26; camDist = CAM_DIST;
     onGround = true; speed2D = 0; anim = 'idle';
     stanceIdx = 1; this.attackQueued = false;
+    this.speedMul = 1; this.jumped = false;
     stanceEl = document.getElementById('stanceTag');
     if (stanceEl) stanceEl.textContent = STANCE_NAMES[stanceIdx];
     var st = JK.Input && JK.Input.state;
@@ -1187,7 +1207,7 @@ JK.Player = {
 
     var dvx = 0, dvz = 0;
     if (hasMove){
-      var spd = (sprinting ? SPRINT_SPEED : WALK_SPEED) * mag;
+      var spd = (sprinting ? SPRINT_SPEED : WALK_SPEED) * mag * (P.speedMul || 1);
       if (onGround){
         /* uphill grade along move dir; >~50deg gets heavily slowed */
         var e = 0.4;
@@ -1227,7 +1247,8 @@ JK.Player = {
     }
 
     /* ---- jump / gravity / integrate ---- */
-    if (st.jump && onGround){ vel[1] = JUMP_VY; onGround = false; }
+    P.jumped = false;
+    if (st.jump && onGround){ vel[1] = JUMP_VY; onGround = false; P.jumped = true; }
     if (onGround) vel[1] = 0; else vel[1] -= GRAVITY * dt;
     pos[0] += vel[0] * dt;
     pos[1] += vel[1] * dt;
@@ -2716,6 +2737,137 @@ var Fx = JK.Fx = {
 };
 })();
 
+/* ===== 58_playerent.js ===== */
+/* JK.Hero — registers the player as a JK.Combat entity so bots can hurt him,
+ * and owns his health / knockback / death / respawn. Owner: core.
+ *
+ * Runs inside the 'Fx' slot's Combat pass indirectly: Combat.update() calls
+ * ent.onHit(); this module only needs its own update() for regen + respawn, so
+ * it is driven from 90_main's SYSTEMS list entry 'Hero'.
+ *
+ * Exposed:
+ *   JK.Hero.ent      the registered entity (team 'player'), pos ALIASES
+ *                    JK.Player.pos so it tracks the player with no copying.
+ *   JK.Hero.hurt(dmg, dirX, dirY, dirZ, kind)  damage entry point for bots.
+ *   JK.Hero.dead     bool
+ *   JK.Hero.invuln   seconds of remaining spawn protection
+ */
+(function(){
+'use strict';
+
+var HP_MAX = 100;
+var RESPAWN_T = 2.6;
+var INVULN_T = 2.0;
+var REGEN_DELAY = 6.0;      /* seconds without damage before health creeps back */
+var REGEN_RATE = 4.0;       /* hp per second */
+
+var dead = false, deadT = 0, invuln = 0, sinceHit = 99;
+var ent = null, hpEl = null;
+var flashT = 0;
+
+function game(){ return JK.game || (JK.game = { hp: HP_MAX, hpMax: HP_MAX }); }
+
+function hurt(dmg, dx, dy, dz, kind){
+  var g = game();
+  if (dead || invuln > 0 || !(dmg > 0)) return;
+  g.hp -= dmg;
+  sinceHit = 0;
+  flashT = 0.22;
+  /* knockback: blasters shove lightly, sabers/force shove hard */
+  var k = kind === 'bolt' ? 1.6 : (kind === 'force' ? 7.0 : 4.0);
+  if (JK.Player && JK.Player.impulse){
+    var l = Math.sqrt((dx||0)*(dx||0) + (dz||0)*(dz||0)) || 1;
+    JK.Player.impulse((dx||0)/l * k, (dy > 0 ? dy * k : 1.5), (dz||0)/l * k);
+  }
+  if (JK.Fx && JK.Fx.sparks && JK.Player){
+    SP[0] = JK.Player.pos[0]; SP[1] = JK.Player.pos[1] + 1.1; SP[2] = JK.Player.pos[2];
+    JK.Fx.sparks(SP, 8, RED);
+  }
+  if (g.hp <= 0){
+    g.hp = 0;
+    dead = true; deadT = RESPAWN_T;
+    if (JK.msg) JK.msg('YOU HAVE FALLEN', 2.4);
+    if (JK.Fx && JK.Fx.burst && JK.Player){
+      SP[0] = JK.Player.pos[0]; SP[1] = JK.Player.pos[1] + 1.0; SP[2] = JK.Player.pos[2];
+      JK.Fx.burst(SP, 26, RED);
+    }
+  }
+}
+var SP = [0, 0, 0];
+var RED = [1.0, 0.25, 0.15];
+
+function respawn(){
+  var g = game();
+  g.hp = g.hpMax || HP_MAX;
+  if (g.forceMax) g.force = g.forceMax;
+  dead = false; invuln = INVULN_T; sinceHit = 99;
+  var P = JK.Player;
+  if (P){
+    P.pos[0] = 0; P.pos[2] = 6;
+    P.pos[1] = (JK.Terrain && JK.Terrain.height) ? JK.Terrain.height(0, 6) : 0;
+    P.vel[0] = P.vel[1] = P.vel[2] = 0;
+    P.speedMul = 1;
+  }
+  if (JK.Fx && JK.Fx.shimmer && P){
+    SP[0] = P.pos[0]; SP[1] = P.pos[1] + 1.0; SP[2] = P.pos[2];
+    JK.Fx.shimmer(SP, 18, [0.6, 0.85, 1.0]);
+  }
+  if (JK.msg) JK.msg('THE FORCE SUSTAINS YOU', 1.6);
+}
+
+JK.Hero = {
+  ent: null,
+  dead: false,
+  invuln: 0,
+  hurt: hurt,
+
+  init: function(){
+    var g = game();
+    g.hpMax = g.hpMax || HP_MAX;
+    g.hp = g.hpMax;
+    dead = false; deadT = 0; invuln = INVULN_T; sinceHit = 99; flashT = 0;
+    hpEl = document.getElementById('hpFill');
+    if (!JK.Player) return;
+    ent = {
+      pos: JK.Player.pos,            /* alias — tracks the player for free */
+      radius: 0.55,
+      height: 1.8,
+      hp: g.hp,
+      team: 'player',
+      kind: 'hero',
+      onHit: function(dmg, dir, kind){
+        hurt(dmg, dir ? dir[0] : 0, dir ? dir[1] : 0, dir ? dir[2] : 0, kind);
+        this.hp = game().hp;
+      }
+    };
+    JK.Hero.ent = ent;
+    if (JK.Combat && JK.Combat.register) JK.Combat.register(ent);
+  },
+
+  update: function(dt, t){
+    var g = game();
+    if (invuln > 0) invuln -= dt;
+    if (flashT > 0) flashT -= dt;
+    sinceHit += dt;
+    if (dead){
+      deadT -= dt;
+      if (deadT <= 0) respawn();
+    } else if (g.hp < g.hpMax && sinceHit > REGEN_DELAY){
+      g.hp = Math.min(g.hpMax, g.hp + REGEN_RATE * dt);
+    }
+    if (ent) ent.hp = dead ? 0 : g.hp;
+    JK.Hero.dead = dead;
+    JK.Hero.invuln = invuln > 0 ? invuln : 0;
+    /* the Ui module owns the bar width; we only tint on damage flash */
+    if (hpEl){
+      var want = flashT > 0 ? '#ff6a4a' : '';
+      if (hpEl.style.filter !== (want ? 'brightness(1.6)' : ''))
+        hpEl.style.filter = want ? 'brightness(1.6)' : '';
+    }
+  }
+};
+})();
+
 /* ===== 60_ui.js ===== */
 /* JK.Ui — saber customization menu + combat HUD feedback. Owner: ui agent.
  *
@@ -3161,7 +3313,8 @@ if (!JK.Hud) JK.Hud = Ui;
 /* JK.main — boot + game loop. Owner: core. */
 (function(){
 'use strict';
-var SYSTEMS = ['Terrain', 'Input', 'Player', 'Rig', 'Sabers', 'Powers', 'Bots', 'Fx', 'Hud'];
+var SYSTEMS = ['Terrain', 'Input', 'Player', 'Rig', 'Sabers', 'Powers', 'Bots',
+               'Blaster', 'Hero', 'Fx', 'ForceFx', 'Audio', 'Hud'];
 var last = 0, t0 = 0, started = false;
 
 JK.game = { hp: 100, hpMax: 100, force: 100, forceMax: 100, over: false, kills: 0 };

@@ -15,6 +15,7 @@
  *     stanceTap,     // edge: stance-cycle tap (Q / #btnStance)
  *     forceTap,      // edge: force-select tap (R / mousewheel)
  *     attackHeld,    // held: TRUE while #btnAtk is touched or LMB is down
+ *     forceHeld,     // held: TRUE while #btnForce is touched or E is down
  *     runHeld,       // held: TRUE while sprinting (stick deflection > 0.92
  *                    //   of radius, or Shift on desktop)
  *     run,           // legacy alias, always === runHeld
@@ -40,7 +41,7 @@ var state = {
   moveX: 0, moveY: 0,
   lookDX: 0, lookDY: 0,
   jump: false, attack: false, force: false, stanceTap: false, forceTap: false,
-  attackHeld: false, runHeld: false,
+  attackHeld: false, runHeld: false, forceHeld: false,
   run: false,
   stance: 0, forceSel: 0
 };
@@ -57,12 +58,14 @@ var stickMX = 0, stickMY = 0, stickRun = false;
 var lookId = null, lookLX = 0, lookLY = 0;
 /* --- touch buttons (attack hold) --- */
 var touchAtk = false;
+var touchForce = false;   /* #btnForce held (channelled force powers) */
 var btns = [];  /* {el, tid, mdown, down, up} */
 /* --- mouse --- */
 var mouseLook = false, mouseLX = 0, mouseLY = 0, mouseAtk = false;
 var lastWheel = 0;
 /* --- keyboard --- */
 var kFwd = false, kBack = false, kLeft = false, kRight = false, kShift = false;
+var kForce = false;       /* E held */
 var keyHeld = {};   /* keyCode -> bool, our own repeat guard */
 
 var elStick = null, elUI = null, elKnob = null, elCanvas = null, elStart = null;
@@ -245,7 +248,7 @@ function keyDown(e){
     case 68: case 39: kRight = true; break;  /* D / Right */
     case 16: kShift = true; break;           /* Shift = run */
     case 32: if (!overlayUp()) pJump = true; break;                    /* Space */
-    case 69: if (!overlayUp()) pForce = true; break;                   /* E */
+    case 69: if (!overlayUp()){ pForce = true; kForce = true; } break;   /* E */
     case 81: if (!overlayUp()){ pStance = true; cStance++; } break;    /* Q */
     case 82: if (!overlayUp()){ pForceTap = true; cForceSel++; } break;/* R */
   }
@@ -260,6 +263,7 @@ function keyUp(e){
     case 65: case 37: kLeft = false; break;
     case 68: case 39: kRight = false; break;
     case 16: kShift = false; break;
+    case 69: kForce = false; break;          /* E */
   }
 }
 
@@ -269,6 +273,7 @@ function releaseAll(){
   for (k in keyHeld) keyHeld[k] = false;
   kFwd = kBack = kLeft = kRight = kShift = false;
   mouseLook = false; mouseAtk = false; touchAtk = false;
+  touchForce = false; kForce = false;
   stickId = null; stickMX = 0; stickMY = 0; stickRun = false;
   lookId = null;
   /* rAF is paused while hidden — drop pending edges + look deltas so the
@@ -304,7 +309,8 @@ JK.Input = {
       function(){ pAttack = true; touchAtk = true; },
       function(){ touchAtk = false; });
     bindBtn(document.getElementById('btnForce'),
-      function(){ pForce = true; }, null);
+      function(){ pForce = true; touchForce = true; },
+      function(){ touchForce = false; });
     bindBtn(document.getElementById('btnStance'),
       function(){ pStance = true; cStance++; }, null);
 
@@ -338,6 +344,7 @@ JK.Input = {
     state.runHeld = stickRun || kShift;
     state.run = state.runHeld;                 /* legacy alias */
     state.attackHeld = touchAtk || mouseAtk;
+    state.forceHeld = touchForce || kForce;
 
     /* edges: pending -> state, then clear */
     state.jump = pJump;

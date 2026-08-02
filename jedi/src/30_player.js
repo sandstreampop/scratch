@@ -107,6 +107,18 @@ JK.Player = {
   stanceIdx: 1,
   attackQueued: false,
 
+  /* --- hooks for JK.Powers / JK.Bots (iteration 3+) ---
+   * speedMul  multiplies walk/sprint target speed (Force Speed). Default 1.
+   * jumped    true only on the frame the player left the ground by jumping.
+   * impulse() adds world-space velocity (knockback, Force Jump); an upward
+   *           impulse also unsticks the player from the ground the same frame. */
+  speedMul: 1,
+  jumped: false,
+  impulse: function(vx, vy, vz){
+    vel[0] += vx || 0; vel[1] += vy || 0; vel[2] += vz || 0;
+    if (vy > 0){ onGround = false; pos[1] += 0.02; }
+  },
+
   init: function(){
     pos[0] = 0; pos[2] = 6;                      /* spawn facing origin (-Z) */
     pos[1] = gh(pos[0], pos[2]);                 /* ground at the ACTUAL spawn xz */
@@ -114,6 +126,7 @@ JK.Player = {
     yaw = 0; camYaw = 0; camPitch = -0.26; camDist = CAM_DIST;
     onGround = true; speed2D = 0; anim = 'idle';
     stanceIdx = 1; this.attackQueued = false;
+    this.speedMul = 1; this.jumped = false;
     stanceEl = document.getElementById('stanceTag');
     if (stanceEl) stanceEl.textContent = STANCE_NAMES[stanceIdx];
     var st = JK.Input && JK.Input.state;
@@ -148,7 +161,7 @@ JK.Player = {
 
     var dvx = 0, dvz = 0;
     if (hasMove){
-      var spd = (sprinting ? SPRINT_SPEED : WALK_SPEED) * mag;
+      var spd = (sprinting ? SPRINT_SPEED : WALK_SPEED) * mag * (P.speedMul || 1);
       if (onGround){
         /* uphill grade along move dir; >~50deg gets heavily slowed */
         var e = 0.4;
@@ -188,7 +201,8 @@ JK.Player = {
     }
 
     /* ---- jump / gravity / integrate ---- */
-    if (st.jump && onGround){ vel[1] = JUMP_VY; onGround = false; }
+    P.jumped = false;
+    if (st.jump && onGround){ vel[1] = JUMP_VY; onGround = false; P.jumped = true; }
     if (onGround) vel[1] = 0; else vel[1] -= GRAVITY * dt;
     pos[0] += vel[0] * dt;
     pos[1] += vel[1] * dt;

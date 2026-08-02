@@ -1,7 +1,8 @@
 /* JK.main — boot + game loop. Owner: core. */
 (function(){
 'use strict';
-var SYSTEMS = ['Terrain', 'Input', 'Player', 'Rig', 'Sabers', 'Powers', 'Bots', 'Fx', 'Hud'];
+var SYSTEMS = ['Terrain', 'Input', 'Player', 'Rig', 'Sabers', 'Powers', 'Bots',
+               'Blaster', 'Hero', 'Fx', 'ForceFx', 'Audio', 'Hud'];
 var last = 0, t0 = 0, started = false;
 
 JK.game = { hp: 100, hpMax: 100, force: 100, forceMax: 100, over: false, kills: 0 };
