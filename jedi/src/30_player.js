@@ -25,6 +25,7 @@ var ACCEL_GND    = 40;     /* m/s^2 toward desired vel on ground */
 var ACCEL_AIR    = 12;     /* ~30% air control */
 var DECEL_GND    = 30;     /* m/s^2 friction when no input on ground */
 var TURN_RATE    = 12;     /* rad/s body yaw toward move dir */
+var ATTACK_TURN_RATE = 26; /* rad/s — snap to the aim when swinging */
 var GRAVITY      = 22;     /* m/s^2 */
 var JUMP_VY      = 8.5;    /* m/s — heroic */
 var BODY_R       = 0.55;   /* player capsule radius vs obstacle circles */
@@ -189,12 +190,16 @@ JK.Player = {
       else { vel[0] += ax / al * step; vel[2] += az / al * step; }
     }
 
-    /* ---- body yaw eases toward travel direction (shortest arc) ---- */
-    if (hasMove){
-      var tYaw = Math.atan2(-dirX, -dirZ);           /* fwd(yaw)=(-sin,-cos) */
+    /* ---- body yaw: face the aim while attacking, else face travel ----
+     * A swing must land where the camera is pointing, so an attack overrides
+     * the movement-facing and turns hard toward camYaw (JKO does the same). */
+    var swinging = !!(JK.Rig && JK.Rig.swingPhase && JK.Rig.swingPhase() >= 0);
+    var aiming = swinging || P.attackQueued;
+    if (aiming || hasMove){
+      var tYaw = aiming ? camYaw : Math.atan2(-dirX, -dirZ);  /* fwd(yaw)=(-sin,-cos) */
       var d = tYaw - yaw;
       d -= TWO_PI * Math.round(d / TWO_PI);
-      var mt = TURN_RATE * dt;
+      var mt = (aiming ? ATTACK_TURN_RATE : TURN_RATE) * dt;
       if (d > mt) d = mt; else if (d < -mt) d = -mt;
       yaw += d;
       if (yaw > PI) yaw -= TWO_PI; else if (yaw < -PI) yaw += TWO_PI;

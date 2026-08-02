@@ -1071,6 +1071,7 @@ var ACCEL_GND    = 40;     /* m/s^2 toward desired vel on ground */
 var ACCEL_AIR    = 12;     /* ~30% air control */
 var DECEL_GND    = 30;     /* m/s^2 friction when no input on ground */
 var TURN_RATE    = 12;     /* rad/s body yaw toward move dir */
+var ATTACK_TURN_RATE = 26; /* rad/s — snap to the aim when swinging */
 var GRAVITY      = 22;     /* m/s^2 */
 var JUMP_VY      = 8.5;    /* m/s — heroic */
 var BODY_R       = 0.55;   /* player capsule radius vs obstacle circles */
@@ -1235,12 +1236,16 @@ JK.Player = {
       else { vel[0] += ax / al * step; vel[2] += az / al * step; }
     }
 
-    /* ---- body yaw eases toward travel direction (shortest arc) ---- */
-    if (hasMove){
-      var tYaw = Math.atan2(-dirX, -dirZ);           /* fwd(yaw)=(-sin,-cos) */
+    /* ---- body yaw: face the aim while attacking, else face travel ----
+     * A swing must land where the camera is pointing, so an attack overrides
+     * the movement-facing and turns hard toward camYaw (JKO does the same). */
+    var swinging = !!(JK.Rig && JK.Rig.swingPhase && JK.Rig.swingPhase() >= 0);
+    var aiming = swinging || P.attackQueued;
+    if (aiming || hasMove){
+      var tYaw = aiming ? camYaw : Math.atan2(-dirX, -dirZ);  /* fwd(yaw)=(-sin,-cos) */
       var d = tYaw - yaw;
       d -= TWO_PI * Math.round(d / TWO_PI);
-      var mt = TURN_RATE * dt;
+      var mt = (aiming ? ATTACK_TURN_RATE : TURN_RATE) * dt;
       if (d > mt) d = mt; else if (d < -mt) d = -mt;
       yaw += d;
       if (yaw > PI) yaw -= TWO_PI; else if (yaw < -PI) yaw += TWO_PI;
@@ -2888,9 +2893,15 @@ JK.Hero = {
  *   - update(): syncs #hpFill/#fpFill widths from JK.game (only when changed).
  *
  * The panel/button live directly on <body> (z 6/7) because #hud (z3) is its own
- * stacking context below .tbtn (z4). All panel events stopPropagation so the
- * document-level touch handlers in 20_input.js never see them (this is ALSO what
- * keeps the sliders draggable: input's document touchmove preventDefaults).
+ * stacking context below .tbtn (z4). touchstart/touchmove stopPropagation at the
+ * panel boundary so the document-level handlers in 20_input.js never see them
+ * (input's document touchmove preventDefaults, which would kill the panel's
+ * native pan-y scroll). touchend/touchcancel are deliberately ALLOWED to bubble:
+ * iOS can coalesce several fingers into ONE event (see the ownsTouch note in
+ * 20_input.js) — swallowing an end that also carries a stick/button finger
+ * would leave input with a stuck identifier (run-forever stick, stuck
+ * attackHeld). Bubbling ends are safe: input filters by identifiers it owns,
+ * and menu touches are never claimed by it.
  *
  * NOTE: 90_main.js SYSTEMS has no 'Ui' entry; while no dedicated Hud module
  * exists we defensively alias JK.Hud = JK.Ui so main drives init/update.
@@ -3007,38 +3018,91 @@ function eat(e){                       /* swallow: game never sees it, no ghost 
   if (e.cancelable) e.preventDefault();
 }
 
-/* Block every input event at the panel/button boundary so 20_input.js document/
- * window handlers (which preventDefault touchmove!) never see menu touches. */
+/* Did this Touch actually land on el? Same guard as 20_input.js: an iOS event
+ * can coalesce several new/moved/ended fingers into one changedTouches list,
+ * so [0] may belong to the stick/look/ATK finger, not to us. */
+function ownsTouch(el, t){
+  var n = t.target;
+  if (!n) return true;                 /* ancient UA without Touch.target */
+  return n === el || !!(el.contains && el.contains(n));
+}
+function hasTouch(ts, id){
+  if (id === null || !ts) return false;
+  for (var i = 0; i < ts.length; i++) if (ts[i].identifier === id) return true;
+  return false;
+}
+
+/* Block game-feeding events at the panel/button boundary. touchstart/touchmove
+ * STOP here (input's document touchmove preventDefaults => would kill native
+ * pan-y scroll; starts must never leak toward game zones). touchend/touchcancel
+ * are NOT stopped — a coalesced end may carry ANOTHER finger's release that
+ * 20_input.js's document touchEnd must see to clear its identifiers; letting
+ * ends bubble is harmless because input ignores ids it never claimed. */
 function shield(el){
   var i;
-  var tev = ['touchstart', 'touchmove', 'touchend', 'touchcancel'];
+  var tev = ['touchstart', 'touchmove'];
   for (i = 0; i < tev.length; i++) el.addEventListener(tev[i], stopOnly, {passive:false});
   var mev = ['mousedown', 'mousemove', 'mouseup', 'click', 'wheel', 'keydown', 'keyup'];
   for (i = 0; i < mev.length; i++) el.addEventListener(mev[i], stopOnly, {passive:false});
 }
 
-/* iOS-safe tap: touchend preventDefault kills the synthetic click (no double
- * fire); the click handler is the desktop path. */
+/* iOS-safe tap. touchstart+touchend preventDefault kills the synthetic click
+ * (no touchend+click double fire); the click handler is the desktop path, with
+ * a time guard in case a non-cancelable touchend let a ghost click through.
+ * The touch is latched by identifier so a coalesced event can't trigger us
+ * with someone else's finger, and ends/cancels bubble on (see shield note). */
+var GHOST_MS = 700;
 function tap(el, fn){
-  el.addEventListener('touchstart', function(e){ eat(e); el.classList.add('dn'); }, {passive:false});
-  el.addEventListener('touchend', function(e){ eat(e); el.classList.remove('dn'); fn(); }, {passive:false});
-  el.addEventListener('touchcancel', function(e){ stopOnly(e); el.classList.remove('dn'); }, {passive:false});
+  var tid = null, lastTouchT = 0;
+  el.addEventListener('touchstart', function(e){
+    eat(e);
+    if (tid !== null) return;                  /* one finger owns the control */
+    var ts = e.changedTouches;
+    for (var i = 0; i < ts.length; i++){
+      if (ownsTouch(el, ts[i])){ tid = ts[i].identifier; break; }
+    }
+    if (tid !== null) el.classList.add('dn');
+  }, {passive:false});
+  el.addEventListener('touchend', function(e){
+    if (e.cancelable) e.preventDefault();      /* kill iOS synthetic click */
+    if (!hasTouch(e.changedTouches, tid)) return;   /* not our finger */
+    tid = null;
+    lastTouchT = Date.now();
+    el.classList.remove('dn');
+    fn();
+  }, {passive:false});
+  el.addEventListener('touchcancel', function(e){
+    if (!hasTouch(e.changedTouches, tid)) return;
+    tid = null;
+    lastTouchT = Date.now();
+    el.classList.remove('dn');
+  }, {passive:false});
   el.addEventListener('mousedown', function(e){ stopOnly(e); el.classList.add('dn'); });
   el.addEventListener('mouseup', function(e){ stopOnly(e); el.classList.remove('dn'); });
-  el.addEventListener('click', function(e){ eat(e); fn(); });
+  el.addEventListener('click', function(e){
+    eat(e);
+    if (Date.now() - lastTouchT < GHOST_MS) return;  /* ghost click: already fired */
+    fn();
+  });
 }
 
-/* ---------------- rig bridge (defensive vs mid-build siblings) ---------------- */
+/* ---------------- rig bridge (defensive vs mid-build siblings) ----------------
+ * Prefer the contract instance API (rig.setType/setSaber). The module-level
+ * bridges in 40_character.js exist BEFORE Rig.init() and silently no-op while
+ * their player slot is still null — report that as failure so the update()
+ * retry loop actually retries (a rig without a 'player' slot is trusted). */
 function rigSetType(t){
   var R = JK.Rig;
-  if (R && R.setType){ R.setType(t); return true; }
-  if (R && R.player && R.player.setType){ R.player.setType(t); return true; }
+  if (!R) return false;
+  if (R.player && R.player.setType){ R.player.setType(t); return true; }
+  if (R.setType){ R.setType(t); return R.player !== null; }
   return false;
 }
 function rigSetSaber(f){
   var R = JK.Rig;
-  if (R && R.setSaber){ R.setSaber(f); return true; }
-  if (R && R.player && R.player.setSaber){ R.player.setSaber(f); return true; }
+  if (!R) return false;
+  if (R.player && R.player.setSaber){ R.player.setSaber(f); return true; }
+  if (R.setSaber){ R.setSaber(f); return R.player !== null; }
   return false;
 }
 
@@ -3094,8 +3158,12 @@ function setOpen(o){
 /* ---------------- sliders ----------------
  * iOS Safari + ancestor touch-action:none makes native range touch-drag flaky,
  * so touches drive the value manually (deterministic); mouse uses the native
- * 'input' path. Rect math only runs during menu interaction — not per frame. */
+ * 'input' path. The driving touch is latched by identifier: a coalesced event's
+ * changedTouches[0] can be the STICK finger moving under the open panel, and
+ * feeding its X here would yank the color around. Rect math only runs during
+ * menu interaction — not per frame. */
 function bindSlider(inp, idx){
+  var tid = null;
   function fromX(clientX){
     var rc = inp.getBoundingClientRect();
     var tw = 30;                                /* thumb width incl. borders */
@@ -3103,10 +3171,32 @@ function bindSlider(inp, idx){
     var v = clamp255(w > 0 ? (clientX - rc.left - tw / 2) / w * 255 : 0);
     if (v !== cur[idx]){ cur[idx] = v; applyColor(false); }
   }
-  inp.addEventListener('touchstart', function(e){ eat(e); fromX(e.changedTouches[0].clientX); }, {passive:false});
-  inp.addEventListener('touchmove', function(e){ eat(e); fromX(e.changedTouches[0].clientX); }, {passive:false});
-  inp.addEventListener('touchend', function(e){ eat(e); applyColor(true); }, {passive:false});
-  inp.addEventListener('touchcancel', function(e){ stopOnly(e); applyColor(true); }, {passive:false});
+  inp.addEventListener('touchstart', function(e){
+    eat(e);
+    if (tid !== null) return;                   /* one finger drives the slider */
+    var ts = e.changedTouches;
+    for (var i = 0; i < ts.length; i++){
+      if (ownsTouch(inp, ts[i])){ tid = ts[i].identifier; fromX(ts[i].clientX); break; }
+    }
+  }, {passive:false});
+  inp.addEventListener('touchmove', function(e){
+    var ts = e.changedTouches;
+    for (var i = 0; i < ts.length; i++){
+      if (ts[i].identifier === tid){ eat(e); fromX(ts[i].clientX); return; }
+    }
+    /* foreign finger only: leave it for the panel shield / input module */
+  }, {passive:false});
+  inp.addEventListener('touchend', function(e){
+    if (e.cancelable) e.preventDefault();       /* no ghost click; DO bubble (shield note) */
+    if (!hasTouch(e.changedTouches, tid)) return;
+    tid = null;
+    applyColor(true);
+  }, {passive:false});
+  inp.addEventListener('touchcancel', function(e){
+    if (!hasTouch(e.changedTouches, tid)) return;
+    tid = null;
+    applyColor(true);
+  }, {passive:false});
   inp.addEventListener('mousedown', stopOnly);  /* no preventDefault: keep native drag */
   inp.addEventListener('input', function(){
     var v = clamp255(+inp.value || 0);

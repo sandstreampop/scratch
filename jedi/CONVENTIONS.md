@@ -271,3 +271,71 @@ Pure visuals, driven by JK.Powers. NO gameplay logic, NO input reads.
   8 kills to a cap of 9 bots. Keep the cost sane: bots update fully within 60 m of the player,
   cheap-update (position only, no rig anim) beyond.
 - Draw: one JK.Rig.create per bot (shared meshes internally, so this is cheap).
+
+## SWING REWORK CONTRACT (supersedes the iteration-2 swing authoring) — FROZEN
+
+WHY: the keyframed joint-angle swing system produced unreadable flailing. Measured on the
+MEDIUM neutral attack: the blade tip spent 0% of the swing in front of the body, stayed at
+head height behind the shoulder, and its path was 2.6x its total span (it waggled instead of
+sweeping). Joint angles authored blind cannot produce readable arcs.
+
+NEW PRINCIPLE: **author the BLADE'S ARC, solve the ARM to match.** Nobody hand-authors shoulder
+angles ever again.
+
+### Arc definition (the unit of choreography)
+An attack is an arc of the blade swept about a pivot in the character's CHEST space:
+```
+arcDef = {
+  dur:      seconds,
+  pivot:    [x,y,z]        // arc centre in body-local space (+X right, +Y up, -Z forward),
+                           // typically near the chest/shoulder, e.g. [0.05, 1.35, -0.10]
+  radius:   metres         // distance from pivot to the blade's MIDDLE (arm + half blade)
+  axis:     [x,y,z]        // body-local rotation axis of the swing plane (unit). The blade
+                           // sweeps IN the plane perpendicular to this axis.
+  a0, a1:   radians        // start and end angle within that plane (the arc actually swept)
+  tilt:     radians        // roll of the blade about its own length (edge orientation)
+  windup:   0..1           // fraction of dur spent in anticipation before the strike
+  recover:  0..1           // fraction spent returning to guard after
+  lunge:    metres         // forward body shift during the strike (visual only)
+  name:     string
+}
+```
+`JK.Rig` converts an arc into: a world-space hand position + a blade direction at each instant,
+then poses the arm to reach it. The angle within the arc is eased so the strike is FAST in the
+middle and slow at the ends (anticipation → strike → follow-through), which is what makes a
+swing read.
+
+### Required JK.Rig instance API (owner: 40_character.js)
+- `rig.playArc(arcDef)` -> bool. Same acceptance/chaining rule as before (accept when idle or
+  phase >= 0.6). `rig.swingPhase()` keeps its 0..1 | -1 meaning.
+- `rig.playSwing(def)` MUST KEEP WORKING as a compatibility shim (JK.Bots is being written
+  against it right now in another workflow). Internally it may convert to an arc or keep the
+  old path — but it must not crash and must produce a visible swing.
+- Arm posing is TWO-BONE IK: given the shoulder joint (from the existing rig hierarchy) and the
+  target hand position, solve upper/lower arm angles so the hand lands on target (clamp the
+  target into reach; never NaN when the target is at the shoulder or beyond full extension).
+  The hand's orientation comes from the arc: blade direction = arc tangent-normal per the def,
+  NOT from accumulated joint angles.
+- Both hands for 'dual' (mirrored arc, offset in phase by ~0.12 for a flurry feel); 'staff'
+  keeps a single hand with blades both ways.
+- Torso counter-rotation follows the arc automatically (yaw toward the swing direction,
+  slight pitch on overheads) — derive it from the arc, do not hand-author it.
+
+### Acceptance test — THE gate (owner: everyone touching swings)
+```
+node jedi/test/preview.js  <scratch>/mine.html          # build YOUR copy, no build races
+node jedi/test/swing_probe.js <outdir> <stance> <dir> <scratch>/mine.html
+```
+Prints metrics, writes `<outdir>/strip.png` (a tiled filmstrip — LOOK AT IT), exits non-zero
+on failure. Every one of the 12 attacks must PASS:
+- `frontFraction >= 0.55`  blade is in front of the body for most of the swing
+- `tipSpan >= 1.8`         the tip actually travels
+- `pathOverSpan <= 1.9`    one directed sweep, not a waggle
+- `maxTipHeight <= 2.6`    no antenna-waving above the head
+- zero console errors
+Metrics passing is necessary but NOT sufficient: the filmstrip must also LOOK like the attack's
+name. You must open the strip images and describe what you actually see.
+
+### Facing (already done by core in 30_player.js — do not re-implement)
+While a swing is active or an attack was just queued, the body turns toward `camYaw` at
+26 rad/s, overriding movement facing. Swings therefore land where the camera looks.
