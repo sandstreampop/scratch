@@ -73,3 +73,68 @@ right half = look drag, buttons #btnJump #btnAtk #btnForce #btnStance. Input mod
 wires them. Desktop: WASD run, SPACE jump, mouse look w/ pointer lock on click,
 LMB attack, E force. CSS is in template.html — input agent may add classes there ONLY
 in the marked INPUT-CSS block.
+
+## ITERATION 2 CONTRACTS (saber combat) — FROZEN, build against these exactly
+
+New systems in 90_main.js order (already wired): Sabers (50_sabers.js), then later
+Powers/Bots/Fx/Hud. Rig updates BEFORE Sabers each frame; all draws happen after all updates.
+
+### JK.Rig instance extensions (owner: character agent, 40_character.js)
+- `rig.setType(type)` — 'single' | 'dual' | 'staff'.
+  single: right hand. dual: second hilt+blade mirrored in LEFT hand. staff: one hilt in right
+  hand with blades BOTH directions. Shared meshes; per-instance type.
+- `rig.blades` — array of `{base:[x,y,z], tip:[x,y,z]}` world-space, refreshed EVERY draw
+  (1 entry single, 2 dual, 2 staff). `rig.tipPos/basePos` stay aliases of blades[0].
+- `rig.playSwing(def)` — def:
+  `{ dur /*s*/, keys:[{t /*0..1*/, sp,sy,sr /*shoulder pitch/yaw/roll rad*/, el /*elbow*/,
+     wr /*wrist*/, ty,tp /*torso yaw/pitch*/, lunge /*m forward*/}...], mirror /*bool: also
+     drive left arm mirrored (dual)*/ }`
+  Interpolates smoothly (smoothstep between keys), overrides procedural arm/torso anim while
+  active, returns to normal blending after. Returns true if accepted. Accepts a new swing when
+  none active or current one >= 60% done (combo chaining).
+- `rig.swingPhase()` -> 0..1 while swinging else -1.
+- Rig's OLD auto-consume of JK.Player.attackQueued and startSwing() fallback: keep startSwing()
+  but ONLY auto-consume attackQueued when `!JK.Sabers` (Sabers owns attacks now).
+
+### JK.Sabers (owner: sabers agent, NEW file 50_sabers.js)
+- Stances: 0=LIGHT (fast/weak), 1=MEDIUM, 2=STRONG (slow/heavy). Current = JK.Player.stanceIdx.
+- 4 attacks per stance, selected AT PRESS by stick direction: neutral / forward / left / right
+  (12 distinct swing defs total, different arcs & timings per stance).
+- Consumes JK.Player.attackQueued in update(); calls JK.Rig's player-instance playSwing.
+- `JK.Sabers.active()` -> true during damage-active frames (e.g. phase 0.25..0.75).
+- `JK.Sabers.sweep` -> during active frames: `{pb,pt,cb,ct /*prev/cur base+tip vec3*/, dmg,
+   knock /*m/s knockback*/, name}` else null. Uses JK.Rig.blades[…] positions captured each
+   frame (all blades of dual/staff contribute — array `JK.Sabers.sweeps` list, `sweep` = [0]).
+- `JK.Sabers.stanceName(i)`, `JK.Sabers.STANCES` table exposed for HUD.
+- Updates #stanceTag on stance change (takes over from Player's basic text set — keep Player's
+  code, last-writer-wins is fine since both write same frame).
+
+### JK.Combat (owner: combat agent, NEW file 55_combat.js) — includes JK.Fx
+- Entity registry: `JK.Combat.register(ent)` / `unregister(ent)`.
+  ent contract: `{ pos:[x,y,z] /*feet*/, radius, height, hp, team /*'player'|'enemy'|'neutral'*/,
+  onHit(dmg, dir3, kind) }`. Combat.update does segment-swept-vs-capsule tests of every active
+  saber sweep (player's, later bots') against entities of OTHER teams; calls onHit once per
+  entity per swing (not per frame — track swing ids).
+- `JK.Combat.swingId` increments per new player swing (read JK.Sabers state).
+- JK.Fx (same file, exported as JK.Fx): tiny particle pool (<=256, preallocated): sparks
+  (impact), respawn shimmer. `JK.Fx.sparks(pos, n, color)`. Drawn additive, zero alloc/frame.
+- 3 training droids on posts near spawn (~10-14 m out, distinct bearings), hp 60, they wobble,
+  spark when hit, explode into boxes-parts fx at 0 hp, respawn after 3 s. Register as team
+  'enemy'. Droids must NOT block movement (no obstacles entries).
+- Damage numbers: floating "-12" style DOM-less — reuse #msg? NO: draw small emissive boxes is
+  ugly; instead JK.Combat exposes `JK.Combat.lastHit = {dmg, t}` and Ui shows it. Keep simple.
+
+### JK.Ui (owner: ui agent, NEW file 60_ui.js)
+- Creates ALL its DOM + a <style> element at init() via JS (no template.html edits!).
+- SABER menu: a small "SABER" tbtn-styled button top-left under stance tag opens a 2002-style
+  panel (chunky borders, Trebuchet, tan/olive like the HUD): saber TYPE row (SINGLE/DUAL/STAFF),
+  6 color presets (blue #2f7cf0, green #33e05a, red #f03428, purple #a04af0, yellow #f0d028,
+  orange #f08a28) + three R/G/B sliders (0-255) with live preview swatch. Applies instantly:
+  `JK.Rig.setType(t)`; `JK.Rig.setSaber([r,g,b] 0..1)`. Persists to localStorage
+  ('jk_saber_type', 'jk_saber_rgb'), re-applies on boot. Game PAUSES while panel open?? NO —
+  keep running (retro arcade), but panel blocks its own touches from reaching game controls
+  (stopPropagation + it sits above #stickL).
+- Shows attack name flashes (JK.Sabers last attack name) + damage feedback via
+  JK.Combat.lastHit in a small line under #stanceTag. Updates #hpFill/#fpFill widths from
+  JK.game.hp/force each frame (cheap: only when changed).
+- Update #forceTag placeholder text "" for now (Powers iteration owns it).
