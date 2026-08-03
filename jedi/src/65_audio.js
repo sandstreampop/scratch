@@ -3,7 +3,9 @@
  * Every sound is synthesised from oscillators + three noise buffers built once at
  * init(). init() runs inside the ENTER-THE-DUNES tap, so the iOS AudioContext is
  * created and unlocked by a real user gesture; a self-removing touchend/mousedown
- * listener resumes it again if iOS suspends it later.
+ * listener, an onstatechange hook and a 1 Hz poll in update() bring it back if
+ * WebKit later parks it in 'suspended' OR 'interrupted' (call/Siri/alarm) — it
+ * never resumes itself, and we schedule nothing at all while it is down.
  *
  * API (CONVENTIONS.md "ITERATION 3+4 CONTRACTS"):
  *   JK.Audio.play(name, opt)   opt = {pos:[x,y,z], vol, rate}
@@ -12,7 +14,8 @@
  *               fallback to plain gain on old iOS).
  *       vol  -> 0..1 multiplier on the sound's authored level.
  *       rate -> pitch/speed multiplier (used by 'swing' for the doppler whoosh).
- *       Unknown names, muted, or no-WebAudio => silent no-op, never throws.
+ *       Unknown names, muted, no-WebAudio, a down context or NaN pos/vol =>
+ *       silent no-op, never throws.
  *   JK.Audio.hum(on, intensity)  the ONE persistent saber drone voice.
  *   JK.Audio.setMute(b) / toggle() / .muted / .enabled / .ctx / .stopAll()
  *
@@ -56,7 +59,7 @@ var humOn = false, humGain = -1, humFc = -1, humF0 = -1, humDet = -1;
 /* self-drive edge trackers */
 var lastAtkId = 0, wasLit = false, wasGround = true, prevVy = 0;
 var lastHp = -1, wasDead = false, lastStance = -1, lastHitT = -1e9;
-var resumeTry = 0;
+var resumeTry = 0, wasRun = false;
 
 /* scratch opt for our own self-driven play() calls: zero allocation per event */
 var SOPT = { pos: null, vol: 1, rate: 1 };
@@ -69,6 +72,18 @@ function so(pos, vol, rate){
 
 /* ============================ tiny helpers ============================= */
 function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
+
+/* iOS/WebKit has THREE non-running states: 'suspended' (never unlocked, or we
+ * suspended it ourselves), 'closed', and the WebKit-only 'interrupted' (phone
+ * call, Siri, alarm, another app grabbing the audio session). None of them ever
+ * self-resume, and while any of them is in effect ctx.currentTime is FROZEN —
+ * scheduling into it piles every sound up at the same timestamp so they all fire
+ * in one blast the moment audio comes back. Old engines have no .state at all. */
+function running(){
+  if (!ctx) return false;
+  var s = ctx.state;
+  return s === undefined || s === 'running';
+}
 
 function trk(v, n){ if (v.nc < NMAX) v.n[v.nc++] = n; return n; }
 
@@ -487,7 +502,7 @@ function spatial(pos){
   if (!eye || !pos) return;
   var dx = pos[0] - eye[0], dy = pos[1] - eye[1], dz = pos[2] - eye[2];
   var d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  if (d >= ROLLOFF){ SPG = 0; return; }
+  if (!(d < ROLLOFF)){ SPG = 0; return; }  /* also catches NaN/short pos arrays */
   var fade = 1 - d / ROLLOFF;              /* linear taper to true silence */
   SPG = (REF_D / (REF_D + d)) * fade * 1.1;
   if (SPG > 1) SPG = 1;
@@ -531,9 +546,10 @@ function buildHum(){
 
 function hum(on, intensity){
   if (!ok || !humG) return;
+  humOn = !!on;
+  if (!running()) return;    /* frozen clock — re-applied when audio comes back */
   var i = intensity;
   if (!(i >= 0)) i = 0; else if (i > 2) i = 2;
-  humOn = !!on;
   var t = ctx.currentTime;
   var wantG = (humOn && !muted) ? (0.048 + 0.070 * i) : 0;
   var wantF = 320 + 640 * i;
@@ -561,24 +577,29 @@ function hum(on, intensity){
 
 /* ============================== play =================================== */
 function play(name, opt){
-  if (!ok || muted) return;
-  var def = DEFS[name];
-  if (!def) return;                        /* unknown name: silent no-op */
+  if (!ok || muted || !running()) return;
+  /* own-property + callable test: DEFS['toString'] etc. inherit from
+   * Object.prototype and would otherwise sail past a plain truthiness check. */
+  var def = DEFS.hasOwnProperty(name) ? DEFS[name] : null;
+  if (!def || typeof def.fn !== 'function') return;   /* unknown name: no-op */
   var now = ctx.currentTime;
   if (now - def.last < def.gap) return;    /* flood guard / cross-module dedupe */
 
   var vol = def.vol, rate = 1, pan = 0;
   if (opt){
     if (opt.vol !== undefined && opt.vol !== null) vol *= opt.vol;
-    if (opt.rate) rate = clamp(opt.rate, 0.35, 3);
+    if (opt.rate > 0) rate = clamp(opt.rate, 0.35, 3);
     if (opt.pos){
       spatial(opt.pos);
       vol *= SPG; pan = SPP;
       if (vol < 0.004) return;             /* out of earshot */
     }
   }
-  if (vol <= 0) return;
+  /* NaN-safe: a bad pos/vol from a sibling must go silent, never throw an
+   * AudioParam TypeError up through update() into the game loop. */
+  if (!(vol > 0)) return;
   if (vol > 1.4) vol = 1.4;
+  if (!(pan >= -1 && pan <= 1)) pan = 0;
 
   var v = alloc(vol * def.pri, now);
   if (!v) return;
@@ -639,6 +660,7 @@ function setMute(m){
   if (m === muted){ applyMute(); return; }
   muted = m;
   if (muted) stopAll();
+  else prime();          /* don't replay everything that happened while muted */
   applyMute();
 }
 
@@ -679,13 +701,22 @@ function buildDom(){
 }
 
 /* ======================= context unlock / lifecycle ==================== */
+function nop(){}
 function tryResume(){
-  if (!ctx) return;
-  if (ctx.state === 'suspended'){ try { ctx.resume(); } catch (e){} }
+  if (!ctx || running() || ctx.state === 'closed') return;
+  try {
+    var pr = ctx.resume();               /* 'suspended' AND WebKit 'interrupted' */
+    /* resume() rejects when Safari refuses outside a gesture; an unhandled
+     * rejection would spam the console (and any unhandledrejection handler). */
+    if (pr && pr['catch']) pr['catch'](nop);
+  } catch (e){}
+}
+function onState(){                      /* WebKit fires this when a call ends */
+  if (!document.hidden) tryResume();
 }
 function unlock(){
   tryResume();
-  if (!ctx || ctx.state === 'running'){
+  if (!ctx || running()){
     document.removeEventListener('touchend', unlock, true);
     document.removeEventListener('mousedown', unlock, true);
   }
@@ -694,6 +725,22 @@ function onVis(){
   if (!ctx) return;
   if (document.hidden){ try { ctx.suspend(); } catch (e){} }
   else tryResume();
+}
+
+/* Snapshot every sibling value the self-drive edges compare against, so a gap in
+ * our service (boot, unmute, an audio interruption) never dumps a pile of stale
+ * events into one frame. wasLit stays false on purpose: the saber SHOULD ignite
+ * audibly the first frame we can actually be heard. */
+function prime(){
+  var P = JK.Player;
+  lastStance = P ? (P.stanceIdx | 0) : 1;
+  wasGround  = P ? !!P.onGround : true;
+  prevVy     = (P && P.vel) ? (P.vel[1] || 0) : 0;
+  lastHp     = (JK.game && typeof JK.game.hp === 'number') ? JK.game.hp : -1;
+  wasDead    = !!(JK.Hero && JK.Hero.dead);
+  lastAtkId  = (JK.Sabers && JK.Sabers.attackId) || 0;
+  lastHitT   = (JK.Combat && JK.Combat.lastHit) ? JK.Combat.lastHit.t : -1e9;
+  wasLit     = false;
 }
 
 function stopAll(){
@@ -757,26 +804,29 @@ var Audio = JK.Audio = {
     document.addEventListener('touchend', unlock, true);
     document.addEventListener('mousedown', unlock, true);
     document.addEventListener('visibilitychange', onVis);
+    try { ctx.onstatechange = onState; } catch (e4){}  /* instant un-interrupt */
     /* prime the edge trackers so boot doesn't fire a burst of stale events */
-    var P = JK.Player;
-    lastStance = P ? (P.stanceIdx | 0) : 1;
-    wasGround = P ? !!P.onGround : true;
-    prevVy = 0;
-    lastHp = (JK.game && JK.game.hp) || -1;
-    wasDead = !!(JK.Hero && JK.Hero.dead);
-    lastAtkId = (JK.Sabers && JK.Sabers.attackId) || 0;
-    lastHitT = (JK.Combat && JK.Combat.lastHit) ? JK.Combat.lastHit.t : -1e9;
-    wasLit = false;                        /* => first frame ignites the saber */
+    prime();
+    wasRun = running();
   },
 
   /* Reads sibling state and fires the sounds the frozen modules never ask for.
    * Every read is feature-detected; every write is a play()/hum() call. */
   update: function(dt, t){
     if (!ok) return;
-    if (ctx.state === 'suspended' && !document.hidden){
-      resumeTry -= dt;
-      if (resumeTry <= 0){ resumeTry = 1.0; tryResume(); }
+    /* Context down ('suspended' after a background, or WebKit 'interrupted'
+     * after a call/Siri): keep asking it to come back — nothing else will — and
+     * schedule NOTHING meanwhile, because currentTime is frozen and every voice
+     * would queue on the same timestamp and detonate together on resume. */
+    if (!running()){
+      wasRun = false;
+      if (!document.hidden){
+        resumeTry -= dt;
+        if (resumeTry <= 0){ resumeTry = 1.0; tryResume(); }
+      }
+      return;
     }
+    if (!wasRun){ wasRun = true; prime(); }   /* audio is back: no stale edges */
     reap();
     if (muted) return;
 

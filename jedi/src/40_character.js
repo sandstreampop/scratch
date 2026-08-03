@@ -4,7 +4,49 @@
  * Shared geometry: ONE set of white part meshes built once (buildMeshes); every
  * instance draws them with per-instance palette tints — bots reuse everything.
  *
- * Instance API (consumed by sabers / ui / future bots):
+ * ===================== THE ARC ENGINE (swing rework) =====================
+ * Attacks are authored as the BLADE'S ARC, never as joint angles. An arc is a
+ * rotation of the blade about a pivot in the character's chest space; the arm is
+ * solved to match with two-bone IK, and the torso follows the arc automatically.
+ *
+ *   rig.playArc(arcDef) -> bool     (accepted when idle or phase >= 0.6)
+ *   arcDef = {
+ *     dur      seconds
+ *     pivot    [x,y,z]  arc centre, BODY-LOCAL (+X right, +Y up, -Z forward,
+ *                       origin at the FEET). Chest-ish, e.g. [0.04,1.34,-0.05]
+ *     radius   m        pivot -> blade MIDDLE (arm + half blade), ~0.9-1.15
+ *     axis     [x,y,z]  normal of the swing plane (need not be unit)
+ *     a0, a1   rad      start/end angle in that plane
+ *     tilt     rad      roll of the blade about its own length (edge)
+ *     windup   0..1     fraction of dur spent in anticipation
+ *     recover  0..1     fraction spent settling back toward guard
+ *     lunge    m        forward body shift during the strike (visual only)
+ *     name     string
+ *   }
+ *   ANGLE CONVENTION: angle 0 points UP from the pivot — or FORWARD when `axis`
+ *   is (near) vertical, since "up" degenerates there. Positive angles follow the
+ *   right-hand rule about `axis`. So:
+ *     horizontal right->left sweep : axis [0,1,0], a0 -0.95 .. a1 0.85
+ *     overhead chop down the front : axis [-1,0,0], a0  0.0  .. a1 1.95
+ *     diagonal high-right -> low-left: axis = cross(startDir, endDir)
+ *   Easing: anticipation (eases slightly PAST a0 with the blade coiled IN) ->
+ *   strike (angular speed peaks a third of the way through, then decelerates) ->
+ *   follow-through settle + pull back toward guard. A further short blend into
+ *   the procedural pose runs AFTER dur, so swingPhase() stays exactly 0..1.
+ *
+ * AUTHORING NOTE (measured against jedi/test/swing_probe.js, all 12 attacks):
+ *   - The idle guard points the blade up-forward at ~38 deg (GUARD_DIR below).
+ *     The tip has to travel from there into the cocked pose, and the probe's
+ *     `pathOverSpan <= 1.9` counts that travel. Arcs whose a0 sits within ~1 rad
+ *     of the guard pass with room to spare; a cock-back on the far side of the
+ *     body costs ~1.5 m of tip path.
+ *   - Total swept angle |a1-a0| <= ~2.0 rad. Wider arcs cost more path per unit
+ *     of span (arc/chord grows), which is what pushes pathOverSpan over.
+ *   - The blade tip is smoothly pulled under CEIL_Y: you cannot hold a saber
+ *     overhead at arm's length, so the elbow tucks as the blade passes vertical.
+ *     Overheads therefore stay off the "antenna above the head" failure.
+ *
+ * Instance API (consumed by sabers / ui / bots):
  *   var rig = JK.Rig.create(palette);
  *     palette: {skin,tunic,pants,boots,belt,hair} each [r,g,b]; null => Kyle-ish.
  *   rig.draw(pos, yaw, anim, phaseInfo)
@@ -14,38 +56,29 @@
  *   rig.advance(dt, t, anim, speed2D) — step animation without rendering.
  *   rig.setType(type)   — 'single' | 'dual' | 'staff' (anything else => single).
  *     single: right-hand hilt, 1 blade. dual: extra hilt+blade in the LEFT hand
- *     (left arm holds a raised guard while sabers are on). staff: long (0.5 m)
- *     hilt in the right hand, blades BOTH ways (+Y / -Y of the hand frame),
- *     held angled across the body at idle.
+ *     (left arm mirrors the arc, phase-offset 0.12, for a flurry). staff: long
+ *     (0.5 m) hilt in the right hand, blades BOTH ways (+Y / -Y of the hand).
  *   rig.setSaber(rgb, on) — blade color (applies to ALL blades) / ignite state.
  *   rig.blades — array of {base:Float32Array(3), tip:Float32Array(3)} in WORLD
  *     space, refreshed every draw. 1 entry single; 2 dual (right, left);
  *     2 staff (up-blade, down-blade). Entry objects + arrays are preallocated
  *     and identity-stable (safe to cache); only the array LENGTH changes with
  *     setType (blades[0] is always the same entry).
- *   rig.basePos / rig.tipPos — aliases of blades[0].base / blades[0].tip
- *     (same Float32Array identities forever).
- *   rig.playSwing(def) -> bool — keyframed swing per the ITERATION 2 contract:
- *     { dur seconds, keys:[{t 0..1, sp,sy,sr shoulder pitch/yaw/roll, el elbow,
- *       wr wrist, ty,tp torso yaw/pitch (rad), lunge m forward}...],
- *       mirror bool (also drive the LEFT arm mirrored — dual flurries) }
- *     Missing fields in a key inherit the previous key (key 0 inherits the pose
- *     at accept time). Smoothstep between adjacent keys; before keys[0].t blends
- *     from the current pose, after the last key blends back to procedural.
- *     lunge shifts the DRAWN body forward along facing (visual only — physics
- *     stays in Player). Accepted when no swing is active or the current one is
- *     >= 60% done (combo chaining); returns true if accepted.
+ *   rig.basePos / rig.tipPos — aliases of blades[0].base / blades[0].tip.
+ *   rig.playArc(def) -> bool   — see above. THE way to author a swing.
+ *   rig.playSwing(def) -> bool — ITERATION-2 keyframe defs, kept working as a
+ *     compatibility shim (JK.Bots): the def's cocked key + follow-through key are
+ *     read as blade directions and converted into an arc. Never throws.
  *   rig.swingPhase() -> 0..1 while a swing is active, else -1.
- *   rig.startSwing()  — plays a default slash def (same chaining rules).
- *   rig.swingT (-1 idle, else seconds), rig.pose (eased joint angles),
- *   rig.type ('single'|'dual'|'staff'), rig.lunge (current visual offset, m).
+ *   rig.startSwing()  — plays the default diagonal slash arc.
+ *   rig.swingT (-1 idle, else seconds), rig.pose (procedural joint angles),
+ *   rig.type, rig.lunge (current visual forward offset, m), rig.arc (state).
  *
  * JK.Rig itself is the player's bridge: init/update/draw run the player rig off
  * JK.Player state. Module-level mirrors of the player instance:
  *   JK.Rig.player, JK.Rig.blades, JK.Rig.tipPos/basePos (aliases),
- *   JK.Rig.setType / setSaber / playSwing / swingPhase / startSwing.
- * Old auto-consume of JK.Player.attackQueued runs ONLY while !JK.Sabers
- * (Sabers owns attacks in iteration 2).
+ *   JK.Rig.setType / setSaber / playArc / playSwing / swingPhase / startSwing.
+ * Old auto-consume of JK.Player.attackQueued runs ONLY while !JK.Sabers.
  */
 (function(){
 'use strict';
@@ -61,8 +94,27 @@ var ULEG = 0.42, LLEG = 0.38;
 var HILT_TOP = 0.17, BLADE_LEN = 1.25;
 var STAFF_TOP = 0.25;              /* staff hilt is 0.5 m; blades leave both ends */
 var SWING_DUR = 0.38, CHAIN_FRAC = 0.6;
-var MAX_KEYS = 8;
 var TWO_PI = Math.PI * 2;
+
+/* ---------------- arc engine tunables ---------------- */
+var BACK_FRAC   = 0.07;   /* anticipation overshoot past a0 (fraction of the arc) */
+var SETTLE_FRAC = 0.035;   /* follow-through settles back this much of the arc */
+var CEIL_Y      = 2.42;   /* m above the feet the blade tip is pulled under: you
+                             cannot hold a saber overhead at arm's length, the
+                             elbow tucks — and it keeps chops off the "antenna" */
+var COIL_R      = 0.26;   /* radius shrink while coiled (blade pulled in) */
+var OVER_R      = 0.03;   /* slight over-extension at the end of the strike */
+var PULL_R      = 0.10;   /* radius pull-in while recovering to guard */
+var LEAD        = 0.26;   /* blade leads the radial direction, rad (whip feel) */
+var TW_GAIN     = 0.60;   /* chest yaw follow */
+var LN_GAIN     = 0.34;   /* chest pitch follow */
+var LEAN_SIGN   = 1;      /* +lean tips the chest BACK in this rig */
+var BLEND_IN    = 0.045;  /* s, MINIMUM ease out of the pose we came from. The
+                             anticipation absorbs it: the blend runs over the
+                             wind-up, so guard -> coil is ONE continuous move
+                             instead of a snap plus a slow cock-back. */
+var BLEND_OUT   = 0.14;   /* s, ease back to procedural AFTER dur (phase already -1) */
+var DUAL_PHASE  = 0.12;   /* left blade trails the right by this fraction of dur */
 
 var DEF_PAL = {
   skin:  [0.85, 0.64, 0.47],
@@ -98,7 +150,7 @@ function buildMeshes(){
       bakedBox(0.22, 0.26, 0.24, 1,1,1, 0, 0.17, 0.01)])),    /* skull */
     hair: GL.mesh(G.merge([
       bakedBox(0.24, 0.09, 0.26, 1,1,1, 0, 0.315, -0.005),    /* cap */
-      bakedBox(0.24, 0.15, 0.05, 1,1,1, 0, 0.235, -0.145)])), /* back */
+      bakedBox(0.24, 0.15, 0.05, 1,1,1, 0, 0.235, 0.145)])),  /* back of head (+Z) */
     torso: GL.mesh(bakedBox(0.40, 0.50, 0.24, 1,1,1, 0, 0.28, 0)),
     hips:  GL.mesh(bakedBox(0.32, 0.18, 0.21, 1,1,1, 0, -0.035, 0)),
     belt:  GL.mesh(bakedBox(0.36, 0.09, 0.25, 1,1,1, 0, 0.075, 0)),
@@ -131,99 +183,377 @@ function buildMeshes(){
 var CORE_OPTS = { emissive: 1, nofog: true };
 var SHADOW_OPTS = { emissive: 1 };
 
-/* ---------------- def-swing machinery ----------------
- * Keys normalized at accept into preallocated Float32Array(9) records:
- *   [0]=t, [1]=sp, [2]=sy, [3]=sr, [4]=el, [5]=wr, [6]=ty, [7]=tp, [8]=lunge
- * Snapshots / procedural refs are Float32Array(8) in the same field order
- * (minus t). Left-arm records live in "authored" space: applied syL = -rec[1]
- * so one evaluator serves both sides. Zero alloc after create().            */
-var SWR = new Float32Array(8), SWL = new Float32Array(8);
-var PROCR = new Float32Array(8), PROCL = new Float32Array(8);
-var EMPTY_KEY = {};
-
-/* default slash (the classic iteration-1 swing, authored as a def) */
-var DEFAULT_DEF = { dur: SWING_DUR, keys: [
-  { t: 0.30, sp: 2.25, sy: 0.0, sr: -0.55, el: 1.00, wr: -0.35, ty: -0.45, tp: 0.08, lunge: 0.00 },
-  { t: 0.62, sp: -0.55, sr: 0.95, el: 0.15, wr: 0.55, ty: 0.45, lunge: 0.20 },
-  { t: 0.88, sp: 0.45, sr: 0.15, el: 0.60, wr: -0.60, ty: 0.00, tp: 0.04, lunge: 0.00 }
-]};
-
+/* ---------------- small helpers ---------------- */
 function num(v, d){ return (typeof v === 'number' && v === v) ? v : d; }
+function clamp(v, lo, hi){ return v < lo ? lo : (v > hi ? hi : v); }
 function smooth(s){
   if (s < 0) s = 0; else if (s > 1) s = 1;
   return s * s * (3 - 2 * s);
 }
+function copy3(o, a){ o[0] = a[0]; o[1] = a[1]; o[2] = a[2]; return o; }
+function lerp3(o, a, b, t){
+  o[0] = a[0] + (b[0] - a[0]) * t;
+  o[1] = a[1] + (b[1] - a[1]) * t;
+  o[2] = a[2] + (b[2] - a[2]) * t;
+  return o;
+}
+function norm3(o){
+  var l = Math.sqrt(o[0]*o[0] + o[1]*o[1] + o[2]*o[2]);
+  if (l < 1e-6){ o[0] = 0; o[1] = 1; o[2] = 0; return o; }
+  o[0] /= l; o[1] /= l; o[2] /= l; return o;
+}
+function max0(x){ return x > 0 ? x : 0; }
+function ez(c, t, k){ return c + (t - c) * k; }
 
-/* sample the active swing for one side into out[8].
- * snap = pose at accept, proc = this frame's procedural targets. */
-function swingSample(out, sw, snap, proc){
-  var u = sw.t / sw.dur, keys = sw.keys, n = sw.n;
-  var t0 = keys[0][0], tl = keys[n - 1][0];
-  var a, b, ao, bo, s, j;
-  if (u <= t0){                       /* blend in from the captured pose */
-    a = snap; ao = 0; b = keys[0]; bo = 1;
-    s = t0 > 1e-5 ? u / t0 : 1;
-  } else if (u >= tl){                /* blend back out to procedural */
-    a = keys[n - 1]; ao = 1; b = proc; bo = 0;
-    s = (1 - tl) > 1e-5 ? (u - tl) / (1 - tl) : 1;
-  } else {                            /* between two keys */
-    var i = 0;
-    while (i < n - 2 && u > keys[i + 1][0]) i++;
-    a = keys[i]; ao = 1; b = keys[i + 1]; bo = 1;
-    var span = b[0] - a[0];
-    s = span > 1e-6 ? (u - a[0]) / span : 1;
+/* ======================= ARC ENGINE ========================================
+ * An arc is a rotation of the blade about `pivot` in the plane whose normal is
+ * `axis` (all body-local). The plane's basis (u,v) is derived from the axis so
+ * arcDefs stay readable: u (angle 0) points UP, or FORWARD when the axis is
+ * vertical; v = axis X u, so positive angles follow the right-hand rule.
+ * Zero allocation after create(): every intermediate lives in a module scratch.
+ * ========================================================================== */
+var AV = new Float32Array(3);      /* scratch: radial (pivot->blade middle) dir */
+var A2 = new Float32Array(2);      /* scratch: [a0, a1] out of dirsToArc        */
+
+function setBasis(a, x, y, z){
+  var l = Math.sqrt(x * x + y * y + z * z);
+  if (!(l > 1e-6)){ x = -1; y = 0; z = 0; l = 1; }   /* default: sagittal chop */
+  x /= l; y /= l; z /= l;
+  a.n[0] = x; a.n[1] = y; a.n[2] = z;
+  var ux, uy, uz;
+  if (y < 0.965 && y > -0.965){       /* angle 0 = UP, projected into the plane */
+    ux = -x * y; uy = 1 - y * y; uz = -z * y;
+  } else {                            /* vertical axis: angle 0 = FORWARD (-Z) */
+    ux = x * z; uy = y * z; uz = z * z - 1;
   }
-  s = smooth(s);
-  for (j = 0; j < 8; j++) out[j] = a[ao + j] + (b[bo + j] - a[ao + j]) * s;
-  return out;
+  l = Math.sqrt(ux * ux + uy * uy + uz * uz) || 1;
+  ux /= l; uy /= l; uz /= l;
+  a.u[0] = ux; a.u[1] = uy; a.u[2] = uz;
+  a.v[0] = y * uz - z * uy;           /* v = axis X u */
+  a.v[1] = z * ux - x * uz;
+  a.v[2] = x * uy - y * ux;
 }
 
-function playSwing(def){
-  var sw = this.swing, p = this.pose;
-  if (sw.active && sw.t < sw.dur * CHAIN_FRAC) return false;   /* not chainable yet */
-  if (!def || !def.keys || !def.keys.length) def = DEFAULT_DEF; /* defensive */
-
-  /* snapshot current pose (authored space; left sy sign-flipped) */
-  var sR = sw.snapR, sL = sw.snapL;
-  sR[0] = p.aSwR; sR[1] = p.syR;  sR[2] = p.sprR; sR[3] = p.elbR;
-  sR[4] = p.wrist; sR[5] = p.twist; sR[6] = p.lean; sR[7] = this.lunge;
-  sL[0] = p.aSwL; sL[1] = -p.syL; sL[2] = p.sprL; sL[3] = p.elbL;
-  sL[4] = p.wrL;  sL[5] = p.twist; sL[6] = p.lean; sL[7] = this.lunge;
-
-  /* normalize keys into the preallocated records (missing fields inherit) */
-  var n = def.keys.length; if (n > MAX_KEYS) n = MAX_KEYS;
-  var prevT = 0;
-  for (var i = 0; i < n; i++){
-    var src = def.keys[i] || EMPTY_KEY;
-    var k = sw.keys[i], pk = i > 0 ? sw.keys[i - 1] : null;
-    var kt = num(src.t, i > 0 ? prevT + 0.15 : 0.25);
-    if (kt > 1) kt = 1;
-    if (i > 0 && kt <= prevT) kt = prevT + 1e-3;   /* keep strictly increasing */
-    k[0] = kt; prevT = kt;
-    k[1] = num(src.sp,    pk ? pk[1] : sR[0]);
-    k[2] = num(src.sy,    pk ? pk[2] : sR[1]);
-    k[3] = num(src.sr,    pk ? pk[3] : sR[2]);
-    k[4] = num(src.el,    pk ? pk[4] : sR[3]);
-    k[5] = num(src.wr,    pk ? pk[5] : sR[4]);
-    k[6] = num(src.ty,    pk ? pk[6] : sR[5]);
-    k[7] = num(src.tp,    pk ? pk[7] : sR[6]);
-    k[8] = num(src.lunge, pk ? pk[8] : sR[7]);
+/* Build a plane + [a0,a1] (into A2) that sweeps direction s -> direction e.
+ * Used by the playSwing shim and the default slash. */
+function dirsToArc(a, sx, sy, sz, ex, ey, ez){
+  var l = Math.sqrt(sx*sx + sy*sy + sz*sz) || 1; sx /= l; sy /= l; sz /= l;
+  l = Math.sqrt(ex*ex + ey*ey + ez*ez) || 1; ex /= l; ey /= l; ez /= l;
+  var cx = sy*ez - sz*ey, cy = sz*ex - sx*ez, cz = sx*ey - sy*ex;
+  var cl = Math.sqrt(cx*cx + cy*cy + cz*cz);
+  var dp = sx*ex + sy*ey + sz*ez, ang;
+  if (cl < 1e-3){                     /* parallel: swing in the plane s x up */
+    cx = -sz; cy = 0; cz = sx;
+    if (cx*cx + cz*cz < 1e-4){ cx = 1; cy = 0; cz = 0; }
+    ang = 1.3;
+  } else {
+    ang = Math.atan2(cl, dp);
   }
-  sw.n = n;
-  sw.dur = num(def.dur, SWING_DUR); if (sw.dur < 0.05) sw.dur = 0.05;
-  sw.mirror = !!def.mirror;
-  sw.t = 0; sw.active = true;
+  setBasis(a, cx, cy, cz);
+  A2[0] = Math.atan2(sx*a.v[0] + sy*a.v[1] + sz*a.v[2],
+                     sx*a.u[0] + sy*a.u[1] + sz*a.u[2]);
+  A2[1] = A2[0] + ang;
+  return A2;
+}
+
+/* the classic default slash: high outside right -> low across to the left */
+var DEFAULT_ARC = {
+  dur: 0.40, pivot: new Float32Array([0.06, 1.34, -0.04]), radius: 1.02,
+  axis: new Float32Array(3), a0: 0, a1: 1.6, tilt: 0,
+  windup: 0.28, recover: 0.26, lunge: 0.16, name: 'SLASH'
+};
+(function(){
+  var tmp = { n: DEFAULT_ARC.axis, u: new Float32Array(3), v: new Float32Array(3) };
+  dirsToArc(tmp, 0.52, 0.60, -0.60, -0.60, -0.34, -0.72);
+  DEFAULT_ARC.a0 = A2[0]; DEFAULT_ARC.a1 = A2[1];
+})();
+
+/* Sample the arc at phase p (0..1) for one side, all in body-local space.
+ *   om <- blade MIDDLE (what the IK blends through), od <- blade direction,
+ *   oh <- the hand that puts the blade there, AV <- radial dir (torso follow).
+ *   sgn -1 mirrors everything across the body's YZ plane (dual off hand). */
+function arcSample(a, p, oh, od, om, type, sgn){
+  var d = a.a1 - a.a0, wu = a.windup, rc = a.recover;
+  var back = a.a0 - BACK_FRAC * d;
+  var ang, rs, s;
+  if (p < wu){                                     /* anticipation: coil back */
+    s = smooth(p / wu);
+    ang = a.a0 + (back - a.a0) * s;
+    rs = 1 - COIL_R * (0.55 + 0.45 * s);   /* already coiled at p=0: the blade
+                                              takes the SHORT way into the cock */
+  } else if (p < 1 - rc){                          /* strike: snap, then decel */
+    var span = 1 - rc - wu;
+    s = span > 1e-4 ? (p - wu) / span : 1;
+    if (s > 1) s = 1;
+    /* strike curve: 3/4 of a "snap" (angular speed peaks a third of the way in,
+     * then decelerates) + 1/4 smoothstep so the follow-through is not all dead
+     * time. Both terms start and end at zero speed, so no jerk at either edge. */
+    var e = 0.75 * (s * s * (6 - 8 * s + 3 * s * s)) + 0.25 * (s * s * (3 - 2 * s));
+    ang = back + (a.a1 - back) * e;
+    var x = s * 1.8; if (x > 1) x = 1;
+    rs = (1 - COIL_R) + (COIL_R + OVER_R) * smooth(x);   /* arm extends */
+  } else {                                         /* follow-through -> guard */
+    s = smooth(rc > 1e-4 ? (p - (1 - rc)) / rc : 1);
+    ang = a.a1 - SETTLE_FRAC * d * s;
+    rs = (1 + OVER_R) - PULL_R * s;
+  }
+  var bang = ang + (d >= 0 ? LEAD : -LEAD);        /* blade leads the sweep */
+  var c = Math.cos(ang), si = Math.sin(ang);
+  AV[0] = a.u[0]*c + a.v[0]*si;
+  AV[1] = a.u[1]*c + a.v[1]*si;
+  AV[2] = a.u[2]*c + a.v[2]*si;
+  c = Math.cos(bang); si = Math.sin(bang);
+  od[0] = a.u[0]*c + a.v[0]*si;
+  od[1] = a.u[1]*c + a.v[1]*si;
+  od[2] = a.u[2]*c + a.v[2]*si;
+  var r = a.radius * rs;
+  if (AV[1] > 0.04){          /* elbow tucks as the blade goes overhead */
+    var cap = (CEIL_Y - a.pivot[1] - od[1] * BLADE_LEN * 0.5) / AV[1];
+    if (cap < 0.30) cap = 0.30;
+    var k = 0.35, h = 0.5 + 0.5 * (cap - r) / k;
+    if (h < 0) h = 0; else if (h > 1) h = 1;
+    r = cap + (r - cap) * h - k * h * (1 - h);      /* smooth min(r, cap) */
+  }
+  /* the off hand never holds a staff, so only the right side uses STAFF_TOP */
+  var ho = (sgn > 0 && type === 'staff' ? STAFF_TOP : HILT_TOP) + BLADE_LEN * 0.5;
+  om[0] = a.pivot[0] + AV[0]*r;
+  om[1] = a.pivot[1] + AV[1]*r;
+  om[2] = a.pivot[2] + AV[2]*r;
+  oh[0] = om[0] - od[0]*ho;
+  oh[1] = om[1] - od[1]*ho;
+  oh[2] = om[2] - od[2]*ho;
+  if (sgn < 0){
+    oh[0] = -oh[0]; od[0] = -od[0]; om[0] = -om[0]; AV[0] = -AV[0];
+  }
+}
+
+/* advance the arc clock and refresh this frame's targets */
+function arcUpdate(r, dt){
+  var a = r.arc;
+  a.t += dt;
+  if (a.active && a.t >= a.dur) a.active = false;
+  if (a.t >= a.dur + BLEND_OUT){
+    a.live = false; a.wIn = 0; a.wOut = 0; a.lungeCur = 0;
+    return;
+  }
+  var p = a.t / a.dur; if (p > 1) p = 1; else if (p < 0) p = 0;
+  a.wIn = smooth(a.t / a.blendIn);
+  a.wOut = a.t <= a.dur ? 1 : smooth(1 - (a.t - a.dur) / BLEND_OUT);
+
+  arcSample(a, p, a.hR, a.dR, a.mR, r.type, 1);
+  a.twist = TW_GAIN * -AV[0];                 /* chest rotates into the swing */
+  a.lean  = LN_GAIN * LEAN_SIGN * AV[1];      /* overheads arch, then hunch */
+  if (a.mirror){
+    var pl = (a.t - DUAL_PHASE * a.dur) / a.dur;
+    if (pl < 0) pl = 0; else if (pl > 1) pl = 1;
+    arcSample(a, pl, a.hL, a.dL, a.mL, r.type, -1);
+  }
+
+  var lp = 0;                                  /* lunge pushes during the strike */
+  if (p > a.windup){
+    var sp = 1 - a.recover - a.windup; if (sp < 1e-3) sp = 1e-3;
+    var s = (p - a.windup) / sp; if (s > 1) s = 1;
+    lp = smooth(s * 2 > 1 ? 1 : s * 2);
+    if (p > 1 - a.recover)
+      lp *= 1 - 0.7 * smooth((p - (1 - a.recover)) / (a.recover || 1e-3));
+  }
+  a.lungeCur = a.lungeAmt * lp * a.wOut;
+}
+
+/* Body-local blade middle + direction of the PROCEDURAL arm pose. Used only when
+ * a new arc starts and the rig has not been drawn recently (off-screen bots), so
+ * the blend still has a real pose to come out of instead of popping. */
+var mLocA = M.make();
+function fkLocal(r, side, outM, outD){
+  var p = r.pose;
+  M.ident(mLocA);
+  M.tr(mLocA, 0, HIP_Y + p.bob + PELV2TORSO, 0);
+  M.ry(mLocA, p.twist); M.rx(mLocA, p.lean);
+  M.tr(mLocA, side * SH_X, SH_Y, 0);
+  if (side > 0){ M.rz(mLocA, p.sprR); M.ry(mLocA, p.syR); M.rx(mLocA, p.aSwR); }
+  else { M.rz(mLocA, -p.sprL); M.ry(mLocA, p.syL); M.rx(mLocA, p.aSwL); }
+  M.tr(mLocA, 0, -UARM, 0); M.rx(mLocA, side > 0 ? p.elbR : p.elbL);
+  M.tr(mLocA, 0, -LARM, 0); M.rx(mLocA, side > 0 ? p.wrist : p.wrL);
+  if (side > 0) M.rz(mLocA, p.wrr);
+  var ho = (r.type === 'staff' ? STAFF_TOP : HILT_TOP) + BLADE_LEN * 0.5;
+  outD[0] = mLocA[4]; outD[1] = mLocA[5]; outD[2] = mLocA[6];
+  outM[0] = mLocA[12] + outD[0] * ho;
+  outM[1] = mLocA[13] + outD[1] * ho;
+  outM[2] = mLocA[14] + outD[2] * ho;
+}
+
+function playArc(def){
+  var a = this.arc;
+  if (a.active && a.t < a.dur * CHAIN_FRAC) return false;   /* not chainable yet */
+  if (!def) def = DEFAULT_ARC;
+  var pv = def.pivot, ax = def.axis;
+  a.pivot[0] = pv ? num(pv[0],  0.06) :  0.06;
+  a.pivot[1] = pv ? num(pv[1],  1.34) :  1.34;
+  a.pivot[2] = pv ? num(pv[2], -0.04) : -0.04;
+  a.radius = clamp(num(def.radius, 1.02), 0.45, 1.70);
+  setBasis(a, ax ? num(ax[0], -1) : -1, ax ? num(ax[1], 0) : 0, ax ? num(ax[2], 0) : 0);
+  a.a0 = num(def.a0, -0.9);
+  a.a1 = num(def.a1, 1.9);
+  var d = a.a1 - a.a0;                          /* keep the sweep sane */
+  if (d > 3.4) a.a1 = a.a0 + 3.4;
+  else if (d < -3.4) a.a1 = a.a0 - 3.4;
+  else if (d < 0.3 && d > -0.3) a.a1 = a.a0 + (d < 0 ? -0.3 : 0.3);
+  a.tilt = num(def.tilt, 0);
+  var wu = clamp(num(def.windup, 0.28), 0.05, 0.50);
+  var rc = clamp(num(def.recover, 0.24), 0.02, 0.45);
+  if (wu + rc > 0.82){ var k = 0.82 / (wu + rc); wu *= k; rc *= k; }
+  a.windup = wu; a.recover = rc;
+  a.lungeAmt = clamp(num(def.lunge, 0), -0.4, 1.2);
+  a.dur = clamp(num(def.dur, SWING_DUR), 0.10, 3);
+  /* the anticipation IS the blend out of the previous pose */
+  a.blendIn = Math.max(BLEND_IN, wu * a.dur * 0.9);
+  a.mirror = (this.type === 'dual') || !!def.mirror;
+  a.name = def.name || '';
+  a.t = 0; a.active = true; a.live = true;
+  a.wIn = 0; a.wOut = 1; a.lungeCur = 0;
+  /* Blend FROM whatever the blade is doing right now (idle guard, or the middle
+     of the previous arc when chaining) so nothing ever teleports. The live pose
+     is only known after a draw, so ignore it if this rig has been advanced
+     without being rendered (off-screen bots) — a stale pose would pop. */
+  if (a.hasCur && a.snapAge <= 2){
+    copy3(a.snapM, a.curM); copy3(a.snapD, a.curD);
+    copy3(a.snapML, a.curML); copy3(a.snapDL, a.curDL);
+  } else {
+    fkLocal(this,  1, a.snapM,  a.snapD);
+    fkLocal(this, -1, a.snapML, a.snapDL);
+  }
+  arcUpdate(this, 0);
   this.swingT = 0;
   return true;
 }
 
-function swingPhase(){
-  var sw = this.swing;
-  return sw.active ? sw.t / sw.dur : -1;
+/* ---- compatibility shim: iteration-2 keyframe defs -> an arc -------------- */
+var SHIM_AXIS = new Float32Array(3);
+var SHIM = { dur: 0.4, pivot: new Float32Array([0.06, 1.34, -0.04]), radius: 1.02,
+  axis: SHIM_AXIS, a0: 0, a1: 1.6, tilt: 0, windup: 0.28, recover: 0.24,
+  lunge: 0, name: '', mirror: false };
+var SHIM_BASIS = { n: SHIM_AXIS, u: new Float32Array(3), v: new Float32Array(3) };
+var SD0 = new Float32Array(3), SD1 = new Float32Array(3);
+
+/* Where the idle guard points the blade (body-local, unit): up-forward ~38 deg.
+ * The tip has to travel from here into the arc's cocked pose, so an a0 far from
+ * this costs real path — see the AUTHORING NOTE in the header. */
+var GUARD_DIR = new Float32Array([-0.09, 0.62, -0.78]);
+
+/* pull d toward the guard until it is at most `lim` radians away (shim only:
+ * playArc always honours the author's a0 exactly) */
+function limitFromGuard(d, lim){
+  var c = d[0]*GUARD_DIR[0] + d[1]*GUARD_DIR[1] + d[2]*GUARD_DIR[2];
+  if (c > 1) c = 1; else if (c < -1) c = -1;
+  var ang = Math.acos(c);
+  if (ang <= lim || ang < 1e-4) return;
+  var t = 1 - lim / ang;
+  d[0] += (GUARD_DIR[0] - d[0]) * t;
+  d[1] += (GUARD_DIR[1] - d[1]) * t;
+  d[2] += (GUARD_DIR[2] - d[2]) * t;
+  norm3(d);
 }
 
-function startSwing(){ return this.playSwing(DEFAULT_DEF); }
+/* a key's (shoulder pitch, shoulder yaw) read as a blade direction from the chest */
+function keyDir(o, sp, sy){
+  var el = clamp(sp * 0.62 - 0.32, -1.15, 1.30);   /* elevation */
+  var az = clamp(sy * 1.15, -1.45, 1.45);          /* azimuth, + = left */
+  var ce = Math.cos(el);
+  o[0] = -ce * Math.sin(az);
+  o[1] = Math.sin(el);
+  o[2] = -ce * Math.cos(az);
+}
 
+function playSwing(def){
+  if (!def || !def.keys || !def.keys.length) return this.playArc(DEFAULT_ARC);
+  var keys = def.keys, n = keys.length, i, k, t;
+  var kS = null, tS = 0, best = -1, kE = null, tE = -1, lg = 0;
+  for (i = 0; i < n; i++){
+    k = keys[i]; if (!k) continue;
+    t = num(k.t, n > 1 ? i / (n - 1) : 0.5);
+    if (t <= 0.40){                       /* the cocked / wind-up key */
+      var m = Math.abs(num(k.sy, 0)) + Math.abs(num(k.sp, 0.5) - 0.5) * 0.55;
+      if (m > best){ best = m; kS = k; tS = t; }
+    }
+    if (t <= 0.86 && t > tE){ tE = t; kE = k; }   /* the follow-through key */
+    var lu = Math.abs(num(k.lunge, 0)); if (lu > lg) lg = lu;
+  }
+  if (!kS){ kS = keys[0]; tS = num(kS.t, 0); }
+  if (!kE || kE === kS){ kE = keys[n - 1]; tE = num(kE.t, 1); }
+  keyDir(SD0, num(kS.sp, 0.5), num(kS.sy, 0));
+  keyDir(SD1, num(kE.sp, 0.5), num(kE.sy, 0));
+  limitFromGuard(SD0, 0.95);       /* keep the cock-back reachable from guard */
+  dirsToArc(SHIM_BASIS, SD0[0], SD0[1], SD0[2], SD1[0], SD1[1], SD1[2]);
+  SHIM.a0 = A2[0];
+  SHIM.a1 = A2[0] + clamp(A2[1] - A2[0], 1.40, 2.00);   /* readable sweep */
+  SHIM.dur = num(def.dur, SWING_DUR);
+  SHIM.windup = clamp(tS + 0.08, 0.14, 0.42);
+  SHIM.recover = clamp(1 - tE - 0.04, 0.10, 0.38);
+  SHIM.lunge = lg;
+  SHIM.mirror = !!def.mirror;
+  SHIM.name = def.name || '';
+  return this.playArc(SHIM);
+}
+
+function swingPhase(){
+  var a = this.arc;
+  return a.active ? a.t / a.dur : -1;
+}
+function startSwing(){ return this.playArc(DEFAULT_ARC); }
+
+/* ======================= TWO-BONE IK ======================================= */
+var ikE = new Float32Array(3);   /* elbow */
+var ikH = new Float32Array(3);   /* reached (clamped) hand position */
+var ikN = new Float32Array(3);   /* bend-plane normal */
+
+/* Solve upper/lower so the hand lands on T (clamped into reach). `pole` is a
+ * unit-ish direction the elbow is pushed toward — stable = no inside-out snap. */
+function solveIK(S, T, upper, lower, pole){
+  var dx = T[0] - S[0], dy = T[1] - S[1], dz = T[2] - S[2];
+  var L = Math.sqrt(dx*dx + dy*dy + dz*dz);
+  if (L < 1e-4){                       /* target AT the shoulder: aim down-pole */
+    dx = pole[0]; dy = pole[1]; dz = pole[2];
+    L = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    if (L < 1e-4){ dx = 0; dy = -1; dz = 0; L = 1; }
+  }
+  var nx = dx / L, ny = dy / L, nz = dz / L;
+  var maxL = (upper + lower) * 0.995;
+  var minL = Math.abs(upper - lower) + 0.06;
+  if (L > maxL) L = maxL; else if (L < minL) L = minL;
+  ikH[0] = S[0] + nx * L; ikH[1] = S[1] + ny * L; ikH[2] = S[2] + nz * L;
+  /* in-plane component of the pole */
+  var d = pole[0]*nx + pole[1]*ny + pole[2]*nz;
+  var qx = pole[0] - nx*d, qy = pole[1] - ny*d, qz = pole[2] - nz*d;
+  var ql = Math.sqrt(qx*qx + qy*qy + qz*qz);
+  if (ql < 1e-3){                      /* pole parallel to the reach: any perp */
+    qx = -nz; qy = 0; qz = nx;
+    ql = Math.sqrt(qx*qx + qz*qz);
+    if (ql < 1e-3){ qx = 1; qy = 0; qz = 0; ql = 1; }
+  }
+  qx /= ql; qy /= ql; qz /= ql;
+  var ca = (L*L + upper*upper - lower*lower) / (2 * L * upper);
+  if (ca > 1) ca = 1; else if (ca < -1) ca = -1;
+  var sa = Math.sqrt(1 - ca*ca);
+  ikE[0] = S[0] + upper * (ca*nx + sa*qx);
+  ikE[1] = S[1] + upper * (ca*ny + sa*qy);
+  ikE[2] = S[2] + upper * (ca*nz + sa*qz);
+  ikN[0] = ny*qz - nz*qy;              /* unit: n and q are orthonormal */
+  ikN[1] = nz*qx - nx*qz;
+  ikN[2] = nx*qy - ny*qx;
+}
+
+/* m <- orthonormal frame at o with the given X and Y axes (Z = X x Y) */
+function setFrame(m, ox, oy, oz, xx, xy, xz, yx, yy, yz){
+  m[0] = xx; m[1] = xy; m[2] = xz; m[3] = 0;
+  m[4] = yx; m[5] = yy; m[6] = yz; m[7] = 0;
+  m[8]  = xy*yz - xz*yy;
+  m[9]  = xz*yx - xx*yz;
+  m[10] = xx*yy - xy*yx;
+  m[11] = 0;
+  m[12] = ox; m[13] = oy; m[14] = oz; m[15] = 1;
+}
+
+/* ---------------- instance setters ---------------- */
 function setType(type){
   if (type !== 'dual' && type !== 'staff') type = 'single';
   if (type === this.type) return;
@@ -238,12 +568,9 @@ function setSaber(rgb, on){
   if (on !== undefined) this.saberOn = !!on;
 }
 
-function max0(x){ return x > 0 ? x : 0; }
-function ez(c, t, k){ return c + (t - c) * k; }
-
 /* ---------------- per-instance animation step ---------------- */
 function advance(dt, t, anim, speed){
-  var p = this.pose;
+  var p = this.pose, a = this.arc;
   var sp = speed || 0;
 
   var stride = 2.2 + sp * 0.16;
@@ -254,7 +581,7 @@ function advance(dt, t, anim, speed){
 
   var lSwL, lSwR, kneeL, kneeR, aSwL, aSwR, sprL, sprR, elbL, elbR, wrist;
   var lean, twist, bob, head;
-  var syR = 0, syL = 0, wrL = 0, wrr = 0;      /* new joints default neutral */
+  var syR = 0, syL = 0, wrL = 0, wrr = 0;
 
   if (anim === 'run' || anim === 'sprint'){
     var fast = anim === 'sprint';
@@ -265,11 +592,11 @@ function advance(dt, t, anim, speed){
     kneeL = -(0.22 + kAmp * max0(Math.cos(ph + 0.5)));
     kneeR = -(0.22 + kAmp * max0(-Math.cos(ph + 0.5)));
     aSwL = 0.06 - (fast ? 0.85 : 0.55) * s1;  /* counter-swing */
-    aSwR = 0.35 + (fast ? 0.50 : 0.30) * s1;  /* saber arm swings less */
+    aSwR = 0.42 + (fast ? 0.40 : 0.26) * s1;  /* saber arm carries a guard */
     sprL = 0.14; sprR = 0.16;
-    elbL = 0.60; elbR = 0.55;
-    wrist = -0.55;
-    lean = fast ? 0.26 : 0.14;                /* ~15 / ~8 deg forward */
+    elbL = 0.60; elbR = 0.70;
+    wrist = -2.02;                            /* blade angled up and FORWARD */
+    lean = fast ? 0.26 : 0.14;
     bob = (fast ? 0.045 : 0.030) * (0.5 - 0.5 * Math.cos(2 * ph));
     twist = (fast ? 0.12 : 0.08) * s1;
     head = -lean * 0.6;
@@ -289,13 +616,13 @@ function advance(dt, t, anim, speed){
     elbL = 0.35; elbR = 0.40;
     wrist = -0.50;
     lean = 0.07; bob = 0; twist = 0; head = 0.18;
-  } else {                                    /* idle: breathe, saber relaxed */
+  } else {                                    /* idle: breathe, saber on guard */
     lSwL = 0.05; lSwR = -0.05;
     kneeL = -0.09; kneeR = -0.09;
-    aSwL = 0.10; aSwR = 0.38;
+    aSwL = 0.10; aSwR = 0.30;
     sprL = 0.10; sprR = 0.14;
-    elbL = 0.28; elbR = 0.55;
-    wrist = -0.60 + 0.05 * Math.sin(t * 1.1);
+    elbL = 0.28; elbR = 0.45;
+    wrist = -1.65 + 0.05 * Math.sin(t * 1.1); /* hilt at the hip, blade up-forward */
     lean = 0.04; twist = 0;
     bob = 0.013 * Math.sin(t * 1.7);
     head = 0.03 * Math.sin(t * 0.7);
@@ -303,69 +630,61 @@ function advance(dt, t, anim, speed){
 
   /* ---- saber-type grip overrides (procedural layer) ---- */
   if (this.type === 'dual' && this.saberOn){
-    /* left hand carries a live blade: raised guard, no floppy counter-swing */
+    /* Left hand carries a live blade: it mirrors the saber guard (blade up and
+       FORWARD, no floppy counter-swing) so a mirrored arc does not have to whip
+       the left blade across the body just to get started. */
     if (anim === 'run' || anim === 'sprint'){
-      aSwL = 0.30 - 0.22 * Math.sin(ph);
-      sprL = 0.30; elbL = 0.85; syL = 0.12; wrL = -0.50;
+      aSwL = 0.42 - 0.26 * Math.sin(ph);
+      sprL = 0.16; elbL = 0.70; syL = -0.10; wrL = -2.02;
     } else if (anim === 'idle'){
-      aSwL = 0.42; sprL = 0.32; elbL = 0.88; syL = 0.15;
-      wrL = -0.55 + 0.05 * Math.sin(t * 1.3);
+      aSwL = 0.30; sprL = 0.14; elbL = 0.45; syL = -0.12;
+      wrL = -1.65 + 0.05 * Math.sin(t * 1.3);
     }
   } else if (this.type === 'staff'){
-    if (anim === 'idle'){                     /* Maul special: angled across body */
-      aSwR = 0.80; syR = 0.45; sprR = 0.02; elbR = 0.70;
-      wrist = -0.85; wrr = 0.85;
-      twist += 0.12;
+    /* Maul carry: angled across the body, but kept near the saber guard so a
+       swing does not have to whip 2.9 m of blade across the screen to start. */
+    if (anim === 'idle'){
+      aSwR = 0.40; syR = 0.30; sprR = 0.06; elbR = 0.50;
+      wrist = -1.35; wrr = 0.45;
+      twist += 0.10;
       aSwL = 0.28; sprL = 0.24; elbL = 0.55;  /* off hand up and ready */
     } else if (anim === 'run' || anim === 'sprint'){
-      aSwR = 0.30 + 0.18 * Math.sin(ph);      /* calm carry, blade tilted */
-      sprR = 0.10; elbR = 0.60; wrist = -0.70; wrr = 0.45;
+      aSwR = 0.36 + 0.18 * Math.sin(ph);      /* calm carry, blade tilted */
+      sprR = 0.10; elbR = 0.55; wrist = -1.40; wrr = 0.30;
     }
   }
 
-  /* ---- def-swing lifecycle ---- */
-  var sw = this.swing;
-  if (sw.active){
-    sw.t += dt;
-    if (sw.t >= sw.dur) sw.active = false;
-  }
-  if (sw.active){
-    wrr = 0;                                  /* both hands square on the hilt */
-    if (!sw.mirror && !(this.type === 'dual' && this.saberOn))
-      sprL += 0.25;                           /* off arm counterbalances */
+  /* ---- arc lifecycle ---- */
+  a.snapAge++;
+  if (a.live) arcUpdate(this, dt);
+  var w = a.live ? a.wIn * a.wOut : 0;
+  if (a.live){
+    twist = twist * (1 - w) + a.twist * w;    /* torso follows the arc */
+    lean  = lean  * (1 - w) + a.lean  * w;
+    if (!a.mirror){                           /* off arm counterbalances */
+      aSwL += 0.30 * w; sprL += 0.28 * w; syL += 0.22 * w;
+    }
+    wrr = 0;
   }
 
   /* exponential ease toward targets (~0.12 s blend) */
   var kA = 1 - Math.exp(-26 * dt);            /* limbs */
   var kB = 1 - Math.exp(-14 * dt);            /* body mass */
-  var kR = sw.active ? 1 - Math.exp(-45 * dt) : kA;  /* saber arm snaps */
+  var kT = a.live ? 1 - Math.exp(-40 * dt) : kB;   /* torso snaps in a swing */
   p.lSwL = ez(p.lSwL, lSwL, kA);   p.lSwR = ez(p.lSwR, lSwR, kA);
   p.kneeL = ez(p.kneeL, kneeL, kA); p.kneeR = ez(p.kneeR, kneeR, kA);
   p.aSwL = ez(p.aSwL, aSwL, kA);   p.sprL = ez(p.sprL, sprL, kA);
   p.elbL = ez(p.elbL, elbL, kA);   p.syL = ez(p.syL, syL, kA);
   p.wrL = ez(p.wrL, wrL, kA);
-  p.aSwR = ez(p.aSwR, aSwR, kR);   p.sprR = ez(p.sprR, sprR, kR);
-  p.elbR = ez(p.elbR, elbR, kR);   p.wrist = ez(p.wrist, wrist, kR);
-  p.syR = ez(p.syR, syR, kR);      p.wrr = ez(p.wrr, wrr, kR);
-  p.bob = ez(p.bob, bob, kB);      p.lean = ez(p.lean, lean, kB);
-  p.twist = ez(p.twist, twist, kR); p.head = ez(p.head, head, kB);
+  p.aSwR = ez(p.aSwR, aSwR, kA);   p.sprR = ez(p.sprR, sprR, kA);
+  p.elbR = ez(p.elbR, elbR, kA);   p.wrist = ez(p.wrist, wrist, kA);
+  p.syR = ez(p.syR, syR, kA);      p.wrr = ez(p.wrr, wrr, kA);
+  p.bob = ez(p.bob, bob, kB);      p.lean = ez(p.lean, lean, kT);
+  p.twist = ez(p.twist, twist, kT); p.head = ez(p.head, head, kB);
 
-  /* ---- def-swing override: exact keyframed pose beats the eased targets ---- */
-  if (sw.active){
-    PROCR[0] = aSwR; PROCR[1] = syR;  PROCR[2] = sprR; PROCR[3] = elbR;
-    PROCR[4] = wrist; PROCR[5] = twist; PROCR[6] = lean; PROCR[7] = 0;
-    swingSample(SWR, sw, sw.snapR, PROCR);
-    p.aSwR = SWR[0]; p.syR = SWR[1]; p.sprR = SWR[2]; p.elbR = SWR[3];
-    p.wrist = SWR[4]; p.twist = SWR[5]; p.lean = SWR[6];
-    this.lunge = SWR[7];
-    if (sw.mirror){                           /* dual flurry: left arm mirrored */
-      PROCL[0] = aSwL; PROCL[1] = -syL; PROCL[2] = sprL; PROCL[3] = elbL;
-      PROCL[4] = wrL; PROCL[5] = twist; PROCL[6] = lean; PROCL[7] = 0;
-      swingSample(SWL, sw, sw.snapL, PROCL);
-      p.aSwL = SWL[0]; p.syL = -SWL[1]; p.sprL = SWL[2]; p.elbL = SWL[3];
-      p.wrL = SWL[4];
-    }
-    this.swingT = sw.t;
+  if (a.live){
+    this.lunge = a.lungeCur;
+    this.swingT = a.active ? a.t : -1;
   } else {
     this.swingT = -1;
     this.lunge = ez(this.lunge, 0, kB);       /* settle any leftover lunge */
@@ -375,10 +694,66 @@ function advance(dt, t, anim, speed){
 /* ---------------- render (module-scope matrix pool: zero alloc) ------------- */
 var mRoot = M.make(), mPelv = M.make(), mTorso = M.make(), mA = M.make(), mS = M.make();
 var mHR = M.make(), mHL = M.make();           /* hand frames kept for blade pass */
+var mUR = M.make(), mFR = M.make();           /* right upper arm / forearm */
+var mUL = M.make(), mFL = M.make();           /* left  upper arm / forearm */
+/* world-space IK scratch */
+var wS = new Float32Array(3), wT = new Float32Array(3), wB = new Float32Array(3),
+    wP = new Float32Array(3), wX = new Float32Array(3), wY = new Float32Array(3),
+    wR = new Float32Array(3), wQ = new Float32Array(3);
+
+/* forward-kinematic arm chain from the torso frame */
+function fkArm(mU, mF, mH, shx, roll, yaw, pitch, elb, wr, wroll){
+  M.copy(mU, mTorso); M.tr(mU, shx, SH_Y, 0);
+  M.rz(mU, roll); M.ry(mU, yaw); M.rx(mU, pitch);
+  M.copy(mF, mU); M.tr(mF, 0, -UARM, 0); M.rx(mF, elb);
+  M.copy(mH, mF); M.tr(mH, 0, -LARM, 0); M.rx(mH, wr); M.rz(mH, wroll);
+}
+
+/* Re-pose one arm so the hand reaches the arc target, blending out of (wIn) the
+ * pose we came from and back into (wOut) the procedural FK pose in mH. */
+/* Blending happens in BLADE-MIDDLE space, not hand space: a saber cocking back
+ * pivots roughly about the middle of the blade (hilt drops as the tip rises), so
+ * the tip takes the short way round instead of being shoved across the body. */
+function ikArm(mU, mF, mH, shx, mLoc, dLoc, snapM, snapD, tilt, wIn, wOut, side, ref, ho){
+  M.xp(wT, mRoot, mLoc[0], mLoc[1], mLoc[2]);          /* arc blade middle -> world */
+  M.xd(wB, mRoot, dLoc[0], dLoc[1], dLoc[2]);
+  if (wIn < 1){                                        /* ...from the snapshot */
+    M.xp(wX, mRoot, snapM[0], snapM[1], snapM[2]);
+    M.xd(wY, mRoot, snapD[0], snapD[1], snapD[2]);
+    lerp3(wT, wX, wT, wIn); lerp3(wB, wY, wB, wIn);
+  }
+  if (wOut < 1){                                       /* ...back to procedural */
+    wY[0] = mH[4];  wY[1] = mH[5];  wY[2] = mH[6];
+    wX[0] = mH[12] + wY[0]*ho; wX[1] = mH[13] + wY[1]*ho; wX[2] = mH[14] + wY[2]*ho;
+    lerp3(wT, wX, wT, wOut); lerp3(wB, wY, wB, wOut);
+  }
+  norm3(wB);
+  wT[0] -= wB[0]*ho; wT[1] -= wB[1]*ho; wT[2] -= wB[2]*ho;   /* middle -> hand */
+  M.xp(wS, mTorso, shx, SH_Y, 0);                      /* shoulder joint */
+  M.xd(wP, mTorso, side * 0.30, -0.86, 0.44);          /* elbow pole: down-back */
+  norm3(wP);
+  solveIK(wS, wT, UARM, LARM, wP);
+  setFrame(mU, wS[0], wS[1], wS[2], ikN[0], ikN[1], ikN[2],
+    (wS[0] - ikE[0]) / UARM, (wS[1] - ikE[1]) / UARM, (wS[2] - ikE[2]) / UARM);
+  setFrame(mF, ikE[0], ikE[1], ikE[2], ikN[0], ikN[1], ikN[2],
+    (ikE[0] - ikH[0]) / LARM, (ikE[1] - ikH[1]) / LARM, (ikE[2] - ikH[2]) / LARM);
+  /* hand: +Y is the blade; roll it about the blade by `tilt` */
+  wQ[0] = wB[1]*ref[2] - wB[2]*ref[1];
+  wQ[1] = wB[2]*ref[0] - wB[0]*ref[2];
+  wQ[2] = wB[0]*ref[1] - wB[1]*ref[0];
+  if (wQ[0]*wQ[0] + wQ[1]*wQ[1] + wQ[2]*wQ[2] < 1e-6){ wQ[0] = ikN[0]; wQ[1] = ikN[1]; wQ[2] = ikN[2]; }
+  norm3(wQ);
+  var c = Math.cos(tilt), s = Math.sin(tilt);
+  var xx = wQ[0]*c + (wB[1]*wQ[2] - wB[2]*wQ[1])*s;
+  var xy = wQ[1]*c + (wB[2]*wQ[0] - wB[0]*wQ[2])*s;
+  var xz = wQ[2]*c + (wB[0]*wQ[1] - wB[1]*wQ[0])*s;
+  setFrame(mH, ikH[0], ikH[1], ikH[2], xx, xy, xz, wB[0], wB[1], wB[2]);
+}
 
 function renderRig(r, pos, yaw){
-  var GL = JK.GL, p = r.pose;
+  var GL = JK.GL, p = r.pose, a = r.arc;
   var dual = r.type === 'dual', staff = r.type === 'staff';
+  var HO = (staff ? STAFF_TOP : HILT_TOP) + BLADE_LEN * 0.5;   /* hand -> blade middle */
 
   /* lunge: shift the DRAWN body along facing (visual only; fwd = (-sin,-cos)) */
   var lun = r.lunge;
@@ -415,18 +790,25 @@ function renderRig(r, pos, yaw){
   GL.draw(MESH.head, mA, r.oSkin);
   GL.draw(MESH.hair, mA, r.oHair);
 
-  /* left arm — hand frame kept in mHL for the dual blade pass */
-  M.copy(mA, mTorso); M.tr(mA, -SH_X, SH_Y, 0);
-  M.rz(mA, -p.sprL); M.ry(mA, p.syL); M.rx(mA, p.aSwL);
-  GL.draw(MESH.uarm, mA, r.oTunic);
-  M.tr(mA, 0, -UARM, 0); M.rx(mA, p.elbL);
-  GL.draw(MESH.larm, mA, r.oTunic);
-  M.tr(mA, 0, -LARM, 0); M.rx(mA, p.wrL);
-  GL.draw(MESH.hand, mA, r.oSkin);
-  if (dual){
-    GL.draw(MESH.hilt, mA, null);
-    M.copy(mHL, mA);
+  /* arc influence + swing-plane reference for the blade roll */
+  var arcOn = a.live && (a.wIn * a.wOut) > 0.001;
+  if (arcOn){
+    M.xd(wR, mRoot, a.n[0], a.n[1], a.n[2]);
+    norm3(wR);
   }
+
+  /* left arm (mirrored arc when dual) */
+  fkArm(mUL, mFL, mHL, -SH_X, -p.sprL, p.syL, p.aSwL, p.elbL, p.wrL, 0);
+  if (arcOn && a.mirror){
+    M.xd(wR, mRoot, -a.n[0], a.n[1], a.n[2]); norm3(wR);   /* mirrored plane */
+    ikArm(mUL, mFL, mHL, -SH_X, a.mL, a.dL, a.snapML, a.snapDL,
+          -a.tilt, a.wIn, a.wOut, -1, wR, HILT_TOP + BLADE_LEN * 0.5);
+    M.xd(wR, mRoot, a.n[0], a.n[1], a.n[2]); norm3(wR);
+  }
+  GL.draw(MESH.uarm, mUL, r.oTunic);
+  GL.draw(MESH.larm, mFL, r.oTunic);
+  GL.draw(MESH.hand, mHL, r.oSkin);
+  if (dual) GL.draw(MESH.hilt, mHL, null);
 
   /* left leg */
   M.copy(mA, mPelv); M.tr(mA, -HIP_X, HIP_DY, 0); M.rx(mA, p.lSwL);
@@ -444,16 +826,30 @@ function renderRig(r, pos, yaw){
   M.tr(mA, 0, -LLEG, 0); M.rx(mA, -(p.lSwR + p.kneeR) * 0.6);
   GL.draw(MESH.boot, mA, r.oBoots);
 
-  /* right (saber) arm — hand frame kept in mHR */
-  M.copy(mA, mTorso); M.tr(mA, SH_X, SH_Y, 0);
-  M.rz(mA, p.sprR); M.ry(mA, p.syR); M.rx(mA, p.aSwR);
-  GL.draw(MESH.uarm, mA, r.oTunic);
-  M.tr(mA, 0, -UARM, 0); M.rx(mA, p.elbR);
-  GL.draw(MESH.larm, mA, r.oTunic);
-  M.tr(mA, 0, -LARM, 0); M.rx(mA, p.wrist); M.rz(mA, p.wrr);
-  GL.draw(MESH.hand, mA, r.oSkin);
-  GL.draw(staff ? MESH.hiltS : MESH.hilt, mA, null);
-  M.copy(mHR, mA);
+  /* right (saber) arm */
+  fkArm(mUR, mFR, mHR, SH_X, p.sprR, p.syR, p.aSwR, p.elbR, p.wrist, p.wrr);
+  if (arcOn)
+    ikArm(mUR, mFR, mHR, SH_X, a.mR, a.dR, a.snapM, a.snapD,
+          a.tilt, a.wIn, a.wOut, 1, wR, HO);
+  GL.draw(MESH.uarm, mUR, r.oTunic);
+  GL.draw(MESH.larm, mFR, r.oTunic);
+  GL.draw(MESH.hand, mHR, r.oSkin);
+  GL.draw(staff ? MESH.hiltS : MESH.hilt, mHR, null);
+
+  /* --- remember the effective hand poses (body-local) so the next arc can
+     blend out of exactly what we are drawing right now --- */
+  var cy = Math.cos(yaw), sy = Math.sin(yaw), dx, dy, dz;
+  dx = mHR[12] + mHR[4]*HO - px; dy = mHR[13] + mHR[5]*HO - pos[1];
+  dz = mHR[14] + mHR[6]*HO - pz;
+  a.curM[0] = cy*dx - sy*dz; a.curM[1] = dy; a.curM[2] = sy*dx + cy*dz;
+  a.curD[0] = cy*mHR[4] - sy*mHR[6]; a.curD[1] = mHR[5];
+  a.curD[2] = sy*mHR[4] + cy*mHR[6];
+  dx = mHL[12] + mHL[4]*HO - px; dy = mHL[13] + mHL[5]*HO - pos[1];
+  dz = mHL[14] + mHL[6]*HO - pz;
+  a.curML[0] = cy*dx - sy*dz; a.curML[1] = dy; a.curML[2] = sy*dx + cy*dz;
+  a.curDL[0] = cy*mHL[4] - sy*mHL[6]; a.curDL[1] = mHL[5];
+  a.curDL[2] = sy*mHL[4] + cy*mHL[6];
+  a.hasCur = true; a.snapAge = 0;
 
   /* --- world blade ends for combat (valid every frame, on or off) --- */
   var b0 = r.blades[0], b1 = r.blades.length > 1 ? r.blades[1] : null;
@@ -513,20 +909,31 @@ function col3(a, d){
 function create(palette){
   buildMeshes();
   var pal = palette || {};
-  var i, kf = [];
-  for (i = 0; i < MAX_KEYS; i++) kf.push(new Float32Array(9));
   var rig = {
     pose: { bob: 0, lean: 0.04, twist: 0, head: 0,
       lSwL: 0.05, lSwR: -0.05, kneeL: -0.09, kneeR: -0.09,
-      aSwL: 0.10, aSwR: 0.38, sprL: 0.10, sprR: 0.14,
-      elbL: 0.28, elbR: 0.55, wrist: -0.60,
+      aSwL: 0.10, aSwR: 0.30, sprL: 0.10, sprR: 0.14,
+      elbL: 0.28, elbR: 0.45, wrist: -1.65,
       syL: 0, syR: 0, wrL: 0, wrr: 0 },
     phase: 0,
     swingT: -1,
     lunge: 0,
     type: 'single',
-    swing: { active: false, t: 0, dur: SWING_DUR, mirror: false, n: 0,
-      keys: kf, snapR: new Float32Array(8), snapL: new Float32Array(8) },
+    arc: {
+      live: false, active: false, t: 0, dur: SWING_DUR,
+      pivot: new Float32Array([0.06, 1.34, -0.04]), radius: 1.02,
+      u: new Float32Array(3), v: new Float32Array(3), n: new Float32Array(3),
+      a0: 0, a1: 1.6, tilt: 0, windup: 0.28, recover: 0.24,
+      lungeAmt: 0, lungeCur: 0, mirror: false, name: '', blendIn: BLEND_IN,
+      wIn: 0, wOut: 0, twist: 0, lean: 0, snapAge: 99,
+      hR: new Float32Array(3), dR: new Float32Array([0, 1, 0]), mR: new Float32Array(3),
+      hL: new Float32Array(3), dL: new Float32Array([0, 1, 0]), mL: new Float32Array(3),
+      snapD: new Float32Array([0, 1, 0]), snapDL: new Float32Array([0, 1, 0]),
+      snapM: new Float32Array(3), snapML: new Float32Array(3),
+      curM: new Float32Array(3), curD: new Float32Array([0, 1, 0]),
+      curML: new Float32Array(3), curDL: new Float32Array([0, 1, 0]),
+      hasCur: false
+    },
     saberOn: true,
     saberCol: col3(null, [0.2, 0.9, 0.3]),
     basePos: new Float32Array(3),
@@ -534,11 +941,13 @@ function create(palette){
     advance: advance,
     draw: instanceDraw,
     startSwing: startSwing,
+    playArc: playArc,
     playSwing: playSwing,
     swingPhase: swingPhase,
     setType: setType,
     setSaber: setSaber
   };
+  setBasis(rig.arc, -1, 0, 0);
   /* blades: entries preallocated once; blades[0] aliases basePos/tipPos and the
      array is mutated in place by setType (identity-stable for consumers). */
   rig.blades = [{ base: rig.basePos, tip: rig.tipPos }];
@@ -561,6 +970,7 @@ var player = null;
 JK.Rig = {
   create: create,
   SWING_DUR: SWING_DUR,
+  DEFAULT_ARC: DEFAULT_ARC,
   player: null,
   pose: null,
   tipPos: null,
@@ -588,11 +998,10 @@ JK.Rig = {
          (iteration 2: Sabers owns attack consumption + swing selection). */
       if (!JK.Sabers){
         if (P.attackQueued){
-          /* keep buffered until the current swing is chainable */
-          if (player.playSwing(DEFAULT_DEF)) P.attackQueued = false;
+          if (player.playArc(DEFAULT_ARC)) P.attackQueued = false;
         } else if (P.attackQueued === undefined &&
                    JK.Input && JK.Input.state && JK.Input.state.attack){
-          player.startSwing();   /* fallback until player module queues attacks */
+          player.startSwing();
         }
       }
     }
@@ -607,6 +1016,7 @@ JK.Rig = {
   setSaber: function(rgb, on){ if (player) player.setSaber(rgb, on); },
   setType: function(type){ if (player) player.setType(type); },
   startSwing: function(){ return player ? player.startSwing() : false; },
+  playArc: function(def){ return player ? player.playArc(def) : false; },
   playSwing: function(def){ return player ? player.playSwing(def) : false; },
   swingPhase: function(){ return player ? player.swingPhase() : -1; }
 };

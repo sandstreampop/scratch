@@ -33,6 +33,9 @@
  *
  * UI: this module builds its OWN DOM (a 5-slot chunky strip on the right edge,
  * above #btnForce; it never touches template.html or 60_ui.js) plus a <style>.
+ * On a SHORT LANDSCAPE viewport there is no room above #btnForce for five
+ * slots, so the strip hangs from the top of the right edge instead, inboard of
+ * the button column — see the media query for the arithmetic.
  * It also mirrors "FORCE PUSH  25" into #forceTag. DOM is written ONLY on change.
  *
  * EXPORTS
@@ -70,6 +73,7 @@ var GRIP_THROW   = 12;      /* release impulse handed to the bot */
 var GRIP_BREAK   = 18;      /* m: grip snaps beyond this */
 var GRIP_LIFT    = 0.40;    /* upward bias mixed into the throw direction */
 var MIN_START    = 0.5;     /* s of channel you must be able to afford to start */
+var FAIL_T       = 0.45;    /* s the slot stays red — matches the CSS animation */
 
 var DEG = Math.PI / 180;
 var COS_WIDE   = Math.cos(75 * DEG);   /* push / pull */
@@ -188,7 +192,12 @@ function distTo(e){
   return Math.sqrt(dx * dx + dz * dz);
 }
 
-/* Fill HITS/HITD with live non-player entities inside range + cone. */
+/* Fill HITS/HITD with live non-player entities inside range + cone.
+ * RANGE is the true chest-to-chest distance (3D): a horizontal-only test would
+ * let a 10 m push hit a sith hanging 30 m overhead mid-force-jump. The CONE
+ * stays horizontal on purpose (you shove whatever is in front of you, up or
+ * down a dune alike). HITD keeps the SQUARED 3D distance — it is only ever
+ * compared, never read out, so the sort needs no extra sqrt. */
 function scan(range, cosHalf, needForce){
   nHits = 0;
   var C = JK.Combat, ents = C && C.ents;
@@ -201,13 +210,24 @@ function scan(range, cosHalf, needForce){
     if (!(e.hp > 0)) continue;                       /* dead things are skipped */
     if (needForce && typeof e.onForce !== 'function') continue;
     var dx = e.pos[0] - ORIGIN[0], dz = e.pos[2] - ORIGIN[2];
-    var d2 = dx * dx + dz * dz;
-    if (d2 > r2) continue;
+    var dy = e.pos[1] + (e.height || 1.8) * CHEST_FRAC - ORIGIN[1];
+    var d2 = dx * dx + dz * dz;                      /* horizontal, for the cone */
+    var s2 = d2 + dy * dy;                           /* true range, for the reach */
+    if (s2 > r2) continue;
     var d = Math.sqrt(d2);
     if (d > 0.25 && (dx * FWD[0] + dz * FWD[2]) / d < cosHalf) continue;
-    HITS[nHits] = e; HITD[nHits] = d; nHits++;
+    HITS[nHits] = e; HITD[nHits] = s2; nHits++;
   }
   return nHits;
+}
+
+/* Is this entity still a live member of the registry? A bot that JK.Bots
+ * unregistered (death, wave clear, pool recycle) must not stay gripped — the
+ * hp test alone cannot see it, and a recycled record can come back alive. */
+function registered(e){
+  var C = JK.Combat, l = C && C.ents;
+  if (!l) return true;                               /* no registry: trust the caller */
+  return l.indexOf(e) >= 0;
 }
 
 /* Partial selection sort: the k nearest hits end up at the front of HITS. */
@@ -399,6 +419,7 @@ function tickChannel(dt, t){
   /* GRIP: stay on the SAME entity even if it leaves the cone. */
   e = gripTarget;
   if (!e || !e.pos || !(e.hp > 0)) return false;
+  if (!registered(e)) return false;                  /* never choke a stale record */
   if (distTo(e) > GRIP_BREAK) return false;
   dirTo(e, DIR);
   if (typeof e.onForce === 'function'){
@@ -420,6 +441,11 @@ function tickChannel(dt, t){
 /* Fire the selected power (instant) or start its channel. */
 function fire(p){
   if (p < 0 || p >= NPOW) return false;
+  /* cast() is public, so a caller can arrive outside update(): make sure the
+   * aim/origin scratch belongs to THIS moment before anything is thrown. */
+  if (!PL || !PL.pos) PL = JK.Player || null;
+  if (!PL || !PL.pos) return false;
+  updateAim();
   var d = POWERS[p];
   if (heroDead()) return false;
   if (cool[p] > 0){ failFlash(p); return false; }
@@ -440,6 +466,7 @@ var slots = [null, null, null, null, null];
 var stKey = [-1, -1, -1, -1, -1];    /* cached visual state bitmask per slot */
 var dn  = [false, false, false, false, false];
 var lo  = [false, false, false, false, false];
+var flT = [0, 0, 0, 0, 0];           /* fail-flash timers, s */
 var tagEl = null, tagText = '';
 
 var CSS = [
@@ -469,9 +496,21 @@ var CSS = [
 '@keyframes jkpFail { 0% { background:#5a1810; border-color:#ff8a6a;',
 '    box-shadow:0 0 14px rgba(255,90,50,.7); }',
 '  100% { background:#1d2412; box-shadow:1px 1px 0 rgba(0,0,0,.5); } }',
-'@media (max-height:620px) { #jkpBar { bottom:calc(272px + env(safe-area-inset-bottom));',
-'    width:52px; } .jkp-s { height:32px; margin-bottom:2px; }',
-'  .jkp-l { padding-top:6px; } .jkp-c { margin-top:2px; } }'
+/* LANDSCAPE PHONE: there is no room left above #btnForce. That button's top
+ * edge sits 266px + safe area off the bottom, so on a 390pt-tall iPhone only
+ * ~100px remain — five slots need 160, and the strip used to run 71px OFF THE
+ * TOP of the screen with PUSH and PULL completely unreachable. The strip is
+ * the ONLY force selector a touch device has (the template ships no select
+ * button; forceTap is R / wheel), so that was two dead powers.
+ * Fix: on short landscape viewports the strip hangs from the TOP of the right
+ * edge instead, inboard of the #btnForce/#btnJump column (they start at
+ * right 16-20, w 56-64 => clear of right 84 + 52) and below JK.Audio's 44px
+ * mute button in the corner. Everything else keeps the tall-screen layout. */
+'@media (max-height:620px) and (orientation:landscape) {',
+'  #jkpBar { top:calc(6px + env(safe-area-inset-top)); bottom:auto;',
+'    right:calc(84px + env(safe-area-inset-right)); width:52px; }',
+'  .jkp-s { height:30px; margin-bottom:2px; }',
+'  .jkp-l { padding-top:5px; font-size:8px; } .jkp-c { margin-top:1px; } }'
 ].join('\n');
 
 function mk(tag, cls2, parent){
@@ -492,16 +531,22 @@ function shield(el){
   for (i = 0; i < mev.length; i++) el.addEventListener(mev[i], stopOnly, {passive:false});
 }
 
-/* Slot visuals are keyed by a 4-bit mask so the per-frame refresh compares INTS
- * (no string built, no DOM written) unless something actually changed. */
+/* Slot visuals are keyed by a 5-bit mask so the per-frame refresh compares INTS
+ * (no string built, no DOM written) unless something actually changed.
+ * The FAIL bit must live in the mask: a fail happens mid-update (inside fire())
+ * and the update's own trailing refreshSlots() runs before the browser paints,
+ * so a flash held outside the mask is erased in the same frame — the player
+ * would only ever hear 'forceFail', never see it. */
 function slotKey(i){
-  return (i === sel ? 1 : 0) | (mode === i ? 2 : 0) | (lo[i] ? 4 : 0) | (dn[i] ? 8 : 0);
+  return (i === sel ? 1 : 0) | (mode === i ? 2 : 0) | (lo[i] ? 4 : 0) |
+         (dn[i] ? 8 : 0) | (flT[i] > 0 ? 16 : 0);
 }
 function slotClass(k){
   var s = 'jkp-s';
   if (k & 1) s += (k & 2) ? ' sel act' : ' sel';
   if (k & 4) s += ' lo';
   if (k & 8) s += ' dn';
+  if (k & 16) s += ' fail';
   return s;
 }
 function refreshSlots(){
@@ -513,19 +558,31 @@ function refreshSlots(){
   }
 }
 function failFlash(i){
+  if (i < 0 || i >= NPOW) return;
+  flT[i] = FAIL_T;
   var el = slots[i];
   if (!el) return;
-  var base = slotClass(slotKey(i));
-  el.className = base;
-  void el.offsetWidth;                    /* reflow: restart the one-shot anim */
-  el.className = base + ' fail';
-  stKey[i] = -1;                          /* next state change repaints cleanly */
+  var k = slotKey(i);
+  el.className = slotClass(k & ~16);       /* drop it ... */
+  void el.offsetWidth;                     /* ... reflow: restart the one-shot anim */
+  el.className = slotClass(k);
+  stKey[i] = k;                            /* keyed, so refreshSlots keeps the flash */
 }
 
 function syncTag(){
   var d = POWERS[sel];
   tagText = 'FORCE ' + d.name + '  ' + d.cost + (d.channel ? '/S' : '');
   if (tagEl && tagEl.textContent !== tagText) tagEl.textContent = tagText;
+}
+
+/* A mouse press that starts on a slot and is released ANYWHERE else never
+ * reaches the slot's own mouseup, so the pressed look would stick forever.
+ * One window-level release clears the lot (the slot handler stops propagation,
+ * so an on-slot release still only runs once). */
+function clearDown(){
+  var ch = false;
+  for (var i = 0; i < NPOW; i++) if (dn[i]){ dn[i] = false; ch = true; }
+  if (ch) refreshSlots();
 }
 
 function bindSlot(el, i){
@@ -564,6 +621,7 @@ function build(){
       var k = e.keyCode;
       if (k >= 49 && k <= 53) select(k - 49);
     });
+    window.addEventListener('mouseup', clearDown);
   }
 }
 
@@ -604,8 +662,11 @@ var Powers = JK.Powers = {
 
     mode = -1; channelT = 0; gripTarget = null; gripSent = false;
     Powers.channelling = false; Powers.channelT = 0; Powers.gripTarget = null;
-    for (var i = 0; i < NPOW; i++){ cool[i] = 0; lo[i] = false; dn[i] = false; }
+    for (var i = 0; i < NPOW; i++){
+      cool[i] = 0; lo[i] = false; dn[i] = false; flT[i] = 0; stKey[i] = -1;
+    }
     nHits = 0;
+    for (i = 0; i < 32; i++) HITS[i] = null;   /* drop any entity refs we held */
 
     sel = 0; Powers.sel = 0;
     var st = JK.Input && JK.Input.state;
@@ -625,8 +686,11 @@ var Powers = JK.Powers = {
 
     updateAim();
 
-    /* ---- cooldowns + regen ---- */
-    for (i = 0; i < NPOW; i++) if (cool[i] > 0){ cool[i] -= dt; if (cool[i] < 0) cool[i] = 0; }
+    /* ---- cooldowns + fail flashes + regen (all in SECONDS, never frames) ---- */
+    for (i = 0; i < NPOW; i++){
+      if (cool[i] > 0){ cool[i] -= dt; if (cool[i] < 0) cool[i] = 0; }
+      if (flT[i] > 0){ flT[i] -= dt; if (flT[i] < 0) flT[i] = 0; }
+    }
     sinceSpend += dt;
     if (sinceSpend >= REGEN_DELAY && g.force < g.forceMax){
       g.force += REGEN_RATE * dt;
@@ -672,13 +736,13 @@ var Powers = JK.Powers = {
   /* ---- small public API (also used by harnesses) ---- */
   select: select,
   cycle: function(d){ return select(((sel + (d === undefined ? 1 : d)) % NPOW + NPOW) % NPOW); },
-  name: function(i){ return NAMES[(i | 0) % NPOW]; },
+  name: function(i){ return NAMES[((i | 0) % NPOW + NPOW) % NPOW]; },
   canCast: function(i){
     i = i | 0;
     return !heroDead() && i >= 0 && i < NPOW && cool[i] <= 0 && affords(i);
   },
   cast: function(i){ return fire(i === undefined ? sel : (i | 0)); },
   stop: function(){ endChannel(); },
-  cooldown: function(i){ return cool[(i | 0) % NPOW]; }
+  cooldown: function(i){ return cool[((i | 0) % NPOW + NPOW) % NPOW]; }
 };
 })();
