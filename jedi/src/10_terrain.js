@@ -58,10 +58,14 @@ function height(x, z){
 
 /* ---------- module state ---------- */
 var terrainMesh = null, sceneryMesh = null, sunMesh = null, haloMesh = null;
+var skyMesh = null;
 var OBST = [];
 var SUN_DIR = [0.71, 0.573, 0.409];   /* normalized; points UP toward the sun */
 var SUN_OPTS  = { emissive: 1, nofog: true };
 var HALO_OPTS = { emissive: 1, nofog: true, additive: true, alpha: 0.45 };
+var SKY_OPTS  = { emissive: 1, nofog: true };
+var SKY_R = 1990;                     /* < the 2000 m far plane, > the 1400 m sun */
+var mSky = M.make();                  /* scratch: dome follows the eye */
 
 /* sand palette: #b8905a -> #d2aa6d, banded */
 var SAND_LO = [0.722, 0.565, 0.353];
@@ -242,6 +246,64 @@ function buildSceneryGeo(){
   return Geo.merge(parts);
 }
 
+/* ---------- sky dome ----------
+   Without this the top half of the screen is one flat clear-colour rectangle,
+   which on a phone held in portrait is ~45% of the picture. A vertex-coloured
+   dome parented to the eye costs ONE draw call and 170 verts, needs no shader
+   change (emissive + nofog = the vertex colour straight through), and its
+   bottom ring is painted exactly the fog colour so the horizon join is
+   invisible. Radius sits between the 1400 m sun billboard and the far plane so
+   it never occludes the sun. */
+var SKY_STOPS = [
+  [0.00, 0.86, 0.72, 0.52],   /* horizon = JK.GL.fog() colour: seamless join */
+  [0.13, 0.86, 0.74, 0.57],
+  [0.40, 0.77, 0.73, 0.67],
+  [1.00, 0.53, 0.62, 0.79]    /* zenith: dusty desert blue */
+];
+function skyCol(t, o){
+  if (t < 0) t = 0; else if (t > 1) t = 1;
+  for (var i = 1; i < SKY_STOPS.length; i++){
+    var b = SKY_STOPS[i];
+    if (t <= b[0] || i === SKY_STOPS.length - 1){
+      var a = SKY_STOPS[i - 1];
+      var u = (t - a[0]) / ((b[0] - a[0]) || 1);
+      if (u < 0) u = 0; else if (u > 1) u = 1;
+      u = u * u * (3 - 2 * u);
+      o[0] = a[1] + (b[1] - a[1]) * u;
+      o[1] = a[2] + (b[2] - a[2]) * u;
+      o[2] = a[3] + (b[3] - a[3]) * u;
+      return o;
+    }
+  }
+  return o;
+}
+function buildSkyGeo(){
+  var SEG = 24, RING = 7, P = [], N = [], C = [], I = [], c = [0, 0, 0], i, j;
+  for (j = 0; j <= RING; j++){
+    var t = j / RING;
+    /* start 12 deg BELOW the horizon so pitching the camera down never
+       exposes a gap between the dome's rim and the dunes */
+    var el = (-0.135 + 1.135 * t) * Math.PI * 0.5;
+    var y = Math.sin(el) * SKY_R, rr = Math.cos(el) * SKY_R;
+    skyCol(t, c);
+    for (i = 0; i < SEG; i++){
+      var a = i / SEG * Math.PI * 2;
+      P.push(Math.cos(a) * rr, y, Math.sin(a) * rr);
+      N.push(0, 1, 0);
+      C.push(c[0], c[1], c[2]);
+    }
+  }
+  for (j = 0; j < RING; j++){
+    for (i = 0; i < SEG; i++){
+      var n = (i + 1) % SEG, r0 = j * SEG, r1 = (j + 1) * SEG;
+      I.push(r0 + i, r1 + i, r1 + n);
+      I.push(r0 + i, r1 + n, r0 + n);
+    }
+  }
+  return { pos: new Float32Array(P), nrm: new Float32Array(N),
+           col: new Float32Array(C), idx: new Uint16Array(I) };
+}
+
 /* ---------- JK.Terrain ---------- */
 JK.Terrain = {
   SIZE: 350,                 /* playable half-extent; player/bots clamp to this */
@@ -251,6 +313,7 @@ JK.Terrain = {
   init: function(){
     terrainMesh = JK.GL.mesh(buildTerrainGeo());
     sceneryMesh = JK.GL.mesh(buildSceneryGeo());
+    skyMesh     = JK.GL.mesh(buildSkyGeo());
 
     /* sun billboard blob 1400m out along SUN_DIR (already unit length) */
     var sp = [SUN_DIR[0] * 1400, SUN_DIR[1] * 1400, SUN_DIR[2] * 1400];
@@ -265,6 +328,9 @@ JK.Terrain = {
   },
 
   draw: function(){
+    var e = JK.GL.eye;                       /* dome rides with the camera */
+    M.ident(mSky); M.tr(mSky, e[0], e[1], e[2]);
+    JK.GL.draw(skyMesh, mSky, SKY_OPTS);
     JK.GL.draw(terrainMesh, null);
     JK.GL.draw(sceneryMesh, null);
     JK.GL.draw(sunMesh, null, SUN_OPTS);

@@ -14,6 +14,8 @@
  *   sweep          sweeps[0] or null
  *   attackName     name of current/last swing ('' before first)
  *   attackId       int, increments once per accepted swing (Combat dedupes on it)
+ *   DEFS           DEFS[stance][dir] arcDef — feed straight to rig.playArc(def)
+ *                  (bots may reuse these; they are plain data, never mutated)
  *
  * Consumes JK.Player.attackQueued; drives the player rig via rig.playArc (see the
  * SWING REWORK CONTRACT). Updates #stanceTag text + color on stance change.
@@ -36,25 +38,46 @@
  * Everything else (pivot, radius, windup/recover, lunge) is per stance, overridden
  * per attack where the attack's identity needs it.
  *
- * MEASURED (jedi/test/swing_probe.js, all twelve): the tip sweeps 87-91 deg in LIGHT,
- * 99-145 in MEDIUM, 101-143 in STRONG — over 0.30 / 0.42 / 0.62 s. That ratio is the
- * stance feel: LIGHT is a tight fast flick, STRONG is a slow full-body heave.
+ * ===================== TWO RULES THE TABLE MUST OBEY =====================
+ * 1. THE STRIKE MUST BE THE FASTEST THING ON SCREEN. The blade starts every swing
+ *    at the idle guard (tip ~elevation 20, azimuth -7 from the pivot) and the engine
+ *    blends guard -> a0 over the wind-up. That blend is real, visible motion: if the
+ *    cocked pose is far from the guard and `windup` is short, the COCK-BACK is faster
+ *    than the cut and the attack reads backwards (a flinch, then a slow push). Keep
+ *      coilFromGuard(deg) / (windup * dur)  well under the strike's angular rate.
+ *    Measured guard->coil distances are noted per attack below; none exceed 47 deg,
+ *    and every stance now spends >= 0.08 s winding up.
+ * 2. STANCE CHARACTER IS PEAK TIP SPEED, NOT JUST DURATION. Peak angular rate of the
+ *    strike is ~1.67 * sweptAngle / strikeTime, where strikeTime = (1-windup-recover)
+ *    * dur. LIGHT gets its speed from a SHORT strike time, STRONG gets its weight from
+ *    a LONG one — so STRONG can be much wider without becoming quick.
+ *
+ * MEASURED, all twelve (great-circle arc / PEAK TIP SPEED / wind-up peak speed as a
+ * fraction of the strike's peak — rule 1 needs that last column below 1.0):
+ *      LIGHT   100-102 deg   28-32 m/s   wind-up 0.33-0.82 of the strike
+ *      MEDIUM  101-128 deg   21-26 m/s   wind-up 0.47-0.77
+ *      STRONG   99-140 deg   16-19 m/s   wind-up 0.43-0.69
+ * So STRONG's arcs are up to 40% wider than MEDIUM's and 40% wider again than
+ * LIGHT's, while its blade moves at little over HALF the speed of a LIGHT flick.
+ * That is the stance triangle: fast+small, balanced, slow+huge. (VIPER LUNGE is the
+ * exception on width by design — see the thrust note below.)
  */
 (function(){
 'use strict';
 
 /* ================= stance table (contract fields + damage window) ========== */
-/* act0/act1 bracket the STRIKE, not the whole swing: each stance's windup ends at
- * `windup` (0.16 / 0.18 / 0.24 below) and the blade needs a further ~20% of the
- * strike to accelerate out of the coil, so damage goes live once the blade is
- * genuinely out in front and travelling, and stays live through the follow-through. */
+/* act0/act1 bracket the STRIKE, and they are MEASURED, not guessed: they are the
+ * phase band in which the blade tip is actually travelling (>= 25% of its peak
+ * speed), so damage can never go live while the blade is still cocked, nor linger
+ * after it has stopped at the end of the follow-through. Re-measure with
+ * jedi/test/swing_probe.js if you ever retune windup/recover below. */
 var STANCES = [
   { name: 'LIGHT',  color: '#f0d028', dmg: 12, dur: 0.30, knock: 2, chainAt: 0.45,
-    act0: 0.26, act1: 0.86 },   /* fast flurry: buffers chains early */
+    act0: 0.33, act1: 0.82 },   /* fast flurry: buffers chains early */
   { name: 'MEDIUM', color: '#f0ead2', dmg: 22, dur: 0.42, knock: 4, chainAt: 0.60,
-    act0: 0.28, act1: 0.86 },   /* classic JKO arcs */
+    act0: 0.29, act1: 0.82 },   /* classic JKO arcs */
   { name: 'STRONG', color: '#f0563a', dmg: 40, dur: 0.62, knock: 7, chainAt: 0.75,
-    act0: 0.32, act1: 0.88 }    /* huge commitment, long lethal window */
+    act0: 0.27, act1: 0.84 }    /* huge commitment, long lethal window */
 ];
 
 /* ================= arc authoring helpers (run ONCE at load) ================ */
@@ -96,12 +119,19 @@ function arcFromTips(s, e){
   return { axis: b.n, a0: a0, a1: a0 + d };
 }
 
-/* per-stance body defaults: pivot (chest, body-local, origin at the FEET), arm
- * radius, and the wind-up / recovery fractions that give each stance its weight */
+/* Per-stance body defaults: pivot (chest, body-local, origin at the FEET), arm
+ * radius, and the wind-up / recovery fractions.
+ *   windup  — anticipation. Sized so the guard->coil blend NEVER outruns the strike
+ *             (rule 1 above). In seconds: LIGHT 0.084, MEDIUM 0.101, STRONG 0.136.
+ *   recover — settle back toward guard. The engine only unwinds SETTLE_FRAC (3.5%)
+ *             of the arc here, so a long recovery is just a frozen blade: keep it
+ *             short and let the strike own the phase. In seconds the STRIKE lasts
+ *             LIGHT 0.174, MEDIUM 0.260, STRONG 0.409 — that 2.4x spread is what
+ *             makes LIGHT whip and STRONG heave. */
 var BODY = [
-  { pivot: [0.06, 1.40, -0.08], radius: 1.02, windup: 0.16, recover: 0.18 }, /* LIGHT  */
-  { pivot: [0.05, 1.44, -0.10], radius: 1.18, windup: 0.18, recover: 0.20 }, /* MEDIUM */
-  { pivot: [0.04, 1.40, -0.12], radius: 1.32, windup: 0.24, recover: 0.22 }  /* STRONG */
+  { pivot: [0.06, 1.40, -0.08], radius: 1.05, windup: 0.28, recover: 0.14 }, /* LIGHT  */
+  { pivot: [0.05, 1.44, -0.10], radius: 1.18, windup: 0.24, recover: 0.14 }, /* MEDIUM */
+  { pivot: [0.04, 1.40, -0.12], radius: 1.34, windup: 0.22, recover: 0.12 }  /* STRONG */
 ];
 
 /* A(stance, name, tipStart, tipEnd, lunge, tilt, overrides) -> arcDef */
@@ -123,42 +153,62 @@ function A(st, name, s, e, lunge, tilt, o){
  * Every "left" attack finishes on the character's LEFT and every "right" attack on
  * the RIGHT, so the stick direction always predicts where the blade ends up. */
 var DEFS = [
-  [ /* ------- LIGHT (0.30 s): compact, close to the body, chains fast --------- */
-    /* tight diagonal cross-slash, high-right -> low-left; the off hand mirrors it
-       (and a DUAL saber turns it into a real two-blade flurry) */
-    A(0, 'FLURRY CROSS',   [ 42, -32], [-28,  30], 0.12,  0.50, { mirror: true }),
-    /* a THRUST: barely any arc (45 deg), the blade drops to level and the whole
-       body drives 1.15 m forward — the tip ends ~3 m in front of the player */
-    A(0, 'VIPER LUNGE',    [ 34,  -8], [-10,  -3], 1.15,  0.00, { radius: 1.34 }),
-    /* short flat diagonal off the right shoulder, finishing out past the left hip */
-    A(0, 'SNAP CUT LEFT',  [ 14, -46], [-10,  42], 0.14,  0.30),
+  [ /* ------- LIGHT (0.30 s): compact, close to the body, chains fast ---------
+       100-102 deg of arc in a 0.174 s strike — the fastest blade in the game
+       (28-32 m/s at the tip) even though the arcs are the smallest. */
+    /* tight diagonal cross-slash, high outside the right ear down past the left
+       hip; the off hand mirrors it (and a DUAL saber makes it a two-blade flurry).
+       coil 32 deg from guard. */
+    A(0, 'FLURRY CROSS',   [ 46, -30], [-34,  40], 0.14,  0.50, { mirror: true }),
+    /* a THRUST, and it must READ as one. Only 36 deg of arc — a chamber above the
+       shoulder settling to LEVEL — while the BODY drives 1.2 m forward on the
+       longest reach in the game (radius 1.62). Measured: the tip ends pointing 11
+       deg below horizontal at chest height 3.1 m in front, i.e. an extended lunge,
+       not the knee-height downward poke this used to be. `recover` is stretched to
+       0.22 so the body does not snap back out of the lunge. */
+    A(0, 'VIPER LUNGE',    [ 34,  -6], [ -2,  -2], 1.20,  0.00,
+                           { radius: 1.62, recover: 0.22 }),
+    /* flat snap off the right shoulder, finishing out past the LEFT hip.
+       The exact azimuth mirror of SNAP CUT RIGHT, so the two never read alike. */
+    A(0, 'SNAP CUT LEFT',  [ 18, -46], [-16,  50], 0.16,  0.30),
     /* the same flick reversed: starts up on the LEFT, finishes out past the right */
-    A(0, 'SNAP CUT RIGHT', [ 18,  34], [-12, -48], 0.14, -0.30)
+    A(0, 'SNAP CUT RIGHT', [ 18,  46], [-16, -50], 0.16, -0.30)
   ],
-  [ /* ------- MEDIUM (0.42 s): the classic readable arcs -------------------- */
+  [ /* ------- MEDIUM (0.42 s): the classic readable arcs --------------------
+       101-128 deg over a 0.260 s strike (21-26 m/s). Four genuinely different
+       shapes: one level, one vertical, one rising, one falling. */
     /* true horizontal sweep: the plane is exactly level (axis +Y) so the tip holds
-       shoulder height for the whole 145 deg, right side across the front to left */
-    A(1, 'HORIZON ARC',    [  0, -52], [  0,  86], 0.20,  0.00),
+       shoulder height for the whole 128 deg, right side across the front to left */
+    A(1, 'HORIZON ARC',    [  0, -50], [  0,  78], 0.22,  0.00),
     /* overhead chop: the blade goes up over the head (the engine's ceiling holds
        the tip at 2.42 m) and comes down the front to knee height, with a step in */
-    A(1, 'SKYFALL CHOP',   [ 58,  -8], [-44,  -3], 0.60,  0.00),
-    /* rising cut: dips low outside the right knee and carves up to high-left */
-    A(1, 'RISING TALON',   [-14, -38], [ 33,  52], 0.22,  0.40),
-    /* the fall: cocks high over the left shoulder and drops to the low right */
-    A(1, 'FALLING STAR',   [ 38,  40], [-40, -48], 0.24, -0.40)
+    A(1, 'SKYFALL CHOP',   [ 58,  -8], [-46,  -3], 0.60,  0.00),
+    /* rising cut. It has to READ as rising: the coil only dips to -8 (a low guard
+       outside the right knee, not the fast plunge the eye used to mistake FOR the
+       attack — this one needs the longer 0.28 wind-up to stay slower than its own
+       cut) and it finishes at elevation 28, tip under 2.3 m rather than parked
+       above the head like an antenna. */
+    A(1, 'RISING TALON',   [ -8, -42], [ 28,  56], 0.24,  0.40, { windup: 0.28 }),
+    /* the fall: cocks over the left shoulder and drops across to the low right */
+    A(1, 'FALLING STAR',   [ 34,  34], [-34, -46], 0.26, -0.40)
   ],
-  [ /* ------- STRONG (0.62 s): huge, heavy, torso-driven -------------------- */
-    /* the cyclone: the longest wind-up in the game (24% of a 0.62 s swing) coils the
-       blade back past the right shoulder, then it whips 143 deg around the front and
-       carries through past the LEFT shoulder — twice the travel of a LIGHT cut */
-    A(2, 'DUNE CYCLONE',   [  6, -40], [ -6,  96], 0.45,  0.00),
-    /* leaping smash: overhead, straight down the front, 1.10 m of lunge behind it;
-       the tip finishes at the sand ~2.5 m in front */
-    A(2, 'METEOR SMASH',   [ 50,  -8], [-46,  -3], 1.10,  0.00, { radius: 1.30 }),
-    /* wide diagonal heave: high outside the right, down across the body to low-left */
-    A(2, 'SANDSTORM SWEEP',[ 36, -40], [-40,  52], 0.35,  0.40),
-    /* its mirror: high over the left shoulder, crashing down to the low right */
-    A(2, 'AVALANCHE',      [ 38,  42], [-42, -50], 0.35, -0.40)
+  [ /* ------- STRONG (0.62 s): huge, heavy, torso-driven --------------------
+       99-140 deg — the widest arcs in the game — but a 0.409 s strike, so the tip
+       is the SLOWEST (16-19 m/s). Wide and heavy, never quick. */
+    /* the cyclone: 140 deg, the biggest sweep in the game. Coils back past the
+       right shoulder and carries all the way through past the LEFT shoulder —
+       half again the travel of MEDIUM's horizontal and 1.4x a LIGHT cut. */
+    A(2, 'DUNE CYCLONE',   [ 14, -48], [ -8,  92], 0.45,  0.00),
+    /* leaping smash. Not SKYFALL CHOP slowed down: it cocks 16 deg BEHIND the right
+       shoulder and crashes down slightly ACROSS the body (ending 6 deg past centre),
+       a two-handed axe blow rather than a clean sagittal chop. 1.10 m of lunge. */
+    A(2, 'METEOR SMASH',   [ 52, -13], [-46,   3], 1.10,  0.00, { radius: 1.30 }),
+    /* scything heave: high outside the right, 123 deg down across the body and out
+       past the left hip — much longer and lower than the LIGHT cross-slash */
+    A(2, 'SANDSTORM SWEEP',[ 40, -38], [-44,  62], 0.35,  0.40),
+    /* its opposite number, and steeper than MEDIUM's FALLING STAR: cocked higher
+       over the left shoulder (50) and crashing further out to the low right (-56) */
+    A(2, 'AVALANCHE',      [ 50,  30], [-46, -56], 0.35, -0.40)
   ]
 ];
 

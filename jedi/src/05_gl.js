@@ -11,6 +11,15 @@ var amb    = new Float32Array([0.38, 0.34, 0.30]);
 var fogCol = new Float32Array([0.86, 0.72, 0.52]);
 var fogDen = 0.0035;
 var curBlend = false;
+/* Redundant-state cache. Every draw used to re-bind 4 buffers, re-issue 3
+   vertexAttribPointers and re-upload 4 uniforms even when nothing had changed —
+   and a particle burst issues 150+ consecutive draws of the SAME unit cube with
+   the SAME options. Measured in busy combat: 2053 GL calls/frame. iOS Safari
+   marshals every one of those across a process boundary, so this is the single
+   biggest GPU-side cost in the game. Nothing outside this module touches GL
+   state (verified), so caching is safe; mesh() invalidates the binding. */
+var curMesh = null;
+var uEm = -1, uAl = -1, uNf = -1, uTr = -1, uTg = -1, uTb = -1;
 
 var VS =
 'attribute vec3 aP; attribute vec3 aN; attribute vec3 aC;\n'+
@@ -114,33 +123,44 @@ var GL = JK.GL = {
       var b = gl.createBuffer(); gl.bindBuffer(target, b);
       gl.bufferData(target, data, gl.STATIC_DRAW); return b;
     }
-    return {
+    var m = {
       p: buf(gl.ARRAY_BUFFER, geo.pos),
       n: buf(gl.ARRAY_BUFFER, geo.nrm),
       c: buf(gl.ARRAY_BUFFER, geo.col),
       i: buf(gl.ELEMENT_ARRAY_BUFFER, geo.idx),
       count: geo.idx.length
     };
+    curMesh = null;               /* creating buffers left them bound: invalidate */
+    return m;
   },
 
   draw: function(mesh, model, opts){
     opts = opts || {};
     gl.uniformMatrix4fv(loc.uModel, false, model || IDENT);
-    gl.uniform1f(loc.uEmissive, opts.emissive || 0);
-    gl.uniform1f(loc.uAlpha, opts.alpha !== undefined ? opts.alpha : 1);
-    gl.uniform1f(loc.uNoFog, opts.nofog ? 1 : 0);
+    var v = opts.emissive || 0;
+    if (v !== uEm){ gl.uniform1f(loc.uEmissive, v); uEm = v; }
+    v = opts.alpha !== undefined ? opts.alpha : 1;
+    if (v !== uAl){ gl.uniform1f(loc.uAlpha, v); uAl = v; }
+    v = opts.nofog ? 1 : 0;
+    if (v !== uNf){ gl.uniform1f(loc.uNoFog, v); uNf = v; }
     var t = opts.tint;
-    gl.uniform3f(loc.uTint, t ? t[0] : 1, t ? t[1] : 1, t ? t[2] : 1);
+    var tr = t ? t[0] : 1, tg = t ? t[1] : 1, tb = t ? t[2] : 1;
+    if (tr !== uTr || tg !== uTg || tb !== uTb){
+      gl.uniform3f(loc.uTint, tr, tg, tb); uTr = tr; uTg = tg; uTb = tb;
+    }
     var add = !!opts.additive;
     if (add !== curBlend){
       curBlend = add;
       if (add){ gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE); gl.depthMask(false); }
       else { gl.disable(gl.BLEND); gl.depthMask(true); }
     }
-    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.p); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.n); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.c); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.i);
+    if (mesh !== curMesh){
+      curMesh = mesh;
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.p); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.n); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.c); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.i);
+    }
     gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0);
   }
 };

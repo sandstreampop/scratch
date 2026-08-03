@@ -147,6 +147,7 @@ var SI_DMG = 11, SI_DMG_ELITE = 15;
 var SI_HIT_CD = 0.5;        /* s between two landed saber hits from one bot */
 var SI_REACH = 2.4, SI_REACH_ELITE = 2.8;  /* contract: hit inside 2.4 m */
 var ACT0 = 0.25, ACT1 = 0.72;   /* swing damage window (phase) */
+var FPUSH_MAX = 11.5;       /* m: the shove is re-checked against this on landing */
 
 /* movement */
 var ACC_GND = 26, ACC_AIR = 7;
@@ -181,6 +182,9 @@ var PAL_ELITE = {
 var SABER_RED = [1.0, 0.16, 0.10];
 var COL_TROOPER_FX = [0.95, 0.95, 1.0];
 var COL_SITH_FX = [1.0, 0.30, 0.20];
+var COL_ZAP = [0.65, 0.85, 1.0];        /* force-lightning arc sparks */
+var COL_CLASH = [1.0, 0.50, 0.25];      /* sith blade landing on the hero */
+var COL_SPAWN = [0.80, 0.85, 0.95];     /* trooper reinforcement shimmer */
 
 /* ============================== swing defs ==========================
  * Same shape 50_sabers.js authors (rig.playSwing contract): keyframed
@@ -402,14 +406,16 @@ function makeBot(variant){
     errLat: 0, errUp: 0,
     aimBlend: 0, recoil: 0, flashT: 0,
     aimYaw: 0, aimPitch: 0, aimYaw0: 0, aimPitch0: 0,
+    gunYaw: 0, gunPitch: 0,
     rifleX: 0, rifleY: 0, rifleZ: 0,
     muzX: 0, muzY: 0, muzZ: 0,
+    drewAt: -99,
     /* --- sith --- */
     comboLeft: 0, swingHit: false, hitCd: 0, defIdx: 0,
     chargeCd: 0, leapCd: 0, pushCd: 0, orbit: 1, flipCd: 0,
     /* --- misc --- */
     cheapAcc: 0, avoidT: 0, avoidSide: 1, stuckT: 0, lastX: 0, lastZ: 0,
-    sparkT: 0, dieDir: 1
+    sparkAt: -99, jitAt: -99, dieDir: 1
   };
   var pal = variant === 'trooper' ? PAL_TROOPER
           : (variant === 'elite' ? PAL_ELITE : PAL_SITH);
@@ -438,11 +444,17 @@ function resetBot(b, x, z){
   b.orbit = rnd() < 0.5 ? -1 : 1;
   b.flipCd = rrange(1.5, 3.0);
   b.cheapAcc = 0; b.avoidT = 0; b.stuckT = 0;
-  b.lastX = x; b.lastZ = z; b.sparkT = 0;
+  b.lastX = x; b.lastZ = z; b.sparkAt = -99; b.jitAt = -99;
   b.speed2D = 0; b.anim = 'idle'; b.dist = 999;
+  /* A recycled record must never claim it is still in the registry: if the
+   * unregister on its previous death could not run, spawnVariant would push a
+   * second reference and the pooled bot would leak into JK.Combat.ents. */
+  b.registered = false;
+  b.drewAt = -99;
   var P = JK.Player;
   b.yaw = P && P.pos ? Math.atan2(-(P.pos[0] - x), -(P.pos[2] - z)) : 0;
   b.aimYaw = b.aimYaw0 = b.yaw; b.aimPitch = b.aimPitch0 = 0;
+  b.gunYaw = b.yaw; b.gunPitch = 0;
   b.rifleX = x; b.rifleY = b.pos[1] + 1.2; b.rifleZ = z;
   b.muzX = b.rifleX; b.muzY = b.rifleY; b.muzZ = b.rifleZ;
   if (b.rig){
@@ -485,10 +497,8 @@ function die(b){
   sparksAt(cx, cy, cz, 12, null);
   snd('botDie', cx, cy, cz, 1);
   if (b.rig && b.rig.setSaber) b.rig.setSaber(null, false);
-  if (b.registered && JK.Combat && JK.Combat.unregister){
-    JK.Combat.unregister(b);
-    b.registered = false;
-  }
+  if (b.registered && JK.Combat && JK.Combat.unregister) JK.Combat.unregister(b);
+  b.registered = false;
   if (b.elite) eliteAlive = false;
   if (JK.game) JK.game.kills = (JK.game.kills || 0) + 1;
   deathT[deathI & 7] = now; deathI++;
@@ -592,8 +602,10 @@ function botForce(kind, dir, power){
     if (p > 0){
       b.hp -= p;
       b.flash = 0.6;
-      b.sparkT -= 0.016;
-      if (b.sparkT <= 0){ b.sparkT = 0.12; sparksAt(cx, cy, cz, 3, null); }
+      /* WALL-CLOCK gate, not a per-call one. onForce carries no dt, so the old
+       * `sparkT -= 0.016` was a frame counter: measured 7.5 choke sparks/s at
+       * 60 fps against 2.5/s at 20 fps for the same channel. */
+      if (now - b.sparkAt >= 0.12){ b.sparkAt = now; sparksAt(cx, cy, cz, 3, null); }
       if (b.hp <= 0){ die(b); return; }
     }
     return;
@@ -614,11 +626,7 @@ function botForce(kind, dir, power){
     if (p > 0){
       b.hp -= p;
       b.flash = 1;
-      b.sparkT -= 0.016;
-      if (b.sparkT <= 0){
-        b.sparkT = 0.09;
-        sparksAt(cx, cy, cz, 3, [0.65, 0.85, 1.0]);
-      }
+      if (now - b.sparkAt >= 0.09){ b.sparkAt = now; sparksAt(cx, cy, cz, 3, COL_ZAP); }
       if (b.hp <= 0){ die(b); return; }
     }
     if (!isDown(b)){
@@ -626,9 +634,16 @@ function botForce(kind, dir, power){
       setState(b, 'STAGGER');
       b.stT = -0.12;                        /* refreshed while channelled */
     }
-    /* jitter: they judder in place under the arc */
-    b.vel[0] += (rnd() - 0.5) * 1.6;
-    b.vel[2] += (rnd() - 0.5) * 1.6;
+    /* Jitter: they judder in place under the arc. Also wall-clock gated — as a
+     * raw per-call impulse this was a random walk whose step count scaled with
+     * the framerate: measured mean judder speed 1.14 m/s at 60 fps against
+     * 0.24 m/s at 20 fps, i.e. the same power looked five times angrier on a
+     * fast phone. */
+    if (now - b.jitAt >= 0.05){
+      b.jitAt = now;
+      b.vel[0] += (rnd() - 0.5) * 1.6;
+      b.vel[2] += (rnd() - 0.5) * 1.6;
+    }
     return;
   }
 }
@@ -1075,7 +1090,7 @@ function sithMelee(b, hx, hy, hz){
   b.hitCd = SI_HIT_CD;
   var nx = l > 1e-4 ? dx / l : fx, nz = l > 1e-4 ? dz / l : fz;
   hurtHero(b.elite ? SI_DMG_ELITE : SI_DMG, nx, 0.35, nz, 'saber');
-  sparksAt(hx, hy + 0.9, hz, 16, [1.0, 0.5, 0.25]);
+  sparksAt(hx, hy + 0.9, hz, 16, COL_CLASH);
   snd('clash', hx, hy + 1.0, hz, 0.9);
 }
 
@@ -1187,6 +1202,20 @@ function sithAI(b, dt, t, hx, hy, hz){
       var px = hx - b.pos[0], pz = hz - b.pos[2];
       var pl = Math.sqrt(px * px + pz * pz) || 1;
       px /= pl; pz /= pl;
+      /* RANGE IS RE-CHECKED HERE, at the moment of the shove — not only when
+       * FPUSH was entered 0.45 s ago. Two ways the hero gets out of reach in
+       * between: he sprints (Force Speed moves him ~7 m in the telegraph), or
+       * he leaves the 60 m full-AI radius entirely, which FREEZES this bot
+       * mid-telegraph until he comes back — and the push then landed from
+       * wherever the bot happened to be. Measured in the real build: 9 damage
+       * plus the full 'force' knockback delivered from 60.0 m through a dune,
+       * off-screen. FPUSH_MAX gives the intended 9.5 m entry range a little
+       * slack for an honest chase and nothing more. */
+      if (b.dist > FPUSH_MAX){
+        snd('forceFail', b.pos[0], b.pos[1] + 1.3, b.pos[2], 0.6);
+        setState(b, 'STALK');
+        return;
+      }
       if (heroAttackable()){
         hurtHero(9, px, 0.6, pz, 'force');
         var F = JK.ForceFx;
@@ -1426,17 +1455,38 @@ function updateRifle(b, dt, t){
   var fx = -Math.sin(b.yaw), fz = -Math.cos(b.yaw);
   var rx = -fz, rz = fx;                          /* right = fwd x up */
 
-  /* hand point: the rig publishes blades[0].base every draw (valid even with
-   * the saber off), so the rifle rides the animated hand. Sanity-check it and
-   * fall back to a shoulder-relative offset if it is nonsense. */
+  /* hand point + hand FRAME: the rig publishes blades[0].base every draw (valid
+   * even with the saber off) and blades[0].tip-base is the hand's own axis —
+   * that pair is the hand frame the contract points at. Only trust it if this
+   * bot's rig was actually drawn on the previous frame: distant bots go out as
+   * one impostor mesh and off-camera bots are culled, and in both cases the
+   * blade entry stops being refreshed, so a stale hand up to 1.5 m behind the
+   * bot passed the old sanity box and dragged the muzzle with it. */
+  var fresh = (now - b.drewAt) < 0.2;
   var hx = b.pos[0] + rx * 0.30 + fx * 0.10;
   var hy = b.pos[1] + 1.05;
   var hz = b.pos[2] + rz * 0.30 + fz * 0.10;
-  var bl = b.rig && b.rig.blades && b.rig.blades[0];
+  var carryYaw = b.yaw, carryPitch = -0.10;
+  var bl = fresh && b.rig && b.rig.blades && b.rig.blades[0];
   if (bl && bl.base){
     var qx = bl.base[0] - b.pos[0], qy = bl.base[1] - b.pos[1], qz = bl.base[2] - b.pos[2];
     if (qy > 0.15 && qy < 2.4 && qx * qx + qz * qz < 2.25){
       hx = bl.base[0]; hy = bl.base[1]; hz = bl.base[2];
+      /* barrel along the hand's axis while NOT aiming. Without this the rifle
+       * kept the world-space aim angles no matter what the body did, so a
+       * trooper knocked flat on his back by a Force Push left his carbine
+       * hovering dead level in the air above him — clearly visible from 5 m. */
+      if (bl.tip){
+        var ux = bl.tip[0] - bl.base[0], uy = bl.tip[1] - bl.base[1], uz = bl.tip[2] - bl.base[2];
+        var ul = Math.sqrt(ux * ux + uy * uy + uz * uz);
+        if (ul > 1e-3){
+          ux /= ul; uy /= ul; uz /= ul;
+          if (ux * ux + uz * uz > 1e-6){
+            carryYaw = Math.atan2(-ux, -uz);
+            carryPitch = Math.asin(clamp(uy, -1, 1)) - 0.55;   /* muzzle down off the blade axis */
+          }
+        }
+      }
     }
   }
   /* shouldered aiming pose */
@@ -1485,6 +1535,13 @@ function updateRifle(b, dt, t){
   b.muzX = b.rifleX - Math.sin(b.aimYaw) * cp * RIFLE_MUZZLE;
   b.muzY = b.rifleY + Math.sin(b.aimPitch) * RIFLE_MUZZLE;
   b.muzZ = b.rifleZ - Math.cos(b.aimYaw) * cp * RIFLE_MUZZLE;
+
+  /* What the RIFLE MESH is drawn with: the shouldered aim when he is aiming,
+   * the hand's own frame when he is not (running, tripped, choking in a grip,
+   * flat on his back). aimBlend is already 1 in every firing state, so the
+   * barrel and the bolt still leave along exactly the same line. */
+  b.gunYaw = wrapPi(carryYaw + wrapPi(b.aimYaw - carryYaw) * w);
+  b.gunPitch = carryPitch + (b.aimPitch - carryPitch) * w;
 }
 
 /* ============================== spawning ============================ */
@@ -1530,7 +1587,7 @@ function spawnVariant(variant, x, z){
   var F = JK.Fx;
   if (F && F.shimmer){
     FX3[0] = x; FX3[1] = b.pos[1] + 1.0; FX3[2] = z;
-    F.shimmer(FX3, 10, b.kind === 'sith' ? COL_SITH_FX : [0.8, 0.85, 0.95]);
+    F.shimmer(FX3, 10, b.kind === 'sith' ? COL_SITH_FX : COL_SPAWN);
   }
   return b;
 }
@@ -1608,8 +1665,8 @@ function drawRifleAt(b){
   if (!rifleMesh) return;
   M.ident(MTX);
   M.tr(MTX, b.rifleX, b.rifleY, b.rifleZ);
-  M.ry(MTX, b.aimYaw);
-  M.rx(MTX, b.aimPitch);
+  M.ry(MTX, b.gunYaw);
+  M.rx(MTX, b.gunPitch);
   M.tr(MTX, 0, 0, b.recoil * 0.11);
   JK.GL.draw(rifleMesh, MTX, PLAIN);
   if (b.flashT > 0 && flashMesh){
@@ -1741,6 +1798,7 @@ var Bots = JK.Bots = {
         }
       }
       b.rig.draw(b.pos, b.yaw);
+      b.drewAt = now;            /* blades[0] is fresh for next frame's rifle */
       if (b.kind === 'trooper' && b.state !== 'DEAD'){
         if (b.hasRifle) drawRifleAt(b);
         else drawDroppedRifle(b);

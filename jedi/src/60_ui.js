@@ -121,7 +121,25 @@ var CSS = [
 '.jku-flash { display:inline-block; opacity:0; }',
 '.jku-flash.on { animation:jkuFade .9s ease-out forwards; }',
 '@keyframes jkuFade { 0% { opacity:1; transform:translateY(0); }',
-'  60% { opacity:.95; } 100% { opacity:0; transform:translateY(-8px); } }'
+'  60% { opacity:.95; } 100% { opacity:0; transform:translateY(-8px); } }',
+/* SHORT VIEWPORT (any iPhone in landscape: 390 or 375 CSS px tall).
+   The panel wants 357 px; anchored at top:102 it only got 272, and the 89 px
+   that overflowed held the BLUE slider. overflow-y:auto did not save it —
+   measured on a 120 px touch drag, scrollTop stayed 0, because the page sets
+   touch-action:none on body and the panel's own handlers swallow touchmove.
+   So make it FIT instead of scroll: dock it beside the SABER button (which
+   must stay tappable to close the panel) and tighten the vertical rhythm. */
+'@media (max-height: 470px) {',
+'  #jkuPanel { top:calc(6px + env(safe-area-inset-top));',
+'    left:calc(76px + env(safe-area-inset-left)); width:286px;',
+'    max-height:calc(100vh - 14px - env(safe-area-inset-top) - env(safe-area-inset-bottom));',
+'    padding:7px 9px 8px; }',
+'  .jku-h { margin:0 0 5px; padding-bottom:4px; }',
+'  .jku-sec { margin:5px 0 3px; }',
+'  .jku-sw { width:36px; height:36px; margin:0 5px 4px 0; }',
+'  .jku-type { height:38px; line-height:34px; }',
+'  #jkuPrev { height:18px; margin-top:5px; }',
+'}'
 ].join('\n');
 
 /* ---------------- tiny DOM helpers ---------------- */

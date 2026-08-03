@@ -132,6 +132,33 @@ function bakedBox(sx, sy, sz, r, g, b, x, y, z){
   M.ident(TB); M.tr(TB, x, y, z);
   return JK.Geo.tf(JK.Geo.box(sx, sy, sz, r, g, b), TB);
 }
+/* Flat contact-shadow disc: centre + an inner ring held at the dark colour +
+   an outer ring painted the LIT SAND colour, so gouraud interpolation fades the
+   rim into the ground and the blob has no visible edge. The core shader has no
+   alpha blending for opaque geometry, so the gradient has to live in the vertex
+   colours; measured sand under the character reads (0.75, 0.54, 0.28). */
+function bakedDisc(rad, segs, cr, cg, cb, er, eg, eb){
+  var P = [0, 0, 0], N = [0, 1, 0], C = [cr, cg, cb], I = [];
+  var inner = rad * 0.44, i, a;
+  for (i = 0; i < segs; i++){                       /* ring 1: still dark */
+    a = i / segs * TWO_PI;
+    P.push(Math.cos(a) * inner, 0, Math.sin(a) * inner);
+    N.push(0, 1, 0); C.push(cr, cg, cb);
+  }
+  for (i = 0; i < segs; i++){                       /* ring 2: sand, invisible */
+    a = i / segs * TWO_PI;
+    P.push(Math.cos(a) * rad, 0, Math.sin(a) * rad);
+    N.push(0, 1, 0); C.push(er, eg, eb);
+  }
+  for (i = 0; i < segs; i++){
+    var n = (i + 1) % segs;
+    I.push(0, 1 + i, 1 + n);                                        /* fan  */
+    I.push(1 + i, 1 + segs + i, 1 + segs + n);                      /* skirt */
+    I.push(1 + i, 1 + segs + n, 1 + n);
+  }
+  return { pos: new Float32Array(P), nrm: new Float32Array(N),
+           col: new Float32Array(C), idx: new Uint16Array(I) };
+}
 /* one blade = core + two additive glow shells, baked along +/-Y of hand frame */
 function bladeSet(base, sgn){
   var GL = JK.GL, mid = base + BLADE_LEN / 2;
@@ -174,10 +201,11 @@ function buildMeshes(){
     blade:  bladeSet(HILT_TOP, 1),   /* single / dual (from a hand hilt)  */
     bladeU: bladeSet(STAFF_TOP, 1),  /* staff up-blade                    */
     bladeD: bladeSet(STAFF_TOP, -1), /* staff down-blade                  */
-    /* shadow: emissive dark-sand patch (core shader only blends in additive
-       mode, so a thin "pre-shaded" opaque box reads as a shadow with zero
-       core edits). */
-    shadow: GL.mesh(bakedBox(0.95, 0.02, 1.05, 0.33, 0.25, 0.155, 0, 0, 0))
+    /* shadow: emissive pre-shaded patch (core shader only blends in additive
+       mode, so an opaque "pre-shaded" patch reads as a shadow with zero core
+       edits). A ROUND blob that fades into the sand at the rim — the old
+       hard-edged box read as a hole cut in the ground. */
+    shadow: GL.mesh(bakedDisc(0.62, 14, 0.405, 0.290, 0.150, 0.753, 0.537, 0.278))
   };
 }
 var CORE_OPTS = { emissive: 1, nofog: true };

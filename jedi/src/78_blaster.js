@@ -47,7 +47,12 @@
  * ONE-FRAME NOTE: JK.Rig.blades are refreshed during Rig.DRAW, so at update
  * time they hold the previous frame's pose (~16 ms, ~1 m of bolt travel). The
  * deflection radius is deliberately generous to swallow that lag — a lit saber
- * anywhere near the bolt's path sends it back, which is the fun answer.
+ * anywhere near the bolt's path sends it back, which is the fun answer. The one
+ * thing it will NOT do is save a shot the body already ate: the parry and the
+ * hero's own capsule are raced on ENTRY distance along the bolt's path, so the
+ * verdict is pure geometry rather than a function of the substep grid. See the
+ * race note on tryDeflect — getting that wrong made the same shot bounce or
+ * land depending on the frame rate.
  *
  * Zero per-frame allocations: the pool, all scratch vectors, matrices and draw
  * option objects live at module scope. JK.GL.mesh is STATIC_DRAW — ONE unit
@@ -80,12 +85,24 @@ var SUB_LEN     = 0.85;     /* m of travel per substep we aim for */
 
 var DEFL_R      = 0.46;     /* m, blade-to-bolt distance that deflects */
 var DEFL_R_SW   = 0.68;     /* m, while actually swinging — very generous */
-var DEFL_LOOK   = 0.75;     /* m, the parry test peeks this far down the bolt's
-                             * path. Without it a bolt aimed at the chest clips
-                             * the hero's 0.55 m capsule BEFORE it comes within
-                             * blade radius, and the body eats a shot the saber
-                             * was clearly in position to take. The saber gets
-                             * the last word — that is the whole fantasy. */
+var DEFL_LOOK   = 0.75;     /* m, the head start the saber gets over the hero's
+                             * own hitbox. Without it a bolt aimed at the chest
+                             * can clip the 0.55 m capsule BEFORE it comes
+                             * within blade radius, and the body eats a shot the
+                             * saber was clearly in position to take. The saber
+                             * gets the last word — that is the whole fantasy.
+                             * It is a budget measured between the two ENTRY
+                             * points, not a licence to parry past the body:
+                             * see the race note on tryDeflect. */
+var PROBE_PAD   = 0.80;     /* m of probe beyond DEFL_LOOK. entryDist() reads
+                             * the solvers' closest-approach parameter, which is
+                             * up to one radius (max DEFL_R_SW = 0.68) past the
+                             * entry; padding the probe by more than that keeps
+                             * that parameter off the segment's clamped end, so
+                             * the entry distances stay exact — and therefore
+                             * substep-phase independent — inside the window we
+                             * actually act on. */
+var DEFL_PROBE  = DEFL_LOOK + PROBE_PAD;
 var DEFL_NEAR   = 4.2;      /* m, coarse reject around the player's chest */
 var BLADE_NEAR  = 3.0;      /* m, sanity: ignore blades far from the player */
 var DEFL_DMG    = 14;       /* deflected bolts hit harder (contract) */
@@ -354,11 +371,12 @@ function aimAtEnemy(x, y, z){
   return true;
 }
 
-/* Contact happened: bolt point (segS along the tested segment) vs blade point
- * (segT). Flip team, recolor, retarget — or mirror off the blade if there is
- * nothing worth hitting. `frac` is how much of the tested segment the bolt
- * actually covers this substep (< 1 when the contact is in the look-ahead
- * zone); the bolt is never teleported past where it truly is. */
+/* Contact happened: bolt point (segS along the probe, the ENTRY point) vs blade
+ * point (segT). Flip team, recolor, retarget — or mirror off the blade if there
+ * is nothing worth hitting; entry sits exactly one blade radius off the blade,
+ * so that mirror normal is always well conditioned. `frac` is how much of the
+ * probe the bolt actually covers this substep (< 1 whenever the contact is in
+ * the look-ahead zone); the bolt is never teleported past where it truly is. */
 function doDeflect(b, ax, ay, az, bx, by, bz, bl, frac){
   var px = ax + (bx - ax) * segS;
   var py = ay + (by - ay) * segS;
@@ -417,32 +435,86 @@ function doDeflect(b, ax, ay, az, bx, by, bz, bl, frac){
   snd('deflect', qx, qy, qz, 1);
 }
 
-/* Test one bolt substep segment (already extended by DEFL_LOOK) against every
- * blade of the player's saber. `frac` = the real portion of that segment. */
+/* Where the bolt's path ENTERS a swollen target, in metres along the probe,
+ * given the closest approach a solver just measured: a ray enters one chord
+ * half-length before its closest point. The closest point is not the contact —
+ * and, crucially, the DIFFERENCE of two entry distances is a property of the
+ * ray alone, so a comparison built on it answers the same at every frame rate
+ * and every substep phase. `d2`/`r2` are squared distance and squared radius. */
+function entryDist(s, len, r2, d2){
+  var k = r2 - d2;
+  return s * len - (k > 0 ? Math.sqrt(k) : 0);
+}
+
+/* Where the bolt's path enters the HERO's own capsule (1e9 when it misses him).
+ * Exactly the capsule hitEnts uses, so the parry and the impact agree on where
+ * the body is. Leaves its result in segS — call it BEFORE the blade loop. */
+function heroEntry(ax, ay, az, dx, dy, dz, len){
+  var e = JK.Hero && JK.Hero.ent;               /* optional sibling */
+  if (!e || !e.pos || e.hp <= 0) return 1e9;
+  var rr = (e.radius || 0.55) + BOLT_R;
+  rr *= rr;
+  var d2 = segCapDistSq(ax, ay, az, dx, dy, dz,
+                        e.pos[0], e.pos[1], e.pos[1] + (e.height || 1.8), e.pos[2]);
+  if (d2 > rr) return 1e9;
+  return entryDist(segS, len, rr, d2);
+}
+
+/* Test one bolt substep against every blade of the player's saber. The segment
+ * handed in is the substep extended by DEFL_PROBE; `frac` is the real portion
+ * of it, so frac*len is the bolt's actual travel this substep.
+ *
+ * THE PARRY/BODY RACE. Both the blade and the hero's own capsule can sit on
+ * this path, and "run the parry first, over a longer segment" is NOT the same
+ * question as "which one does the bolt reach first". It made the outcome hinge
+ * on whether each contact happened to fall inside the current substep, so the
+ * substep GRID decided who won. Measured on a bolt fired from directly behind
+ * the player — which must pass clean through him before any blade held in
+ * front can be reached, so the body must always win — the parry fired on 68%
+ * of spawn phases at 60 fps, 75% at 30 fps and 78% at 20 fps, and at a FIXED
+ * 60 fps it flipped between parried and eaten as the spawn moved by 7 cm.
+ *
+ * Decide on ENTRY distance instead: the saber wins when it meets the bolt no
+ * more than DEFL_LOOK metres after the body would have, which is exactly what
+ * DEFL_LOOK was always meant to buy. Both entries are ray properties, so the
+ * verdict is identical at every frame rate and every phase; and because the
+ * accepted case always clears the parry's reach threshold at least as early as
+ * the body clears the entity test, the parry still gets there first. A bolt
+ * that has already gone through the player can no longer be saved by a blade
+ * on the far side of him. */
 function tryDeflect(b, ax, ay, az, bx, by, bz, frac){
   if (!saberLit()) return false;
   var P = JK.Player;
   if (!P || !P.pos) return false;
+  var dx = bx - ax, dy = by - ay, dz = bz - az;
+  var len = Math.sqrt(dx * dx + dy * dy + dz * dz);
   var cx = P.pos[0], cy = P.pos[1] + 1.10, cz = P.pos[2];
+  /* coarse reject: no point of the probe is within DEFL_NEAR of the chest */
   var mx = (ax + bx) * 0.5 - cx, my = (ay + by) * 0.5 - cy, mz = (az + bz) * 0.5 - cz;
-  if (mx * mx + my * my + mz * mz > DEFL_NEAR * DEFL_NEAR) return false;
+  var mr = DEFL_NEAR + len * 0.5;
+  if (mx * mx + my * my + mz * mz > mr * mr) return false;
+
+  var hIn = heroEntry(ax, ay, az, dx, dy, dz, len);
+  var reach = frac * len + DEFL_LOOK;     /* this substep's travel + head start */
 
   var blades = JK.Rig.blades;
   var rad = swinging() ? DEFL_R_SW : DEFL_R;
   var rr = rad * rad;
-  for (var i = 0; i < blades.length; i++){
+  var bestIn = 1e9, bestT = 0, best = null, i, d2, en;
+  for (i = 0; i < blades.length; i++){
     var bl = blades[i];
     if (!bl || !bl.base || !bl.tip) continue;
     /* sanity: blades are filled in during Rig.draw — before the first draw they
        are still at the world origin. Only trust blades held near the player. */
     var hx = bl.base[0] - cx, hy = bl.base[1] - cy, hz = bl.base[2] - cz;
     if (hx * hx + hy * hy + hz * hz > BLADE_NEAR * BLADE_NEAR) continue;
-    if (segSegDistSq(ax, ay, az, bx, by, bz,
-                     bl.base[0], bl.base[1], bl.base[2],
-                     bl.tip[0], bl.tip[1], bl.tip[2]) <= rr){
-      doDeflect(b, ax, ay, az, bx, by, bz, bl, frac);
-      return true;
-    }
+    d2 = segSegDistSq(ax, ay, az, bx, by, bz,
+                      bl.base[0], bl.base[1], bl.base[2],
+                      bl.tip[0], bl.tip[1], bl.tip[2]);
+    if (d2 > rr) continue;
+    en = entryDist(segS, len, rr, d2);
+    /* earliest contact wins, not the first entry of a dual/staff pair */
+    if (en < bestIn){ bestIn = en; bestT = segT; best = bl; }
   }
 
   /* A swinging blade crosses metres between frames, and JK.Rig.blades only
@@ -450,21 +522,32 @@ function tryDeflect(b, ax, ay, az, bx, by, bz, frac){
    * (prev base/tip -> cur base/tip) while a swing is damage-active, so test the
    * PREVIOUS blade position too — the parry window covers the whole arc. */
   var S = JK.Sabers;
-  if (rad === DEFL_R_SW && S && S.sweeps){
+  if (!best && rad === DEFL_R_SW && S && S.sweeps){
     for (i = 0; i < S.sweeps.length; i++){
       var sw = S.sweeps[i];
       if (!sw || !sw.pb || !sw.pt) continue;
-      if (segSegDistSq(ax, ay, az, bx, by, bz,
-                       sw.pb[0], sw.pb[1], sw.pb[2],
-                       sw.pt[0], sw.pt[1], sw.pt[2]) <= rr){
+      d2 = segSegDistSq(ax, ay, az, bx, by, bz,
+                        sw.pb[0], sw.pb[1], sw.pb[2],
+                        sw.pt[0], sw.pt[1], sw.pt[2]);
+      if (d2 > rr) continue;
+      en = entryDist(segS, len, rr, d2);
+      if (en < bestIn){
+        bestIn = en; bestT = segT;
         SWB.base[0] = sw.pb[0]; SWB.base[1] = sw.pb[1]; SWB.base[2] = sw.pb[2];
         SWB.tip[0] = sw.pt[0]; SWB.tip[1] = sw.pt[1]; SWB.tip[2] = sw.pt[2];
-        doDeflect(b, ax, ay, az, bx, by, bz, SWB, frac);
-        return true;
+        best = SWB;
       }
     }
   }
-  return false;
+
+  if (!best) return false;
+  if (bestIn > reach) return false;             /* the blade is not there yet */
+  if (bestIn > hIn + DEFL_LOOK) return false;   /* the body got there first */
+  /* stash the contact for doDeflect: the bolt stops where it MEETS the blade */
+  segS = (len > 1e-6 && bestIn > 0) ? bestIn / len : 0;
+  segT = bestT;
+  doDeflect(b, ax, ay, az, bx, by, bz, best, frac);
+  return true;
 }
 
 /* ============================== impacts ============================= */
@@ -474,6 +557,7 @@ function hitEnts(b, ax, ay, az, bx, by, bz){
   var ents = C.ents;
   var dx = bx - ax, dy = by - ay, dz = bz - az;
   var segLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  var best = null, bestS = 2;
   for (var i = 0; i < ents.length; i++){
     var e = ents[i];
     if (!e || !e.pos || e.team === b.team || e.hp <= 0 || e === b.owner) continue;
@@ -485,18 +569,24 @@ function hitEnts(b, ax, ay, az, bx, by, bz){
     var fx = ecx - ax, fy = ecy - ay, fz = ecz - az;
     if (fx * fx + fy * fy + fz * fz > reach * reach) continue;
     if (segCapDistSq(ax, ay, az, dx, dy, dz, ecx, e.pos[1], e.pos[1] + eh, ecz) > rr * rr) continue;
-
-    var px = ax + dx * segS, py = ay + dy * segS, pz = az + dz * segS;
-    var vl = Math.sqrt(b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]) || 1;
-    DIRV[0] = b.vel[0] / vl; DIRV[1] = b.vel[1] / vl; DIRV[2] = b.vel[2] / vl;
-    b.pos[0] = px; b.pos[1] = py; b.pos[2] = pz;
-    Blaster.stats.hits++;
-    sparks(px, py, pz, b.deflected ? 14 : 10, b.color);
-    snd('boltHit', px, py, pz, 1);
-    if (typeof e.onHit === 'function') e.onHit(b.dmg, DIRV, 'bolt', b.pos);
-    return true;
+    /* Two capsules can share one substep (bots keep only 1.6 m of separation
+     * and a substep spans ~0.85 m plus both radii). The bolt must stop at the
+     * one it reaches FIRST, not at whichever sits earlier in the registry —
+     * that order shuffles every time unregister() swaps in the last entry. */
+    if (segS < bestS){ bestS = segS; best = e; }
   }
-  return false;
+  if (!best) return false;
+
+  var px = ax + dx * bestS, py = ay + dy * bestS, pz = az + dz * bestS;
+  var vl = Math.sqrt(b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]) || 1;
+  DIRV[0] = b.vel[0] / vl; DIRV[1] = b.vel[1] / vl; DIRV[2] = b.vel[2] / vl;
+  b.pos[0] = px; b.pos[1] = py; b.pos[2] = pz;
+  Blaster.stats.hits++;
+  sparks(px, py, pz, b.deflected ? 14 : 10, b.color);
+  snd('boltHit', px, py, pz, 1);
+  /* onHit last: a bot may die and unregister, which mutates ents underneath us */
+  if (typeof best.onHit === 'function') best.onHit(b.dmg, DIRV, 'bolt', b.pos);
+  return true;
 }
 
 function hitGround(b, bx, by, bz){
@@ -523,14 +613,15 @@ function stepBolt(b, dt){
     /* velocity can change mid-loop (deflection) — always re-read it */
     var bx = ax + b.vel[0] * sdt, by = ay + b.vel[1] * sdt, bz = az + b.vel[2] * sdt;
 
-    /* Parry first, and peek DEFL_LOOK metres further down the path so the blade
-     * beats the hero's own hitbox to a chest shot. `frac` keeps the bolt from
-     * being teleported into the look-ahead zone. */
+    /* Parry first, probing DEFL_PROBE metres further down the path so the blade
+     * can beat the hero's own hitbox to a chest shot. tryDeflect only ACTS on
+     * the first DEFL_LOOK of that; the rest is headroom for its entry-distance
+     * maths. `frac` keeps the bolt from being teleported into the probe zone. */
     if (b.team !== 'player' && !b.deflected){
       var sl = Math.sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay) + (bz - az) * (bz - az));
       var ex = bx, ey = by, ez = bz, frac = 1;
       if (sl > 1e-6){
-        var k = (sl + DEFL_LOOK) / sl;
+        var k = (sl + DEFL_PROBE) / sl;
         ex = ax + (bx - ax) * k; ey = ay + (by - ay) * k; ez = az + (bz - az) * k;
         frac = 1 / k;
       }
