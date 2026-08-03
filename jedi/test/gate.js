@@ -163,17 +163,25 @@ async function benchmark(){
     d && d.strafeLeft ? 'align ' + d.strafeLeft.alignDeg + 'deg in ' +
       d.strafeLeft.alignSeconds + 's, drift ' + d.strafeLeft.headingDriftDeg : '');
 
-  var swingPass = 0, swingWorst = '';
-  for (var s = 0; s < 3; s++){
-    for (var dir = 0; dir < 4; dir++){
-      var rr = runNode('swing_probe.js', [path.join(OUT, 'sw' + s + dir), s, dir, HTML]);
-      var dd = json(rr.out);
-      if (rr.code === 0) swingPass++;
-      else if (dd) swingWorst += ' ' + (dd.attack || (s + '/' + dir));
+  /* All 36: 12 attacks x 3 saber types. Testing only the default single saber is
+   * how 8 of 12 STAFF attacks read backwards for a whole iteration unnoticed. */
+  var TYPES = ['single', 'dual', 'staff'];
+  var swingPass = 0, swingTotal = 0, perType = [];
+  for (var ti = 0; ti < TYPES.length; ti++){
+    var tPass = 0, worst = '';
+    for (var s = 0; s < 3; s++){
+      for (var dir = 0; dir < 4; dir++){
+        var rr = runNode('swing_probe.js',
+          [path.join(OUT, 'sw_' + TYPES[ti] + s + dir), s, dir, HTML, TYPES[ti]]);
+        var dd = json(rr.out);
+        swingTotal++;
+        if (rr.code === 0){ tPass++; swingPass++; }
+        else if (dd) worst += ' ' + (dd.attack || (s + '/' + dir));
+      }
     }
+    perType.push(TYPES[ti] + ' ' + tPass + '/12' + (worst ? ' (' + worst.trim() + ')' : ''));
   }
-  record('12 saber swing arcs', swingPass === 12,
-    swingPass + '/12 pass' + (swingWorst ? ' — failing:' + swingWorst : ''));
+  record('36 swing arcs (3 types)', swingPass === swingTotal, perType.join(', '));
 
   var b = await benchmark();
   var p = b.perf;
