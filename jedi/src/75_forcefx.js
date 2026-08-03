@@ -22,7 +22,8 @@
  *     STATIC_DRAW, so nothing is ever rebuilt: every instance is placed with a
  *     model matrix written into module-scope scratch.
  *   - Zero allocation per frame. Pools are preallocated with hard caps:
- *     4 waves x 16 shards, 4 arcs x 9 links (+1 fork), 2 grips, 14 ghosts.
+ *     4 waves x 16 shards, 4 arcs x 9 links (+1-2 forks), 2 grips, 14 ghosts.
+ *     Ghosts are spent on DISTANCE as well as time — see GHOST_MIN_D.
  *   - Everything draws additive + emissive + nofog, so the sand can occlude it
  *     but the fog can never grey it out. A final degenerate opaque draw restores
  *     depthMask(true) — additive draws leave it off and the next frame's depth
@@ -79,6 +80,17 @@ var GHOSTS     = 14;     /* speed after-image ring buffer slots */
 var GHOST_DT   = 0.042;  /* s between samples */
 var GHOST_LIFE = 0.34;   /* s a sample stays visible */
 var SPEED_TAIL = 0.30;   /* s of trailing ghosts after speed ends */
+/* An after-image is a MOTION streak: it only means anything where the player
+ * HAS BEEN. Sampling on a timer alone stacked every live slot on one spot the
+ * moment he stood still (or crept along on a half-pushed stick) and the ~6
+ * overlapping additive silhouettes erased the character — measured on the
+ * torso: rgb(122,84,44) -> rgb(185,191,173), luminance 91 -> 187, hue gone.
+ * So: a sample also costs DISTANCE, and any ghost still sitting on top of the
+ * player fades out instead of adding to him. Sprinting (14 m/s => 0.7 m per
+ * sample) is untouched — the trail is entirely behind him at that spacing. */
+var GHOST_MIN_D = 0.26;  /* m the player must travel to earn a new sample */
+var GHOST_NEAR  = 0.24;  /* m from the player: ghost fully suppressed */
+var GHOST_FAR   = 0.52;  /* m from the player: ghost at full strength */
 
 /* pale blue-white palette — the Force is cold and bright */
 var C_HOT  = [1.00, 1.00, 1.00];
@@ -146,6 +158,7 @@ var arcCursor = 0;             /* reset every update; one slot per call, in orde
 var gPos = new Float32Array(GHOSTS * 4);
 var gT   = new Float32Array(GHOSTS);
 var gHead = 0, gLast = -9;
+var gLx = 0, gLy = 0, gLz = 0, gHave = false;   /* last SAMPLED position */
 var speedOn = false, speedOffT = -9;
 
 /* ====================== matrix / basis helpers ====================== */
@@ -281,7 +294,10 @@ function spawnRing(kind, o, d){
   r.ox = o ? o[0] : 0; r.oy = o ? o[1] : 1.2; r.oz = o ? o[2] : 0;
   var dx = d ? d[0] : 0, dy = d ? d[1] : 0, dz = d ? d[2] : -1;
   var l = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  if (l < 1e-5){ dx = 0; dy = 0; dz = -1; l = 1; }
+  /* `!(l > 1e-5)` not `l < 1e-5`: a NaN component makes l NaN, and NaN fails
+   * EVERY `<` test, so the old form fell through and normalised NaN/NaN into
+   * the wave basis. Both degenerate cases now land on the default forward. */
+  if (!(l > 1e-5)){ dx = 0; dy = 0; dz = -1; l = 1; }
   r.dx = dx / l; r.dy = dy / l; r.dz = dz / l;
   frame(r.dx, r.dy, r.dz);                       /* in-plane basis for the disc */
   r.ux = PX[0]; r.uy = PX[1]; r.uz = PX[2];
@@ -443,14 +459,21 @@ function drawArc(arc){
  * aliases itself as .pos, so `p.pos === p` distinguishes the two cleanly. */
 function gripPoint(p, out){
   if (!p) return false;
-  var a = p.pos;
-  if (a && a !== p && a.length >= 3){
-    out[0] = a[0]; out[1] = a[1] + (p.height || 1.8) * 0.55; out[2] = a[2];
-    return true;
+  var a = p.pos, lift = 0;
+  if (a && a !== p && a.length >= 3) lift = (p.height || 1.8) * 0.55;   /* feet -> chest */
+  else {
+    a = a && a.length >= 3 ? a : p;
+    /* `a.length < 3` is NOT the negation of `a.length >= 3`: an object with no
+     * length at all ({pos:null}, a bare entity record) yields undefined, and
+     * `undefined < 3` is FALSE — the old guard let it straight through and every
+     * model matrix built from it came out NaN. Test the positive form. */
+    if (!a || !(a.length >= 3)) return false;
   }
-  a = a && a.length >= 3 ? a : p;
-  if (!a || a.length < 3) return false;
-  out[0] = a[0]; out[1] = a[1]; out[2] = a[2];
+  var x = a[0], y = a[1] + lift, z = a[2];
+  /* one caller-garbage check at the door beats NaN spraying through ~58 model
+   * matrices a frame with no way to tell where it came from */
+  if (!(x > -1e9 && x < 1e9 && y > -1e9 && y < 1e9 && z > -1e9 && z < 1e9)) return false;
+  out[0] = x; out[1] = y; out[2] = z;
   return true;
 }
 
@@ -547,14 +570,23 @@ function setVignette(on){
   if (vig) vig.className = on ? 'on' : '';
 }
 
-function sampleGhost(){
+/* `force` lays one down unconditionally (the frame Force Speed latches on);
+ * otherwise the player must have MOVED since the last one. gLast is only
+ * advanced by a sample that actually happened, so a slow walker gets his ghost
+ * the instant he has covered the distance rather than on the next 42 ms tick. */
+function sampleGhost(force){
   var P = JK.Player;
   if (!P || !P.pos) return;
+  if (!force && gHave){
+    var dx = P.pos[0] - gLx, dy = P.pos[1] - gLy, dz = P.pos[2] - gLz;
+    if (dx * dx + dy * dy + dz * dz < GHOST_MIN_D * GHOST_MIN_D) return;
+  }
   var k = gHead * 4;
   gPos[k] = P.pos[0]; gPos[k + 1] = P.pos[1]; gPos[k + 2] = P.pos[2];
   gPos[k + 3] = P.yaw || 0;
   gT[gHead] = now;
   gHead = (gHead + 1) % GHOSTS;
+  gLx = P.pos[0]; gLy = P.pos[1]; gLz = P.pos[2]; gHave = true;
   gLast = now;
 }
 
@@ -565,12 +597,24 @@ function drawGhosts(){
     if (off > SPEED_TAIL) return;
     fade = 1 - off / SPEED_TAIL;
   }
+  /* current body position, so an after-image sitting ON the player (he stopped,
+   * or curled back through his own trail) fades instead of bleaching him */
+  var P = JK.Player, near = !!(P && P.pos);
+  var px = near ? P.pos[0] : 0, py = near ? P.pos[1] : 0, pz = near ? P.pos[2] : 0;
   for (var i = 0; i < GHOSTS; i++){
     var age = now - gT[i];
     if (age <= 0.03 || age > GHOST_LIFE) continue;    /* skip the newest sample */
     var k = i * 4;
     var s = 1 - age / GHOST_LIFE;
     var a = s * s * 0.30 * fade;
+    if (near){
+      var qx = gPos[k] - px, qy = gPos[k + 1] - py, qz = gPos[k + 2] - pz;
+      var q2 = qx * qx + qy * qy + qz * qz;
+      if (q2 < GHOST_FAR * GHOST_FAR){
+        if (q2 <= GHOST_NEAR * GHOST_NEAR) continue;
+        a *= (Math.sqrt(q2) - GHOST_NEAR) / (GHOST_FAR - GHOST_NEAR);
+      }
+    }
     if (a <= 0.005) continue;
     var y = gPos[k + 3];
     var c = Math.cos(y), sn = Math.sin(y);
@@ -604,7 +648,8 @@ var ForceFx = JK.ForceFx = {
     for (i = 0; i < GRIP_MAX; i++) grips[i].life = 0;
     for (i = 0; i < GHOSTS; i++) gT[i] = -9;
     arcCursor = 0;
-    speedOn = false; ForceFx.speedOn = false; speedOffT = -9; gLast = -9;
+    speedOn = false; ForceFx.speedOn = false; speedOffT = -9;
+    gLast = -9; gHave = false;
     setVignette(false);
   },
 
@@ -677,7 +722,7 @@ var ForceFx = JK.ForceFx = {
     if (on === speedOn) return;
     speedOn = on;
     ForceFx.speedOn = on;
-    if (on){ gLast = -9; sampleGhost(); }
+    if (on){ gLast = -9; gHave = false; sampleGhost(true); }
     else speedOffT = now;
     setVignette(on);
     if (on && JK.Fx && JK.Fx.shimmer && JK.Player && JK.Player.pos)
