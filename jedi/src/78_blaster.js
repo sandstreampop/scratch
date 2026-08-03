@@ -21,7 +21,8 @@
  *
  * Bolt record (preallocated, contract shape):
  *   { pos:Float32Array(3), vel:Float32Array(3), color:Float32Array(3),
- *     life, team, dmg, speed, active, deflected, owner }
+ *     life, team, dmg, speed, active, deflected, owner,
+ *     pop /* s of "just turned around" scale-up left — visual only *\/ }
  *
  * COLLISION: each bolt's frame movement is split into >= 2 substeps (a 58 m/s
  * bolt covers ~1 m per 60 Hz frame, up to 2.9 m on a 0.05 s clamped frame), and
@@ -54,9 +55,43 @@
  * race note on tryDeflect — getting that wrong made the same shot bounce or
  * land depending on the frame rate.
  *
- * Zero per-frame allocations: the pool, all scratch vectors, matrices and draw
- * option objects live at module scope. JK.GL.mesh is STATIC_DRAW — ONE unit
- * cube is built at init and every bolt is placed with a per-draw model matrix.
+ * SELLING THE PARRY. Mechanically the deflection was already excellent (9 of 9
+ * chest shots turned, HP never moved) and visually it was almost invisible:
+ * measured on a frozen still one frame after contact, the whole event changed
+ * 0.11% of the screen — a white smudge on the blade — and the returned bolt was
+ * the same small box as an incoming one, so nobody could tell they had just
+ * parried a blaster shot with a lightsaber. Four additions, all pooled and all
+ * drawn with the ONE shared cube:
+ *   - a PARRY FLASH pool (<=4) pinned to the contact point ON THE BLADE: a
+ *     screen-facing impact diamond, a white-hot core, a saber-coloured halo, two
+ *     chunky crossed spikes and a streak that grows down the return path. 7 boxes
+ *     each for 0.26 s, and only ever while a parry is on screen.
+ *   - deflected bolts are BEEFIER for their whole flight (1.55x cross-section,
+ *     1.22x core length, hotter core tint) plus a 0.13 s scale-up "pop" as they
+ *     leave, so the eye is dragged onto them at the moment they turn.
+ *   - one extra additive WAKE box behind a deflected bolt (+1 box per returned
+ *     bolt) so the return reads as a streak of motion rather than a dot.
+ *   - the same flash again where a RETURNED bolt lands, which is the end of the
+ *     story: flash on the blade -> streak -> fat green bolt -> flash on the
+ *     trooper who fired it.
+ * Measured (frozen still, one frame after contact, 844x390): screen pixels
+ * changed by the whole event went 0.08-0.14% -> 0.41-0.43% for a shot returned
+ * straight down the camera axis (the worst case: everything is foreshortened) and
+ * 0.45% -> 2.02% for one returned across the view. Independently re-measured with
+ * a frozen-world A/B against the identical frame with no bolt in it: 0.40% down
+ * the lens, 0.75% from behind, 0.95% across the view.
+ *
+ * DRAW COST: TWO CALLS, whatever is on screen. Every bolt and every flash is a
+ * box, so they are CPU-transformed into two shared vertex buffers — one opaque
+ * (the cores, which must write depth) and one additive (shells, wakes, flashes) —
+ * and go out as two drawElements per frame. It used to be 3 calls per bolt plus 7
+ * per flash plus a state-restore draw: a parried 3-round burst cost 34 and a
+ * 20-bolt salvo 81, against a 200-call whole-game budget. See the batching note
+ * above emitBox; the pixels are identical, not merely similar, and a frozen-frame
+ * A/B against the per-box path measures 0 of 329160 pixels different.
+ *
+ * Zero per-frame allocations: the pool, all scratch vectors, matrices, batches
+ * and draw option objects live at module scope.
  */
 (function(){
 'use strict';
@@ -123,9 +158,43 @@ var REPEL_SPRD  = 0.10;     /* rad, scatter of a repelled volley */
 var COL_ENEMY   = [1.00, 0.188, 0.125];   /* imperial red   #ff3020 */
 var COL_PLAYER  = [0.250, 1.000, 0.376];  /* deflected green #40ff60 */
 var COL_SAND    = [0.86, 0.74, 0.52];     /* ground-impact puff */
+var COL_HOT     = [1.00, 1.00, 1.00];     /* parry flash core */
 var CORE_MIX    = 0.55;     /* how far the core tint lerps toward white */
+var DEFL_MIX    = 0.72;     /* ...and further still for a returned bolt */
 var WORLD_PAD   = 60;       /* m past Terrain.SIZE before a bolt is discarded */
 var DEG         = Math.PI / 180;
+
+/* ---- the parry: how the deflection is SOLD (see the header note) ---- */
+var DEFL_VIS_W  = 1.55;     /* returned bolts are this much fatter, for life */
+var DEFL_VIS_L  = 1.22;     /* ...and this much longer */
+var POP_T       = 0.13;     /* s of extra scale-up as a bolt turns around */
+/* The pop is deliberately small. At 1.1x extra width the bolt's own halo became
+ * a 1.2 m green slab across the hero's chest on the contact frame and buried the
+ * flash that is supposed to be the star of the moment; the flash owns the punch,
+ * the bolt only needs to swell enough to look shoved. */
+var POP_W       = 0.55;     /* extra width at the start of the pop */
+var POP_L       = 0.30;     /* extra length at the start of the pop */
+var WAKE_LEN    = 2.8;      /* x core length: faint trail behind a returned bolt */
+var WAKE_W      = 0.65;     /* x GLOW1_W (never scaled by the pop — see draw) */
+var WAKE_A      = 0.16;
+
+var FMAX        = 4;        /* concurrent parry flashes (pooled) */
+var FLASH_T     = 0.26;     /* s a flash lives */
+var FL_CORE     = 0.40;     /* m, white-hot core at birth */
+var FL_HALO     = 0.50;     /* m, saber-coloured halo (expands) */
+var FL_SPIKE_L  = 1.30;     /* m, crossed spikes at full stretch */
+var FL_SPIKE_W  = 0.085;    /* m, spike cross-section at birth */
+var FL_STREAK_L = 2.60;     /* m the exit streak reaches */
+var FL_STREAK_W = 0.11;     /* m, streak cross-section at birth. Wider than
+                             * this and the core stops reading as a beam and
+                             * starts reading as a green slab. */
+var FL_DIA      = 0.46;     /* m, screen-facing impact diamond at full bloom.
+                             * Bigger than this and the hard-edged quad stops
+                             * reading as a flash and starts reading as a kite —
+                             * at 0.72 m it was 140 px across, wider than the
+                             * hero's whole torso, with its left half depth-culled
+                             * behind his shoulder into a lopsided wedge. */
+var FL_DIA_OFF  = 0.30;     /* m along the exit dir, so the quad clears the body */
 
 /* ============================== pool ================================ */
 var pool = new Array(MAXB);
@@ -136,11 +205,21 @@ var pool = new Array(MAXB);
       vel: new Float32Array(3),
       color: new Float32Array(3),
       life: 0, team: 'enemy', dmg: DEF_DMG, speed: DEF_SPEED,
-      active: false, deflected: false, owner: null
+      active: false, deflected: false, owner: null,
+      pop: 0                          /* s of "just turned around" scale-up left */
     };
   }
 })();
 var cursor = 0, nActive = 0;
+
+/* ---- parry flashes: pooled, additive, all on the shared cube ---- */
+var flashes = new Array(FMAX);
+(function(){
+  for (var i = 0; i < FMAX; i++)
+    flashes[i] = { life: 0, x: 0, y: 0, z: 0, dx: 0, dy: 0, dz: -1,
+                   cr: 1, cg: 1, cb: 1, roll: 0 };
+})();
+var nFlash = 0;
 
 /* ============================== scratch ============================= */
 var MTX   = M.make();               /* per-draw model matrix */
@@ -151,11 +230,33 @@ var NRM   = new Float32Array(3);    /* mirror normal */
 var SWB   = { base: new Float32Array(3), tip: new Float32Array(3) };  /* swept blade */
 var TC    = new Float32Array(3);    /* core tint */
 var TG    = new Float32Array(3);    /* glow tint */
-var CORE_O  = { emissive: 1, nofog: true, tint: TC };
-var GLOW1_O = { emissive: 1, nofog: true, additive: true, alpha: GLOW1_A, tint: TG };
-var GLOW2_O = { emissive: 1, nofog: true, additive: true, alpha: GLOW2_A, tint: TG };
-var FLAT_O  = {};                   /* opaque state-restore draw */
-var mesh = null;                    /* ONE shared unit cube */
+var CORE_BO = { emissive: 1, nofog: true };                   /* core batch */
+var ADD_BO  = { emissive: 1, nofog: true, additive: true };   /* shell batch */
+
+/* ---- the two batches ------------------------------------------------------
+ * WHY: every bolt used to cost three back-to-back drawElements of the same unit
+ * cube and every parry flash seven more. On iOS Safari each WebGL entry point is
+ * marshalled across a process boundary, so the CALL COUNT — not the 12 triangles
+ * behind each one — is the frame-time spike, and 200 calls a frame is the budget
+ * for the whole game. Both batches use the identical trick JK.Fx's particle pool
+ * uses (see the batching note in 55_combat.js):
+ *  1. emissive = 1 drops the shader's lit term (vCol = base), so NORMALS are
+ *     never read: they are written once at build time and a box can be 8 shared
+ *     corners / 12 triangles instead of 24 split verts. CULL_FACE is off, so
+ *     front and back faces still both accumulate.
+ *  2. nofog = true pins the fog factor at 1, so per-box colour and alpha fold
+ *     into the vertex colour exactly (aC = rgb*alpha, uTint = 1, uAlpha = 1).
+ *  3. The additive batch runs with depthMask(false) and the depth TEST is per
+ *     fragment, so collapsing those draws cannot change occlusion. The CORE
+ *     batch does write depth, and one drawElements rasterizes its primitives in
+ *     index order — the same order the separate draws used — so it too is exact.
+ * The cores stay in their own batch, drawn FIRST, because they are opaque and
+ * must occlude; mixing them into the additive one would lose the depth writes. */
+var CORE_BOXES = MAXB;                  /* one opaque core per live bolt */
+var ADD_BOXES  = MAXB * 3 + FMAX * 7;   /* glow1 + glow2 + wake, 7 per flash */
+var bCore = null, bAdd = null;
+var CUBE_TRI = [0,1,3, 0,3,2,   4,5,7, 4,7,6,   0,1,5, 0,5,4,
+                2,3,7, 2,7,6,   0,2,6, 0,6,4,   1,3,7, 1,7,5];
 
 var segS = 0, segT = 0;             /* params stashed by the distance tests */
 
@@ -300,6 +401,7 @@ function fire(origin, dir, team, opts){
   b.life = (o.life > 0) ? o.life : DEF_LIFE;
   b.owner = o.owner || null;
   b.deflected = false;
+  b.pop = 0;                             /* a recycled slot must not inherit one */
   b.active = true;
 
   var sp = o.spread || 0;
@@ -316,6 +418,104 @@ function fire(origin, dir, team, opts){
   sparks(origin[0], origin[1], origin[2], 2, b.color);
   snd('blaster', origin[0], origin[1], origin[2], 1);
   return b;
+}
+
+/* ============================== parry flash ========================= */
+/* A parry is the most heroic thing in the game and it lasted a couple of dozen
+ * pixels. spawnFlash pins a flash to the CONTACT POINT ON THE BLADE (not to the
+ * bolt, which is already leaving) and remembers the exit direction, so the flash
+ * and the streak both point where the shot is going. Pooled: a flash never
+ * allocates and never survives more than FLASH_T seconds. */
+function spawnFlash(x, y, z, dx, dy, dz, col){
+  var l = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (!(l > 1e-6)){ dx = 0; dy = 0; dz = -1; l = 1; }
+  var f = null, i, worst = 1e9;
+  for (i = 0; i < FMAX; i++){
+    var c = flashes[i];
+    if (c.life <= 0){ f = c; break; }
+    if (c.life < worst){ worst = c.life; f = c; }     /* else steal the faintest */
+  }
+  if (!f) return;
+  f.life = FLASH_T;
+  f.roll = 0.5 + (Blaster.stats.deflected % 5) * 0.31;   /* vary the diamond */
+  f.x = x; f.y = y; f.z = z;
+  f.dx = dx / l; f.dy = dy / l; f.dz = dz / l;
+  var c2 = col || COL_PLAYER;
+  f.cr = c2[0]; f.cg = c2[1]; f.cb = c2[2];
+}
+
+/* A screen-facing quad with an in-plane roll: the 2002 impact sprite, except the
+ * sprite is the same unit cube squashed flat along the view axis. Rolled 45 deg
+ * it is a diamond, which is the shape that says IMPACT at any size, and it costs
+ * one draw. Built straight into the matrix: right/up span the screen. */
+function billboard(m, s, roll, px, py, pz){
+  var eye = JK.GL.eye;
+  var fx = px - eye[0], fy = py - eye[1], fz = pz - eye[2];
+  var fl = Math.sqrt(fx * fx + fy * fy + fz * fz);
+  if (!(fl > 1e-4)){ fx = 0; fy = 0; fz = -1; fl = 1; }
+  fx /= fl; fy /= fl; fz /= fl;
+  var ux = 0, uy = 1, uz = 0;
+  if (fy > 0.999 || fy < -0.999){ ux = 1; uy = 0; uz = 0; }
+  var rx = uy * fz - uz * fy, ry = uz * fx - ux * fz, rz = ux * fy - uy * fx;
+  var rl = Math.sqrt(rx * rx + ry * ry + rz * rz) || 1;
+  rx /= rl; ry /= rl; rz /= rl;
+  var vx = fy * rz - fz * ry, vy = fz * rx - fx * rz, vz = fx * ry - fy * rx;
+  var c = Math.cos(roll) * s, sn = Math.sin(roll) * s;
+  m[0] = rx * c + vx * sn;  m[1] = ry * c + vy * sn;  m[2] = rz * c + vz * sn;  m[3] = 0;
+  m[4] = -rx * sn + vx * c; m[5] = -ry * sn + vy * c; m[6] = -rz * sn + vz * c; m[7] = 0;
+  m[8] = fx * 0.02; m[9] = fy * 0.02; m[10] = fz * 0.02; m[11] = 0;
+  m[12] = px; m[13] = py; m[14] = pz; m[15] = 1;
+}
+
+function drawFlash(f){
+  var p = 1 - f.life / FLASH_T;              /* 0 at contact -> 1 when spent */
+  if (p < 0) p = 0; else if (p > 1) p = 1;
+  var ip = 1 - p;
+
+  /* 0. the impact sprite: a screen-facing diamond that blooms and fades. This is
+   *    the element that makes the parry legible even when the return path runs
+   *    straight away from the camera and every other cue is foreshortened. */
+  var bloom = p < 0.35 ? p / 0.35 : 1;       /* snap open, then just fade */
+  billboard(MTX, FL_DIA * (0.40 + 0.90 * bloom), f.roll,
+            f.x + f.dx * FL_DIA_OFF, f.y + f.dy * FL_DIA_OFF, f.z + f.dz * FL_DIA_OFF);
+  TG[0] = f.cr + (1 - f.cr) * 0.65; TG[1] = f.cg + (1 - f.cg) * 0.65;
+  TG[2] = f.cb + (1 - f.cb) * 0.65;
+  add(ip * ip * 0.85);
+
+  /* 1. white-hot core: biggest on the contact frame, gone fast */
+  var s = FL_CORE * (0.45 + 0.55 * ip);
+  place(MTX, f.dx, f.dy, f.dz, s, s, s, f.x, f.y, f.z);
+  TG[0] = COL_HOT[0]; TG[1] = COL_HOT[1]; TG[2] = COL_HOT[2];
+  add(ip * ip * 0.95);
+
+  /* 2. saber-coloured halo: expands as it fades, so the eye is pulled outward */
+  s = FL_HALO * (0.6 + 0.9 * p);
+  place(MTX, f.dx, f.dy, f.dz, s, s, s, f.x, f.y, f.z);
+  TG[0] = f.cr; TG[1] = f.cg; TG[2] = f.cb;
+  add(ip * 0.45);
+
+  /* 3. two chunky spikes crossed ACROSS the exit direction — the 2002 impact
+   *    star, made of the same box as everything else */
+  var sl = FL_SPIKE_L * (0.35 + 0.65 * (p < 0.5 ? p * 2 : 1));
+  var sw = FL_SPIKE_W * ip;
+  if (sw > 0.004){
+    place(MTX, f.dx, f.dy, f.dz, sl, sw, sw, f.x, f.y, f.z);
+    add(ip * ip * 0.85);
+    place(MTX, f.dx, f.dy, f.dz, sw, sl, sw, f.x, f.y, f.z);
+    add(ip * ip * 0.85);
+  }
+
+  /* 4. the exit streak: a box that grows out of the contact point along the
+   *    return path, core + fat halo. THIS is the "it went that way" cue. */
+  var len = FL_STREAK_L * (0.25 + 0.75 * p);
+  var w = FL_STREAK_W * (1 - 0.55 * p);
+  var h = len * 0.5;
+  place(MTX, f.dx, f.dy, f.dz, w, w, len,
+        f.x + f.dx * h, f.y + f.dy * h, f.z + f.dz * h);
+  add(ip * 0.85);
+  place(MTX, f.dx, f.dy, f.dz, w * 3.2, w * 3.2, len * 0.92,
+        f.x + f.dx * h, f.y + f.dy * h, f.z + f.dz * h);
+  add(ip * 0.26);
 }
 
 /* ============================== deflection ========================== */
@@ -401,6 +601,7 @@ function doDeflect(b, ax, ay, az, bx, by, bz, bl, frac){
   b.dmg = DEFL_DMG;
   b.speed = DEFL_SPEED;
   b.life = DEF_LIFE;                  /* fresh clock for the return trip */
+  b.pop = POP_T;                      /* brief scale-up as it turns around */
   setCol(b, COL_PLAYER);
 
   if (!aimAtEnemy(px, py, pz)){
@@ -428,10 +629,17 @@ function doDeflect(b, ax, ay, az, bx, by, bz, bl, frac){
   b.vel[1] = SD[1] * b.speed;
   b.vel[2] = SD[2] * b.speed;
 
-  /* the flash belongs ON the blade, not on the bolt */
+  /* THE FLASH BELONGS ON THE BLADE, NOT ON THE BOLT. Its direction is the
+   * bolt's NEW velocity (set just above), so the spikes cross the return path
+   * and the streak points down it. Particles are batched into a single draw call
+   * by JK.Fx, so the extra sparks cost pixels, not calls. */
   Blaster.stats.deflected++;
-  sparks(qx, qy, qz, 12, saberCol());
-  sparks(qx, qy, qz, 5, COL_PLAYER);
+  spawnFlash(qx, qy, qz, b.vel[0], b.vel[1], b.vel[2], saberCol());
+  /* 22 sparks, not 40: JK.Fx's 256-particle pool is SHARED with droid explosions
+   * and a parried 3-round burst already spends 66 of it. Particles are batched
+   * into one draw call, so this costs pixels rather than calls either way. */
+  sparks(qx, qy, qz, 14, saberCol());
+  sparks(qx, qy, qz, 8, COL_PLAYER);
   snd('deflect', qx, qy, qz, 1);
 }
 
@@ -583,6 +791,11 @@ function hitEnts(b, ax, ay, az, bx, by, bz){
   b.pos[0] = px; b.pos[1] = py; b.pos[2] = pz;
   Blaster.stats.hits++;
   sparks(px, py, pz, b.deflected ? 14 : 10, b.color);
+  /* A RETURNED shot landing is the end of the parry's story, so it gets the same
+   * flash the blade got — same pool, same 7 boxes, only for bolts the player sent
+   * back. Aimed along the bolt's own heading so the streak sprays THROUGH the
+   * victim: "that came off my saber and it went into him". */
+  if (b.deflected) spawnFlash(px, py, pz, DIRV[0], DIRV[1], DIRV[2], COL_PLAYER);
   snd('boltHit', px, py, pz, 1);
   /* onHit last: a bot may die and unregister, which mutates ents underneath us */
   if (typeof best.onHit === 'function') best.onHit(b.dmg, DIRV, 'bolt', b.pos);
@@ -662,10 +875,12 @@ function repel(pos, dir){
     b.dmg = b.dmg > DEFL_DMG ? b.dmg : DEFL_DMG;
     b.speed = b.speed > REPEL_SPEED ? b.speed : REPEL_SPEED;
     b.life = DEF_LIFE;
+    b.pop = POP_T;                    /* same "it just turned" pop as a parry */
     setCol(b, COL_PLAYER);
     spreadDir(fx, fy, fz, REPEL_SPRD, SD);
     b.vel[0] = SD[0] * b.speed; b.vel[1] = SD[1] * b.speed; b.vel[2] = SD[2] * b.speed;
-    sparks(b.pos[0], b.pos[1], b.pos[2], 6, COL_PLAYER);
+    spawnFlash(b.pos[0], b.pos[1], b.pos[2], SD[0], SD[1], SD[2], COL_PLAYER);
+    sparks(b.pos[0], b.pos[1], b.pos[2], 8, COL_PLAYER);
     lx = b.pos[0]; ly = b.pos[1]; lz = b.pos[2];
     n++;
   }
@@ -677,6 +892,47 @@ function repel(pos, dir){
 }
 
 /* ============================== drawing ============================= */
+function buildBatches(){
+  if (bAdd || !JK.GL || !JK.GL.dynamic) return;
+  bCore = mkBatch(CORE_BOXES);
+  bAdd  = mkBatch(ADD_BOXES);
+}
+function mkBatch(nb){
+  var idx = new Uint16Array(nb * 36), i, j;
+  for (i = 0; i < nb; i++){
+    var vb = i * 8, ib = i * 36;
+    for (j = 0; j < 36; j++) idx[ib + j] = vb + CUBE_TRI[j];
+  }
+  var h = JK.GL.dynamic(nb * 8, { idx: idx });
+  var v = h.v;                        /* normals: unused (emissive), set once */
+  for (i = 3; i < v.length; i += 9){ v[i] = 0; v[i + 1] = 1; v[i + 2] = 0; }
+  return h;
+}
+
+/* Queue one box into batch `h` from a model matrix built by place()/billboard()
+ * (cols X, Y, Z, T; the local box is the unit cube centred on the origin), with
+ * the colour folded to rgb*alpha so nothing per-box reaches a uniform. */
+function emitBox(h, m, r, g, b, a){
+  if (!h || h.n + 8 > h.max || !(a > 0)) return;   /* full or invisible: drop */
+  var e0x = m[0] * 0.5, e0y = m[1] * 0.5, e0z = m[2] * 0.5;
+  var e1x = m[4] * 0.5, e1y = m[5] * 0.5, e1z = m[6] * 0.5;
+  var e2x = m[8] * 0.5, e2y = m[9] * 0.5, e2z = m[10] * 0.5;
+  var cx = m[12], cy = m[13], cz = m[14];
+  r *= a; g *= a; b *= a;
+  var V = h.v, o = h.n * 9;
+  for (var q = 0; q < 8; q++){        /* sign bits: 1=+x, 2=+y, 4=+z */
+    var sx = (q & 1) ? 1 : -1, sy = (q & 2) ? 1 : -1, sz = (q & 4) ? 1 : -1;
+    V[o]     = cx + sx * e0x + sy * e1x + sz * e2x;
+    V[o + 1] = cy + sx * e0y + sy * e1y + sz * e2y;
+    V[o + 2] = cz + sx * e0z + sy * e1z + sz * e2z;
+    V[o + 6] = r; V[o + 7] = g; V[o + 8] = b;      /* o+3..o+5: normal, fixed */
+    o += 9;
+  }
+  h.n += 8; h.ni += 36;
+}
+/* queue MTX into the additive batch tinted by TG at alpha `a` */
+function add(a){ emitBox(bAdd, MTX, TG[0], TG[1], TG[2], a); }
+
 /* Build an orientation+scale+translation matrix whose local +Z runs along the
  * bolt's velocity. The exactly-vertical case would make cross(up, f) vanish, so
  * the reference up flips to +X there. Column-major: cols = right, up, fwd. */
@@ -705,9 +961,27 @@ function boltView(b){
   return d2 > FAR_DRAW * FAR_DRAW ? -1 : d2;
 }
 
+/* A returned bolt is the pay-off of the whole system, so it is drawn as a
+ * heavier object than the shot that came in: wider, longer, hotter-cored, plus a
+ * short scale-up "pop" over the frames it turns around. Both multipliers land in
+ * VW / VL, which the two passes below share, so a bolt's core and its shells can
+ * never disagree about how big it is. */
+var VW = 1, VL = 1;
+function boltScale(b){
+  VW = b.deflected ? DEFL_VIS_W : 1;
+  VL = b.deflected ? DEFL_VIS_L : 1;
+  if (b.pop > 0){
+    var k = b.pop / POP_T;
+    VW *= 1 + POP_W * k;
+    VL *= 1 + POP_L * k;
+  }
+}
+
 function draw(){
-  if (!mesh || nActive === 0) return;
-  var GL = JK.GL, i, b, d2, half;
+  if (!bAdd) return;
+  var GL = JK.GL, i, b, d2, half, len;
+  GL.reset(bCore); GL.reset(bAdd);   /* counts decide what draws: never stale */
+  if (nActive === 0 && nFlash === 0) return;
 
   /* opaque cores first so they occlude correctly... */
   for (i = 0; i < MAXB; i++){
@@ -715,13 +989,15 @@ function draw(){
     if (!b.active) continue;
     d2 = boltView(b);
     if (d2 < 0) continue;
-    half = BOLT_LEN * 0.5;
-    TC[0] = b.color[0] + (1 - b.color[0]) * CORE_MIX;
-    TC[1] = b.color[1] + (1 - b.color[1]) * CORE_MIX;
-    TC[2] = b.color[2] + (1 - b.color[2]) * CORE_MIX;
-    place(MTX, SD[0], SD[1], SD[2], CORE_W, CORE_W, BOLT_LEN,
+    boltScale(b);
+    len = BOLT_LEN * VL; half = len * 0.5;
+    var mix = b.deflected ? DEFL_MIX : CORE_MIX;
+    TC[0] = b.color[0] + (1 - b.color[0]) * mix;
+    TC[1] = b.color[1] + (1 - b.color[1]) * mix;
+    TC[2] = b.color[2] + (1 - b.color[2]) * mix;
+    place(MTX, SD[0], SD[1], SD[2], CORE_W * VW, CORE_W * VW, len,
           b.pos[0] - SD[0] * half, b.pos[1] - SD[1] * half, b.pos[2] - SD[2] * half);
-    GL.draw(mesh, MTX, CORE_O);
+    emitBox(bCore, MTX, TC[0], TC[1], TC[2], 1);
   }
 
   /* ...then every additive shell in one blend-state block */
@@ -730,22 +1006,43 @@ function draw(){
     if (!b.active) continue;
     d2 = boltView(b);
     if (d2 < 0) continue;
-    half = BOLT_LEN * 0.5;
+    boltScale(b);
+    len = BOLT_LEN * VL; half = len * 0.5;
     TG[0] = b.color[0]; TG[1] = b.color[1]; TG[2] = b.color[2];
-    place(MTX, SD[0], SD[1], SD[2], GLOW1_W, GLOW1_W, BOLT_LEN,
+    place(MTX, SD[0], SD[1], SD[2], GLOW1_W * VW, GLOW1_W * VW, len,
           b.pos[0] - SD[0] * half, b.pos[1] - SD[1] * half, b.pos[2] - SD[2] * half);
-    GL.draw(mesh, MTX, GLOW1_O);
+    add(GLOW1_A);
     if (d2 < FAR_HALO * FAR_HALO){
-      place(MTX, SD[0], SD[1], SD[2], GLOW2_W, GLOW2_W, BOLT_LEN * GLOW2_LEN,
+      place(MTX, SD[0], SD[1], SD[2], GLOW2_W * VW, GLOW2_W * VW, len * GLOW2_LEN,
             b.pos[0] - SD[0] * half, b.pos[1] - SD[1] * half, b.pos[2] - SD[2] * half);
-      GL.draw(mesh, MTX, GLOW2_O);
+      add(GLOW2_A);
+      if (b.deflected && b.pop <= 0){
+        /* WAKE: one faint box stretched back down the flight path, so the return
+         * shot reads as MOTION rather than as a dot. +1 box, deflected only.
+         * Held back until the pop is over: on the contact frames the wake points
+         * back at the CAMERA (the bolt has only just turned), and a 0.5 m wide
+         * box aimed down the lens is a slab over a quarter of the screen, not a
+         * trail. By the time it draws, the bolt is genuinely travelling. */
+        var wbase = BOLT_LEN * DEFL_VIS_L, wl = wbase * WAKE_LEN;
+        var ww = GLOW1_W * WAKE_W * DEFL_VIS_W;
+        var wh = wl * 0.5 - wbase * 0.5;
+        TG[0] = b.color[0]; TG[1] = b.color[1]; TG[2] = b.color[2];
+        place(MTX, SD[0], SD[1], SD[2], ww, ww, wl,
+              b.pos[0] - SD[0] * wh, b.pos[1] - SD[1] * wh, b.pos[2] - SD[2] * wh);
+        add(WAKE_A);
+      }
     }
   }
 
-  /* additive draws left depthMask(false); restore with one zero-scale opaque
-   * draw (rasterizes nothing) so later systems and the next depth clear work. */
-  M.ident(MTX); M.sc(MTX, 0, 0, 0);
-  GL.draw(mesh, MTX, FLAT_O);
+  /* the parry flashes ride along in the same additive batch */
+  for (i = 0; i < FMAX; i++) if (flashes[i].life > 0) drawFlash(flashes[i]);
+
+  /* TWO calls for the whole system: cores (opaque, they write depth) then every
+   * shell, wake and flash. No trailing state-restore draw — JK.GL.beginFrame
+   * puts depthMask(true) back before it clears, so leaving GL additive here is
+   * harmless (JK.Fx and JK.ForceFx rely on exactly the same thing). */
+  if (bCore.ni) GL.draw(bCore, null, CORE_BO);
+  if (bAdd.ni) GL.draw(bAdd, null, ADD_BO);
 }
 
 /* ============================== module ============================== */
@@ -759,12 +1056,16 @@ var Blaster = JK.Blaster = {
   count: function(){ return nActive; },
 
   clear: function(){
-    for (var i = 0; i < MAXB; i++){ pool[i].active = false; pool[i].owner = null; }
-    nActive = 0;
+    var i;
+    for (i = 0; i < MAXB; i++){
+      pool[i].active = false; pool[i].owner = null; pool[i].pop = 0;
+    }
+    for (i = 0; i < FMAX; i++) flashes[i].life = 0;
+    nActive = 0; nFlash = 0;
   },
 
   init: function(){
-    if (!mesh && JK.GL && JK.GL.mesh) mesh = JK.GL.mesh(JK.Geo.box(1, 1, 1, 1, 1, 1));
+    buildBatches();
     Blaster.clear();
     cursor = 0;
     Blaster.stats.fired = Blaster.stats.deflected = 0;
@@ -772,16 +1073,29 @@ var Blaster = JK.Blaster = {
   },
 
   update: function(dt, t){
-    var n = 0;
-    for (var i = 0; i < MAXB; i++){
+    var n = 0, i;
+    for (i = 0; i < MAXB; i++){
       var b = pool[i];
       if (!b.active) continue;
       b.life -= dt;
       if (b.life <= 0){ kill(b); continue; }   /* kill() also drops b.owner */
-      stepBolt(b, dt);
+      if (b.pop > 0){ b.pop -= dt; if (b.pop < 0) b.pop = 0; }
+      stepBolt(b, dt);                /* may set pop again (a fresh deflection) */
       if (b.active) n++;
     }
     nActive = n;                      /* authoritative resync each frame */
+    n = 0;
+    for (i = 0; i < FMAX; i++){       /* age the parry flashes */
+      var f = flashes[i];
+      if (f.life <= 0) continue;
+      f.life -= dt;
+      /* `<= 0`, not `< 0`: a flash landing exactly on zero is dead — drawFlash
+       * skips it — so counting it kept draw() awake for a frame with nothing
+       * in it. Same predicate here and at the draw site. */
+      if (f.life <= 0) f.life = 0;
+      else n++;
+    }
+    nFlash = n;
   },
 
   draw: draw

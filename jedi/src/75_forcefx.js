@@ -8,26 +8,47 @@
  *   JK.ForceFx.pull(origin3, dir3)   converging tangential streaks, 0.45 s
  *   JK.ForceFx.lightning(from3, to3) ONE frame of a jagged arc — call EVERY
  *                                    frame while channelling (up to 4 at once)
- *   JK.ForceFx.grip(target, t)       swirling aura around a lifted target — call
- *                                    EVERY frame; target may be a vec3 (chest
- *                                    point) OR a JK.Combat entity ({pos,height})
+ *   JK.ForceFx.grip(target, t)       the choke: a TETHER from the player's saber
+ *                                    hand to the victim, two fat counter-rotating
+ *                                    bands (the inner one billboarded so it is
+ *                                    always a full hoop), two prisms of glow, and
+ *                                    thrashing motes — call EVERY frame; target
+ *                                    may be a vec3 (chest point) OR a JK.Combat
+ *                                    entity ({pos,height}). STOP calling it and
+ *                                    the aura times out within GRIP_HOLD and
+ *                                    fires a RELEASE shockwave by itself — that
+ *                                    is the only "let go" signal available, since
+ *                                    JK.Powers' contract ends at
+ *                                    onForce('gripRelease').
  *   JK.ForceFx.speed(on)             ghost after-images + CSS vignette (latched)
  *   init() / update(dt, t) / draw()  lifecycle (90_main SYSTEMS slot 'ForceFx')
  *   clear()                          drop every live effect (respawn / tests)
  *   active()                         live effect count (harnesses)
  *
  * RENDERING BUDGET / RULES
- *   - THREE static meshes built once at init: a unit segment (x,z centred,
- *     y in [0,1]), a unit cube, and a chunky humanoid ghost. JK.GL.mesh is
- *     STATIC_DRAW, so nothing is ever rebuilt: every instance is placed with a
- *     model matrix written into module-scope scratch.
+ *   - Every element this module draws is a BOX placed by a model matrix written
+ *     by hand into module-scope scratch (no M.mul) — cols are X, Y, Z, T. See
+ *     seg()/cube()/col(), and the ghost matrix in drawGhosts.
+ *   - ONE DRAW CALL for the entire module. Every box is additive + emissive +
+ *     nofog, which is exactly the case JK.GL.dynamic collapses without changing
+ *     a pixel, so they are CPU-transformed into one shared vertex buffer and go
+ *     out as a single drawElements — see the batching note above emitBox.
+ *     Per-effect driver calls, measured on frozen frames, before -> after:
+ *     grip 54 -> 0, two grips 109 -> 0, one push/pull wave 35 -> 0, four waves
+ *     134 -> 0, one lightning arc ~26 -> 0, four arcs 105 -> 0, speed ghosts
+ *     7 -> 0, and the whole module 1 call when anything at all is live. A
+ *     hand-composed worst case (2 grips + 4 arcs + 4 waves + speed + 24 bolts
+ *     + 4 parries) went 474 draws/frame -> 57, against a 200-call budget, and
+ *     busy combat with PUSH selected went 164 mean / 206 peak -> 136 / 146,
+ *     with the peak no longer depending on which power is in the player's hand.
  *   - Zero allocation per frame. Pools are preallocated with hard caps:
  *     4 waves x 16 shards, 4 arcs x 9 links (+1-2 forks), 2 grips, 14 ghosts.
- *     Ghosts are spent on DISTANCE as well as time — see GHOST_MIN_D.
- *   - Everything draws additive + emissive + nofog, so the sand can occlude it
- *     but the fog can never grey it out. A final degenerate opaque draw restores
- *     depthMask(true) — additive draws leave it off and the next frame's depth
- *     clear would silently do nothing.
+ *     Ghosts are spent on DISTANCE as well as time — see GHOST_MIN_D. BOXES is
+ *     sized to every pool being full at once; emitBox never overruns it.
+ *   - Additive + nofog means the sand can occlude the effects (the depth TEST
+ *     still runs) but the fog can never grey them out. No trailing "reset" draw:
+ *     JK.GL.beginFrame restores depthMask(true) before it clears, so leaving GL
+ *     in additive state here is harmless (JK.Fx relies on the same thing).
  *   - The arc jitter comes from a free-running xorshift32 (pure bitwise ops, no
  *     precision loss, no allocation), re-rolled every frame so it crackles.
  *
@@ -70,11 +91,43 @@ var ARC_HOLD   = 0.09;   /* s an arc survives without a refresh (fade tail) */
 var ARC_CORE_W = 0.045;  /* m: white-hot core cross-section */
 var ARC_GLOW_K = 3.6;    /* glow width multiplier over the core */
 
+/* ---- GRIP: the weakest power on screen, rebuilt ----------------------------
+ * Measured on a frozen still with a bot 6 m out: the old aura (3 thin rings of 8
+ * shards, r 0.55-0.9 m, plus 7 tiny motes) changed 0.48% of the screen — a white
+ * sparkle on the victim's chest — while push/pull/speed change 4-5%. It cost 58
+ * boxes to do it, so the answer could not be "more of the same".
+ * Re-measured independently against the identical frame with no grip in it:
+ * 0.73% of the screen from behind the player, 2.12% from the side — and the
+ * frames read as a man wrapped in a cage of light on a leash.
+ * Fewer, FATTER, BIGGER elements, plus the two things that were missing
+ * entirely: a TETHER from the player's hand to the victim (so the player can see
+ * that HE is doing this), and a RELEASE burst when the choke ends.
+ * Draw budget is spent, not raised: 2 fat rings instead of 3 thin ones pays for
+ * the tether, so the whole effect still fits in ~54 boxes — which, since the
+ * module batches, is ~54 boxes inside ONE driver call. */
 var GRIP_MAX   = 2;
 var GRIP_HOLD  = 0.16;   /* s a grip aura survives without a refresh */
-var GRIP_RINGS = 3;
-var GRIP_SEG   = 8;      /* shards per aura ring */
-var GRIP_MOTES = 7;
+var GRIP_RINGS = 2;      /* two fat bands read at 6 m; three thin ones did not */
+var GRIP_SEG   = 7;      /* shards per aura ring */
+var GRIP_MOTES = 8;
+var GRIP_W     = 0.085;  /* m: shard cross-section (was 0.046 — under 2 px out there) */
+var GRIP_R0    = 1.15;   /* x g.r: inner band radius */
+var GRIP_R1    = 1.62;   /* x g.r: outer band radius */
+var GRIP_AUR0  = 0.78;   /* x g.r: girth of the tall glow prism */
+var GRIP_AUR1  = 1.28;   /* x g.r: girth of the flat chest-height one */
+var GRIP_AUR_A = 0.055;  /* alpha per aura prism (additive, front+back faces) */
+var GRIP_POP   = 0.16;   /* s the bands take to snap open on the lock */
+
+var TETH_LINKS = 6;      /* hand -> victim cord, links */
+var TETH_W     = 0.060;  /* m core cross-section at the hand end */
+var TETH_GLOW  = 2.1;
+var TETH_AMP   = 0.045;  /* x length: lateral writhe of the cord */
+var TETH_SAG   = 0.030;  /* x length: gravity-ish droop in the middle */
+var TETH_BOW   = 0.105;  /* x length: slow revolving bow — see drawTether */
+
+var REL_DUR    = 0.34;   /* s: the release shockwave */
+var REL_R      = 2.7;    /* m: how far it opens */
+var REL_MIN    = 0.10;   /* s a grip must have held before a release is shown */
 
 var GHOSTS     = 14;     /* speed after-image ring buffer slots */
 var GHOST_DT   = 0.042;  /* s between samples */
@@ -100,23 +153,32 @@ var C_CYAN = [0.52, 0.94, 1.00];
 var C_VIO  = [0.68, 0.60, 1.00];
 
 /* ============================== state ============================== */
-var mSeg = null, mCube = null, mGhost = null;   /* built ONCE at init */
+/* Hard cap on boxes queued in one frame, sized to EVERY pool being full at once:
+ *   waves  4 x (16 shards x 2 passes) + 4 core flashes            = 132
+ *   grips  2 x (tether 6x2 + 2 flares + bands 2x7x2 + 2 prisms
+ *                + 8 motes + 2 choke)                             = 108
+ *   arcs   4 x (9 links x2 + 2 forks x3 + 4 flares)               = 112
+ *   ghosts 14 x 5 body boxes                                      =  70
+ * = 422, rounded up. emitBox drops anything past it rather than letting
+ * JK.GL clamp the batch (which would lose whole primitives silently). */
+var BOXES = 448;
+var batch = null;                               /* built ONCE at init */
 var built = false;
 var now = 0;
-var drewAny = false;
 
 /* ---- scratch (never reallocated) ---- */
 var MTX  = M.make();
-var TMX  = M.make();
 var TINT = new Float32Array(3);
-var OPT  = { emissive: 1, additive: true, nofog: true, alpha: 1, tint: TINT };
-var RESET = {};                                  /* opaque, restores depthMask */
+var BOPT = { emissive: 1, additive: true, nofog: true };  /* the one batch draw */
 var PX = new Float32Array(3);                    /* perpendicular basis X */
 var PZ = new Float32Array(3);                    /* perpendicular basis Z */
 var HAND = new Float32Array(3);                  /* saber-hand world point */
 var GP   = new Float32Array(3);                  /* resolved grip point */
 var NODES = new Float32Array(ARC_NODES * 3);     /* arc polyline scratch */
 var FNODES = new Float32Array((FORK_LINKS + 1) * 3);
+var TNODES = new Float32Array((TETH_LINKS + 1) * 3);  /* grip tether polyline */
+var RPOS = new Float32Array(3);                  /* release burst origin */
+var RDIR = new Float32Array(3);                  /* release burst normal */
 
 /* ---- deterministic-but-alive jitter: xorshift32, bitwise only ---- */
 var seed = 0x2f6e2b1 | 0;
@@ -220,37 +282,105 @@ function cube(m, x, y, z, s){
   m[12] = x; m[13] = y; m[14] = z; m[15] = 1;
 }
 
+/* A box spun about Y with independent girth and height — a turning PRISM. Two of
+ * these, counter-rotating at low alpha, are how the grip gets volume for two
+ * draw calls. Spun on two axes it looked like a tumbling crate (the flat top face
+ * gives the game away over open sand); kept upright and turning, it reads as a
+ * column of light around a body, which is the shape a body actually is. */
+function col(m, x, y, z, rw, rh, a){
+  var ca = Math.cos(a) * rw, sa = Math.sin(a) * rw;
+  m[0] = ca;  m[1] = 0;  m[2] = -sa; m[3] = 0;
+  m[4] = 0;   m[5] = rh; m[6] = 0;   m[7] = 0;
+  m[8] = sa;  m[9] = 0;  m[10] = ca; m[11] = 0;
+  m[12] = x; m[13] = y; m[14] = z; m[15] = 1;
+}
+
+/* ======================= THE BATCH (one draw call) ===================
+ * WHY: this module used to issue one JK.GL.draw per box — 54 back-to-back
+ * driver calls for a single grip, 134 for four push waves, 105 for four
+ * lightning arcs. On iOS Safari every WebGL entry point is marshalled across a
+ * process boundary, so that COUNT, not the 12 triangles behind each call, is the
+ * frame-time spike, and 200 calls/frame is the whole game's budget.
+ *
+ * Why the pixels come out identical rather than merely similar (the same three
+ * reasons the particle batch in 55_combat.js relies on):
+ *  1. emissive = 1 makes the shader's lit term drop out (vCol = base), so
+ *     NORMALS are never read — they are written once at build time and a box can
+ *     be 8 shared corners / 12 triangles instead of 24 split verts. CULL_FACE is
+ *     off, so front and back faces still both accumulate.
+ *  2. nofog = true pins the fog factor at 1, so the shader reduces to
+ *     dst += aC * uTint * uAlpha. Per-element tint and alpha therefore multiply
+ *     into the vertex colour exactly: aC = rgb*alpha, uTint = 1, uAlpha = 1.
+ *  3. Additive blending runs with depthMask(false) and the depth TEST is per
+ *     fragment, so collapsing the draws cannot change occlusion or ordering.
+ * Sand still occludes the effects, and the ONE draw is still issued through
+ * JK.GL.draw so the profiler counts it honestly. */
+var CUBE_TRI = [0,1,3, 0,3,2,   4,5,7, 4,7,6,   0,1,5, 0,5,4,
+                2,3,7, 2,7,6,   0,2,6, 0,6,4,   1,3,7, 1,7,5];
+
+/* Queue one box. `m` is a model matrix (cols X, Y, Z, T); the box occupies the
+ * local cell centred on (lx,ly,lz) with half-extents (hx,hy,hz), so a seg()
+ * matrix passes (0,0.5,0) and a cube()/col() one passes (0,0,0). Colour is
+ * folded to rgb*alpha here — nothing per-box reaches a uniform. */
+function emitBox(m, lx, ly, lz, hx, hy, hz, r, g, b){
+  var h = batch;
+  if (!h || h.n + 8 > h.max) return;             /* full: drop, never overrun */
+  var x0 = m[0], y0 = m[1], z0 = m[2];           /* column X */
+  var x1 = m[4], y1 = m[5], z1 = m[6];           /* column Y */
+  var x2 = m[8], y2 = m[9], z2 = m[10];          /* column Z */
+  var cx = m[12] + x0 * lx + x1 * ly + x2 * lz;
+  var cy = m[13] + y0 * lx + y1 * ly + y2 * lz;
+  var cz = m[14] + z0 * lx + z1 * ly + z2 * lz;
+  var e0x = x0 * hx, e0y = y0 * hx, e0z = z0 * hx;
+  var e1x = x1 * hy, e1y = y1 * hy, e1z = z1 * hy;
+  var e2x = x2 * hz, e2y = y2 * hz, e2z = z2 * hz;
+  var V = h.v, o = h.n * 9;
+  for (var q = 0; q < 8; q++){                   /* sign bits: 1=+x, 2=+y, 4=+z */
+    var sx = (q & 1) ? 1 : -1, sy = (q & 2) ? 1 : -1, sz = (q & 4) ? 1 : -1;
+    V[o]     = cx + sx * e0x + sy * e1x + sz * e2x;
+    V[o + 1] = cy + sx * e0y + sy * e1y + sz * e2y;
+    V[o + 2] = cz + sx * e0z + sy * e1z + sz * e2z;
+    V[o + 6] = r; V[o + 7] = g; V[o + 8] = b;    /* o+3..o+5: normal, fixed */
+    o += 9;
+  }
+  h.n += 8; h.ni += 36;
+}
+
+/* Queue MTX tinted by TINT at alpha `a`. yoff 0.5 for a seg() matrix (its local
+ * box spans y in [0,1]), 0 for a cube()/col() one. */
+function put(m, yoff, a){
+  if (!(a > 0.004)) return;                      /* NaN-safe, and skip invisible */
+  emitBox(m, 0, yoff, 0, 0.5, 0.5, 0.5, TINT[0] * a, TINT[1] * a, TINT[2] * a);
+}
+
 function drawCube(x, y, z, s, col, a){
   if (a <= 0.004 || s <= 0) return;
   cube(MTX, x, y, z, s);
-  tint(col); OPT.alpha = a;
-  JK.GL.draw(mCube, MTX, OPT);
-  drewAny = true;
+  tint(col);
+  put(MTX, 0, a);
 }
 
-/* ============================== meshes ============================== */
+/* the humanoid after-image: local centre + half-size of each body box */
+var GHOST_BOX = [
+  0,  0.43, 0, 0.220, 0.430, 0.140,            /* legs  */
+  0,  1.22, 0, 0.270, 0.350, 0.160,            /* torso */
+  0,  1.71, 0, 0.140, 0.140, 0.130,            /* head  */
+  0.34, 1.24, 0, 0.075, 0.310, 0.085,          /* arm R */
+ -0.34, 1.24, 0, 0.075, 0.310, 0.085           /* arm L */
+];
+
+/* ============================== batch build ========================= */
 function buildMeshes(){
-  if (built || !JK.GL || !JK.GL.gl || !JK.Geo) return;
-  var G = JK.Geo, GL = JK.GL;
-
-  /* unit segment: 1x1x1 box shifted so it spans y in [0,1] from its origin */
-  M.ident(TMX); M.tr(TMX, 0, 0.5, 0);
-  mSeg = GL.mesh(G.tf(G.box(1, 1, 1, 1, 1, 1), TMX));
-  mCube = GL.mesh(G.box(1, 1, 1, 1, 1, 1));
-
-  /* chunky humanoid silhouette for the Force Speed after-images */
-  mGhost = GL.mesh(G.merge([
-    bx(0.44, 0.86, 0.28, 0, 0.43, 0),          /* legs */
-    bx(0.54, 0.70, 0.32, 0, 1.22, 0),          /* torso */
-    bx(0.28, 0.28, 0.26, 0, 1.71, 0),          /* head */
-    bx(0.15, 0.62, 0.17,  0.34, 1.24, 0),      /* arm R */
-    bx(0.15, 0.62, 0.17, -0.34, 1.24, 0)       /* arm L */
-  ]));
+  if (built || !JK.GL || !JK.GL.dynamic) return;
+  var idx = new Uint16Array(BOXES * 36), i, j;
+  for (i = 0; i < BOXES; i++){
+    var vb = i * 8, ib = i * 36;
+    for (j = 0; j < 36; j++) idx[ib + j] = vb + CUBE_TRI[j];
+  }
+  batch = JK.GL.dynamic(BOXES * 8, { idx: idx });
+  var v = batch.v;                    /* normals: unused (emissive), set once */
+  for (i = 3; i < v.length; i += 9){ v[i] = 0; v[i + 1] = 1; v[i + 2] = 0; }
   built = true;
-}
-function bx(sx, sy, sz, x, y, z){
-  M.ident(TMX); M.tr(TMX, x, y, z);
-  return JK.Geo.tf(JK.Geo.box(sx, sy, sz, 1, 1, 1), TMX);
 }
 
 /* ======================= the saber hand (origin) ===================== */
@@ -280,6 +410,12 @@ function handPoint(out){
 
 /* ========================== push / pull waves ======================== */
 function spawnRing(kind, o, d){
+  /* The ORIGIN needs the same door check as the direction below. The direction
+   * was guarded and the origin was not, so pull([NaN,NaN,NaN], dir) put NaN
+   * straight into r.ox/oy/oz and every one of the wave's 32 shard matrices came
+   * out NaN for the whole 0.45 s — measured at 32 NaN uniform matrices a frame. */
+  if (o && !(o[0] > -1e9 && o[0] < 1e9 && o[1] > -1e9 && o[1] < 1e9 &&
+             o[2] > -1e9 && o[2] < 1e9)) return;
   var i, r = null, worst = 1e9;
   for (i = 0; i < RING_MAX; i++){
     var c = rings[i];
@@ -289,7 +425,7 @@ function spawnRing(kind, o, d){
   }
   if (!r) return;
   r.live = true; r.kind = kind; r.t = 0;
-  r.dur = kind ? PULL_DUR : PUSH_DUR;
+  r.dur = kind === 1 ? PULL_DUR : (kind === 2 ? REL_DUR : PUSH_DUR);
   r.ph = rnd() * TAU;
   r.ox = o ? o[0] : 0; r.oy = o ? o[1] : 1.2; r.oz = o ? o[2] : 0;
   var dx = d ? d[0] : 0, dy = d ? d[1] : 0, dz = d ? d[2] : -1;
@@ -306,10 +442,21 @@ function spawnRing(kind, o, d){
 
 function drawRing(r){
   var p = r.t / r.dur; if (p > 1) p = 1; if (p < 0) p = 0;
-  var pull = r.kind === 1;
+  var pull = r.kind === 1, rel = r.kind === 2;
   var e, rad, adv, alpha, stretch, w, ip = 1 - p;
 
-  if (!pull){
+  if (rel){
+    /* GRIP RELEASE: a hoop that snaps open around the victim as the choke lets
+     * go. Same machinery as the push wave, but centred ON the victim (adv 0) and
+     * opening from something already body-sized, so it reads as "let go of him"
+     * rather than "a wave arrived from somewhere". */
+    e = 1 - ip * ip * ip;
+    rad = 0.45 + REL_R * e;
+    adv = 0;
+    alpha = ip * ip;
+    stretch = 0.92;
+    w = 0.075 + 0.13 * ip;
+  } else if (!pull){
     e = 1 - ip * ip * ip;                        /* punch out fast, ease to a stop */
     rad = 0.55 + PUSH_R * e;                     /* born as a ring, not a dot */
     adv = 0.55 + PUSH_ADV * e;                   /* clear of the player's chest */
@@ -345,16 +492,23 @@ function drawRing(r){
     seg(MTX, cx - tx * h, cy - ty * h, cz - tz * h, tx, ty, tz, w, len);
 
     if (pull) tintLerp(C_CYAN, C_HOT, e);
+    else if (rel) tintLerp(C_HOT, C_VIO, p);     /* the grip's own colour */
     else tintLerp(C_HOT, C_BLUE, p);
-    OPT.alpha = alpha;
-    JK.GL.draw(mSeg, MTX, OPT);
+    put(MTX, 0.5, alpha);
 
     widen(MTX, 2.9);                             /* fat additive halo, same matrix */
-    tint(pull ? C_BLUE : C_PALE);
-    OPT.alpha = alpha * 0.34;
-    JK.GL.draw(mSeg, MTX, OPT);
+    tint(pull ? C_BLUE : (rel ? C_VIO : C_PALE));
+    put(MTX, 0.5, alpha * 0.34);
   }
-  drewAny = true;
+
+  if (rel){
+    /* the snap: one hot cube on the victim, gone in a third of the wave */
+    if (p < 0.34){
+      var q = 1 - p / 0.34;
+      drawCube(r.ox, r.oy, r.oz, 0.34 + 0.75 * q, C_HOT, q * q * 0.7);
+    }
+    return;
+  }
 
   /* core flash at the heart of the wave — kept small and pushed out in front so
    * it punctuates the cast instead of whiting out the player's own back */
@@ -400,15 +554,12 @@ function drawChain(nodes, n, w, glowK, core, glow, a){
     var k = j * 3;
     if (!seg2(MTX, nodes[k], nodes[k + 1], nodes[k + 2],
               nodes[k + 3], nodes[k + 4], nodes[k + 5], w)) continue;
-    tint(core); OPT.alpha = a;
-    JK.GL.draw(mSeg, MTX, OPT);
+    tint(core); put(MTX, 0.5, a);
     if (glowK > 0){
       widen(MTX, glowK);
-      tint(glow); OPT.alpha = a * 0.30;
-      JK.GL.draw(mSeg, MTX, OPT);
+      tint(glow); put(MTX, 0.5, a * 0.30);
     }
   }
-  drewAny = true;
 }
 
 function drawArc(arc){
@@ -420,7 +571,10 @@ function drawArc(arc){
   }
   var dx = arc.bx - ax, dy = arc.by - ay, dz = arc.bz - az;
   var len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  if (len < 0.05) return;
+  /* `!(len > 0.05)` not `len < 0.05`: a non-finite endpoint makes len NaN, and
+   * NaN fails EVERY `<` test, so the old form fell through and sprayed NaN model
+   * matrices through the whole chain. Same defensive form as spawnRing. */
+  if (!(len > 0.05)) return;
   var amp = 0.11 * len; if (amp < 0.09) amp = 0.09; else if (amp > 0.58) amp = 0.58;
 
   jag(NODES, ARC_LINKS, ax, ay, az, arc.bx, arc.by, arc.bz, amp, now * 21);
@@ -477,62 +631,170 @@ function gripPoint(p, out){
   return true;
 }
 
+/* THE TETHER — the bit that was missing. A writhing cord from the player's saber
+ * hand to the victim's chest, with a bright pulse crawling up it toward the
+ * victim so the direction of the force is unmistakable. 6 links x (core + glow)
+ * plus two flare cubes at the hand: 14 boxes, and it is the single most legible
+ * element of the whole effect because it crosses a lot of screen. */
+function drawTether(g, cx, cy, cz, a){
+  handPoint(HAND);
+  var ax = HAND[0], ay = HAND[1], az = HAND[2];
+  var dx = cx - ax, dy = cy - ay, dz = cz - az;
+  var len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (!(len > 0.45)) return;                     /* NaN-safe, and skip degenerate */
+  frame(dx / len, dy / len, dz / len);
+  var u1x = PX[0], u1y = PX[1], u1z = PX[2];
+  var u2x = PZ[0], u2y = PZ[1], u2z = PZ[2];
+  var amp = TETH_AMP * len, sag = TETH_SAG * len;
+  /* THE BOW. A cord that is only jittered stays inside its own axis, and when the
+   * victim is straight ahead that axis points down the lens: measured on a
+   * head-on grip the whole tether occupied a couple of pixels. So the cord also
+   * bows sideways by a body's width, in a direction that slowly revolves around
+   * the axis — from any camera angle some of that bow is across the screen. Free:
+   * it only moves the nodes that were being computed anyway. */
+  var bow = TETH_BOW * len + 0.12;
+  var bs = now * 1.6, bc = Math.cos(bs) * bow, bn = Math.sin(bs) * bow;
+  var i, k;
+  for (i = 0; i <= TETH_LINKS; i++){
+    var s = i / TETH_LINKS;
+    var env = Math.sin(s * PI);
+    var o1 = (bc + Math.sin(s * 5.2 - now * 6.5) * amp) * env;
+    var o2 = (bn + Math.cos(s * 4.1 + now * 5.1) * amp * 0.8) * env;
+    k = i * 3;
+    TNODES[k]     = ax + dx * s + u1x * o1 + u2x * o2;
+    TNODES[k + 1] = ay + dy * s + u1y * o1 + u2y * o2 - sag * env;
+    TNODES[k + 2] = az + dz * s + u1z * o1 + u2z * o2;
+  }
+  var ph = (now * 1.15) % 1;                     /* pulse crawling toward him */
+  for (i = 0; i < TETH_LINKS; i++){
+    k = i * 3;
+    var sc = (i + 0.5) / TETH_LINKS;
+    /* Fattest in MID-SPAN. Fattest at the hand made a white wedge (perspective
+     * already doubles that end); fattest at the victim washed his silhouette out
+     * the way the speed ghosts once erased the player. Mid-span is empty air. */
+    var w = TETH_W * (0.80 + 0.75 * Math.sin(sc * PI * 0.9));
+    if (!seg2(MTX, TNODES[k], TNODES[k + 1], TNODES[k + 2],
+              TNODES[k + 3], TNODES[k + 4], TNODES[k + 5], w)) continue;
+    var d = sc - ph; if (d < 0) d += 1;
+    var hot = d < 0.20 ? 1 - d / 0.20 : 0;
+    tintLerp(C_PALE, C_HOT, hot);
+    put(MTX, 0.5, a * (0.72 + 0.28 * hot));
+    widen(MTX, TETH_GLOW);
+    tintLerp(C_VIO, C_CYAN, hot);
+    put(MTX, 0.5, a * 0.14);
+  }
+  /* the hand doing the work */
+  var pu = 0.8 + 0.2 * Math.sin(now * 17);
+  drawCube(ax, ay, az, 0.17 * pu, C_HOT, a * 0.85);
+  drawCube(ax, ay, az, 0.44 * pu, C_VIO, a * 0.30);
+}
+
 function drawGrip(g){
   var a = g.life / (GRIP_HOLD * 0.6); if (a > 1) a = 1;
   if (a <= 0.02) return;
   var age = now - g.born;
-  var pop = age < 0.18 ? age / 0.18 : 1;         /* rings snap open on the lock */
+  var pop = age < GRIP_POP ? age / GRIP_POP : 1;  /* bands snap open on the lock */
+  pop = pop * pop * (3 - 2 * pop);
+  /* THRASHING: the victim is fighting it, so everything lurches together on one
+   * shared shudder (two incommensurate frequencies => never a clean loop). */
+  var cx = g.x + Math.sin(now * 13.7) * 0.05 + Math.sin(now * 7.1) * 0.03;
+  var cy = g.y + Math.sin(now * 11.3 + 1.7) * 0.055;
+  var cz = g.z + Math.cos(now * 12.1 + 0.6) * 0.05;
+  var pulse = 1 + 0.13 * Math.sin(now * 9.4);
   var i, k;
 
+  drawTether(g, cx, cy, cz, a);
+
+  /* two fat counter-rotating bands, wobbling on their axes like a caught animal */
   for (k = 0; k < GRIP_RINGS; k++){
-    var rad = (0.62 + 0.20 * k) * g.r * (0.6 + 0.4 * pop);
-    var tilt = 0.0 + k * 1.05;                   /* 0, 60, 120 deg about X */
-    var spin = now * (1.7 - 1.05 * k) + k * 2.1; /* counter-rotating gyroscope */
-    var yoff = (k - 1) * 0.16 + Math.sin(now * 2.3 + k) * 0.05;
+    var rad = (GRIP_R0 + (GRIP_R1 - GRIP_R0) * k) * g.r * pulse * (0.5 + 0.5 * pop);
+    var tilt = k * 1.15 + Math.sin(now * 1.9 + k * 2.1) * 0.30;
+    var spin = now * (2.2 - 1.5 * k) + k * 2.1;
+    var yoff = (k - 0.5) * 0.14 + Math.sin(now * 2.3 + k) * 0.05;
     var ct = Math.cos(tilt), stl = Math.sin(tilt);
     var cs = Math.cos(spin), ss = Math.sin(spin);
     /* ring plane basis: horizontal ring tilted about X, then yawed by spin */
     var e1x = cs,          e1y = 0,   e1z = -ss;
     var e2x = ct * ss,     e2y = stl, e2z = ct * cs;
+    /* ...except the INNER band, which is billboarded to the camera so it is
+     * always a full hoop. A tumbling gyroscope is alive, but it spends part of
+     * every cycle edge-on, and edge-on a ring of shards reads as the same little
+     * asterisk this rebuild exists to kill. One guaranteed circle + one tumbling
+     * ring = legible from every angle and still not static. */
+    if (k === 0 && JK.GL && JK.GL.eye){
+      var ex = cx - JK.GL.eye[0], ey = cy - JK.GL.eye[1], ez = cz - JK.GL.eye[2];
+      var el = Math.sqrt(ex * ex + ey * ey + ez * ez);
+      if (el > 0.5){
+        frame(ex / el, ey / el, ez / el);      /* PX,PZ span the screen plane */
+        e1x = PX[0] * cs + PZ[0] * ss; e1y = PX[1] * cs + PZ[1] * ss; e1z = PX[2] * cs + PZ[2] * ss;
+        e2x = -PX[0] * ss + PZ[0] * cs; e2y = -PX[1] * ss + PZ[1] * cs; e2z = -PX[2] * ss + PZ[2] * cs;
+      }
+    }
     var step = TAU / GRIP_SEG;
-    var w = 0.046 + 0.014 * k;
+    var w = GRIP_W + 0.022 * k;
     for (i = 0; i < GRIP_SEG; i++){
       var an = i * step + spin * 0.5;
       var ca = Math.cos(an), sa = Math.sin(an);
-      var cx = g.x + (e1x * ca + e2x * sa) * rad;
-      var cy = g.y + yoff + (e1y * ca + e2y * sa) * rad;
-      var cz = g.z + (e1z * ca + e2z * sa) * rad;
+      var bx = cx + (e1x * ca + e2x * sa) * rad;
+      var by = cy + yoff + (e1y * ca + e2y * sa) * rad;
+      var bz = cz + (e1z * ca + e2z * sa) * rad;
       var tx = -e1x * sa + e2x * ca;
       var ty = -e1y * sa + e2y * ca;
       var tz = -e1z * sa + e2z * ca;
-      var len = step * rad * 0.72;
+      var len = step * rad * 0.86;                /* nearly closed: a band, not dots */
       var h = len * 0.5;
-      seg(MTX, cx - tx * h, cy - ty * h, cz - tz * h, tx, ty, tz, w, len);
-      tintLerp(C_PALE, C_VIO, k / GRIP_RINGS);
-      OPT.alpha = a * (0.85 - 0.15 * k);
-      JK.GL.draw(mSeg, MTX, OPT);
+      seg(MTX, bx - tx * h, by - ty * h, bz - tz * h, tx, ty, tz, w, len);
+      tintLerp(C_PALE, C_VIO, GRIP_RINGS > 1 ? k / (GRIP_RINGS - 1) : 0);
+      put(MTX, 0.5, a * (0.78 - 0.12 * k));
       widen(MTX, 2.6);
       tint(C_BLUE);
-      OPT.alpha = a * 0.22;
-      JK.GL.draw(mSeg, MTX, OPT);
+      put(MTX, 0.5, a * 0.16);
     }
   }
-  drewAny = true;
 
-  /* motes rising out of the choke — pure formula, no state, no allocation */
+  /* VOLUME for two boxes: two counter-rotating prisms of glow around the
+   * body — a tall one down the whole figure and a wide flat one at the chest.
+   * This is what turns a sparkle into "he is held inside something". */
+  col(MTX, cx, cy, cz, GRIP_AUR0 * g.r * pulse, 2.25, now * 0.8);
+  tint(C_CYAN); put(MTX, 0, a * GRIP_AUR_A * 1.15);
+  col(MTX, cx, cy, cz, GRIP_AUR1 * g.r, 1.15, -now * 0.6 + 0.8);
+  tint(C_VIO); put(MTX, 0, a * GRIP_AUR_A);
+
+  /* motes torn off the body — pure formula, no state, no allocation */
   for (i = 0; i < GRIP_MOTES; i++){
-    var ph = (now * 0.62 + i * 0.1371) % 1;
-    var ang = i * 2.3999 + now * 1.15;
-    var mr = g.r * 0.85 * (1 - 0.55 * ph);
-    var mx = g.x + Math.cos(ang) * mr;
-    var my = g.y - 0.72 + ph * 1.85;
-    var mz = g.z + Math.sin(ang) * mr;
-    drawCube(mx, my, mz, 0.075 * (1 - 0.55 * ph), C_CYAN, a * Math.sin(ph * PI) * 0.9);
+    var mp = (now * 0.62 + i * 0.1371) % 1;
+    var ang = i * 2.3999 + now * 1.35;
+    var mr = g.r * 1.25 * (1 - 0.45 * mp);
+    var mx = cx + Math.cos(ang) * mr + Math.sin(now * 15 + i) * 0.04;
+    var my = cy - 0.80 + mp * 1.95;
+    var mz = cz + Math.sin(ang) * mr;
+    drawCube(mx, my, mz, 0.100 * (1 - 0.45 * mp), C_CYAN, a * Math.sin(mp * PI) * 0.9);
   }
 
   /* the choke itself */
-  drawCube(g.x, g.y, g.z, 0.22 + 0.05 * Math.sin(now * 15), C_HOT, a * 0.55);
-  drawCube(g.x, g.y, g.z, 0.62 + 0.10 * Math.sin(now * 15), C_VIO, a * 0.18);
+  drawCube(cx, cy, cz, 0.26 + 0.06 * Math.sin(now * 15), C_HOT, a * 0.42);
+  drawCube(cx, cy, cz, 0.66 + 0.10 * Math.sin(now * 15), C_VIO, a * 0.13);
+}
+
+/* THE RELEASE. JK.Powers has no ForceFx call for letting go (its contract ends
+ * at onForce('gripRelease')), so the visual is driven from the aura's own death:
+ * a grip that stops being refreshed times out inside GRIP_HOLD, and that is
+ * exactly the moment the player let go. Anything that ends a channel — release,
+ * empty force pool, the victim dying, switching power — lands here, so the choke
+ * can never just evaporate. */
+function releaseBurst(g){
+  if (now - g.born < REL_MIN) return;             /* a one-frame graze: no bang */
+  var P = JK.Player;
+  var px = P && P.pos ? P.pos[0] : g.x;
+  var py = P && P.pos ? P.pos[1] + 1.25 : g.y;
+  var pz = P && P.pos ? P.pos[2] : g.z + 1;
+  RPOS[0] = g.x; RPOS[1] = g.y; RPOS[2] = g.z;
+  RDIR[0] = g.x - px; RDIR[1] = g.y - py; RDIR[2] = g.z - pz;
+  spawnRing(2, RPOS, RDIR);                       /* hoop faces along the throw */
+  if (JK.Fx){
+    if (JK.Fx.burst) JK.Fx.burst(RPOS, 14, C_CYAN);
+    if (JK.Fx.sparks) JK.Fx.sparks(RPOS, 10, C_PALE);
+  }
 }
 
 /* =============================== speed ============================== */
@@ -625,9 +887,10 @@ function drawGhosts(){
     MTX[8] = sn * sc; MTX[9] = 0;  MTX[10] = c * sc;  MTX[11] = 0;
     MTX[12] = gPos[k]; MTX[13] = gPos[k + 1]; MTX[14] = gPos[k + 2]; MTX[15] = 1;
     tintLerp(C_CYAN, C_BLUE, 1 - s);
-    OPT.alpha = a;
-    JK.GL.draw(mGhost, MTX, OPT);
-    drewAny = true;
+    var r = TINT[0] * a, gg = TINT[1] * a, bb = TINT[2] * a;
+    for (var q = 0; q < 30; q += 6)             /* five body boxes, one frame */
+      emitBox(MTX, GHOST_BOX[q], GHOST_BOX[q+1], GHOST_BOX[q+2],
+              GHOST_BOX[q+3], GHOST_BOX[q+4], GHOST_BOX[q+5], r, gg, bb);
   }
 }
 
@@ -679,6 +942,13 @@ var ForceFx = JK.ForceFx = {
    * keeps each target on the same slot with no matching cost. ---- */
   lightning: function(from, to){
     if (!from || !to) return;
+    /* One caller-garbage check at the door, exactly as gripPoint does: a single
+     * non-finite endpoint used to make len NaN and spray ~28 NaN model matrices
+     * a frame, every frame the channel was held, with nothing to say where they
+     * came from. Measured: 8 NaN uniform matrices per frame per bad arc. */
+    if (!(from[0] > -1e9 && from[0] < 1e9 && from[1] > -1e9 && from[1] < 1e9 &&
+          from[2] > -1e9 && from[2] < 1e9 && to[0] > -1e9 && to[0] < 1e9 &&
+          to[1] > -1e9 && to[1] < 1e9 && to[2] > -1e9 && to[2] < 1e9)) return;
     var i = arcCursor;
     if (i >= ARC_MAX){                            /* overflow: recycle the faintest */
       i = 0;
@@ -700,17 +970,21 @@ var ForceFx = JK.ForceFx = {
   grip: function(target, t){
     if (!gripPoint(target, GP)) return;
     if (typeof t === 'number' && t > now) now = t;
-    var i, g = null, best = 1e9;
+    var i, g = null, best = 1e9, same = false;
     for (i = 0; i < GRIP_MAX; i++){
       var c = grips[i];
       if (c.life > 0){
         var dx = c.x - GP[0], dy = c.y - GP[1], dz = c.z - GP[2];
-        if (dx * dx + dy * dy + dz * dz < 12.25){ g = c; break; }   /* same victim */
+        if (dx * dx + dy * dy + dz * dz < 12.25){ g = c; same = true; break; }  /* same victim */
       }
       if (c.life < best){ best = c.life; g = c; }   /* else: recycle the faintest */
     }
     if (!g) g = grips[0];
-    if (g.life <= 0) g.born = now;
+    /* Anything that is NOT a refresh of the same victim restarts the pop — a
+     * fresh lock, and also a live slot STOLEN for a different victim, which the
+     * old `g.life <= 0` test missed: the bands stayed wide open, so the second
+     * simultaneous choke never snapped shut on anybody. */
+    if (!same) g.born = now;
     g.x = GP[0]; g.y = GP[1]; g.z = GP[2];
     g.r = (target && target.radius ? target.radius : 0.55) * 1.6;
     g.life = GRIP_HOLD;
@@ -745,7 +1019,11 @@ var ForceFx = JK.ForceFx = {
     }
     for (i = 0; i < GRIP_MAX; i++){
       var g = grips[i];
-      if (g.life > 0){ g.life -= dt; if (g.life < 0) g.life = 0; }
+      if (g.life > 0){
+        g.life -= dt;
+        /* the frame the choke times out IS the frame the player let go */
+        if (g.life <= 0){ g.life = 0; releaseBurst(g); }
+      }
     }
     if (speedOn && now - gLast >= GHOST_DT) sampleGhost();
   },
@@ -753,17 +1031,13 @@ var ForceFx = JK.ForceFx = {
   draw: function(){
     if (!built || !JK.GL || !JK.GL.gl) return;
     var i;
-    drewAny = false;
+    JK.GL.reset(batch);          /* counts decide what is drawn: never stale */
     drawGhosts();
     for (i = 0; i < RING_MAX; i++) if (rings[i].live) drawRing(rings[i]);
     for (i = 0; i < GRIP_MAX; i++) if (grips[i].life > 0) drawGrip(grips[i]);
     for (i = 0; i < ARC_MAX; i++) if (arcs[i].life > 0) drawArc(arcs[i]);
-    if (drewAny){
-      /* additive draws leave depthMask(false); one degenerate opaque draw puts
-       * it back so the NEXT frame's depth clear is not silently discarded. */
-      cube(MTX, 0, 0, 0, 0);
-      JK.GL.draw(mCube, MTX, RESET);
-    }
+    /* the whole module, however much of it is alight, in ONE driver call */
+    if (batch.ni) JK.GL.draw(batch, null, BOPT);
   }
 };
 })();

@@ -22,27 +22,29 @@
  *            damage; gripRelease throws them.
  *   DEAD     2.0 s corpse: crumples, then sinks into the sand, then recycles.
  *
- * STORMTROOPER (hp 40, r 0.5, h 1.8, white armour, saber off, rifle drawn here)
+ * STORMTROOPER (hp 40, r 0.5, h 1.8, white plastoid over a black undersuit,
+ *               saber off, rifle drawn here)
  *   IDLE ---player within 46 m---> SPOT ---> ADVANCE
  *   ADVANCE  run to 14 m --> FIRE.  Player > 85 m --> IDLE.
- *   FIRE     stand, raise rifle, bursts of 3 @ 0.13 s, 1.5 s between bursts,
- *            per-burst aim bias (~5 deg) + per-shot spread (~4 deg) so they
- *            MISS a lot. dist > 18 --> ADVANCE, dist < 6.5 or 45% roll -->
- *            REPOSITION.
- *   REPOSITION strafe around the player 1.2-2.0 s; 18% of the time they trip
- *            --> STUMBLE. Ends --> FIRE.
+ *   FIRE     stand, raise rifle, bursts of 3 @ 0.13 s on a 1.5 s PERIOD (see
+ *            BURST_GAP), per-burst lateral aim bias + per-shot spread (~4 deg)
+ *            so they MISS a lot. Between bursts: dist > 18 --> ADVANCE,
+ *            dist < 6.5 or a 42% roll --> REPOSITION.
+ *   REPOSITION strafe around the player 0.9-1.6 s, STILL FIRING (the burst clock
+ *            is shared, with 1.7x the aim error because he is moving); 18% of
+ *            the time they trip --> STUMBLE. Ends --> FIRE mid-rest.
  *   FLEE     hp < 30% or 2 squadmates died within 6 s: sprint away, fire
  *            wildly backwards every ~0.45 s. After 5 s they find their nerve
  *            --> ADVANCE.
  *   DISARMED Force Pull: rifle is yanked out of their hands (it lies on the
  *            sand), they panic-run in a zig-zag for 2.5 s, then re-arm.
  *
- * SITH (hp 120, r 0.55, h 1.85, black/crimson robes, red blade; one elite
+ * SITH (hp 120, r 0.55, h 1.85, slate robe + crimson sash, red blade; one elite
  *       carries a staff)
  *   IDLE ---player within 55 m---> SPOT (ignite) ---> STALK
- *   STALK    circle-strafe the ring at 5 m, saber in guard. Timers fire:
- *            charge (1.6-2.8 s, needs the duel token) --> CHARGE,
- *            leap (6-10 s, 6-18 m) --> LEAP, push (7-12 s, 4-9 m) --> FPUSH.
+ *   STALK    circle-strafe the ring at 4.2 m, saber in guard. Timers fire:
+ *            charge (1.4-2.4 s, needs the duel token) --> CHARGE,
+ *            leap (6.5-10 s, 6-18 m) --> LEAP, push (9-15 s, 3.5-9.5 m) --> FPUSH.
  *   CHARGE   close to 2.2 m --> COMBO (2.5 s timeout --> STALK).
  *   COMBO    2-3 chained rig.playSwing arcs; the hero takes JK.Hero.hurt
  *            during each swing's active window (phase 0.25..0.72) if he is
@@ -50,23 +52,29 @@
  *   LEAP     force-jump arc toward the player (own gravity). Landing near -->
  *            COMBO, else --> CHARGE.
  *   FPUSH    0.45 s telegraph (arm out), then a Force Push on the hero.
- *   RECOVER  back off + taunt flourish 1.0-1.6 s --> STALK.
+ *   RECOVER  give up ~1.1 m + taunt flourish 0.85-1.25 s --> STALK.
  *
  * ============================ THE TWO FUN DIALS =============================
  * THE DUEL TOKEN. Only ONE sith may be closing or swinging at any moment; the
  * rest circle at sabre distance, taunt and throw the occasional Force Push.
  * Three sith attacking at once did 54 dps to a standing hero (dead in under
- * two seconds and unreadable); with the token it is ~10 dps of saber damage
- * and the fight reads as a duel with an audience, which is the JK2 feel.
+ * two seconds and unreadable); with the token it is 4.6 dps of saber damage from
+ * a lone sith and 6.1 dps from the whole boot wave (measured against a hero who
+ * never moves: 95 hp in 20.5 s, and 87 hp in 14.3 s), so the fight reads as a
+ * duel with an audience, which is the JK2 feel.
+ * The token is also why FPUSH_DMG matters so much: the sith who does NOT hold
+ * the token has nothing to do but shove, and a shove the player cannot answer
+ * was 30% of all damage taken in a measured session. It is a shove now, not an
+ * attack — 5 damage, and the knockback is the point.
  *
  * THE MISS MODEL. A stormtrooper's per-burst aim error is a LATERAL DISTANCE
  * at the target (3 m), not an angle, and it is applied un-eased so it is
  * already full-strength on the first shot of the burst. Both details matter:
  * an angular error collapses at close range (76% accuracy measured at ~8 m),
  * and easing the error let the opening shot fly true while the aim converged.
- * With the lateral model a trooper is equally hopeless at every range — about
- * a third of his bolts land on a hero who is not even dodging, before the
- * saber deflects any of them.
+ * With the lateral model a trooper is equally hopeless at every range: measured
+ * over 60 s against a hero who never moves, 16 of 123 bolts landed (13%) and 12
+ * more were deflected back at him by the hero's idle blade.
  *
  * ============================ API ==========================================
  *   JK.Bots.list        array of bot objects (live + corpses). Stable identity.
@@ -119,7 +127,28 @@ var TR_HP = 40, TR_R = 0.50, TR_H = 1.80;
 var TR_SPOT = 46, TR_LOSE = 85;
 var TR_RANGE = 14, TR_MIN = 6.5, TR_FAR = 18;
 var TR_WALK = 3.6, TR_RUN = 6.2, TR_PANIC = 7.0;
+/* THE BURST RHYTHM (contract: bursts of 3, 0.13 s apart, 1.5 s between bursts).
+ * BURST_GAP is the burst PERIOD — first shot of one burst to the first shot of
+ * the next — so the rhythm you hear is a burst every 1.5 s, i.e. 2 bolts/s from
+ * an engaged trooper. BURST_REST is what is left over once the burst has spent
+ * its own 0.05 + 2*0.13 s, and is derived, never hand-tuned.
+ *
+ * MEASURED BEFORE THIS: 1.00 bolts/s and a 3.04 s gap between bursts, from a
+ * trooper that was in FIRE 66% of the time. Two things ate the missing half:
+ *   1. the gap was counted from the LAST shot of the burst, so the real period
+ *      was 0.05 + 0.26 + 1.50 = 1.81 s, not 1.50;
+ *   2. REPOSITION was completely silent, and the trooper rolled into it after
+ *      about half his bursts, adding a mean 1.6 s of dead air. That is the whole
+ *      deficit: 1.81 + 0.8 = 2.6 s per burst against the contract's 1.5.
+ * Now the burst clock runs in REPOSITION too — a strafing trooper keeps firing,
+ * which is both the contract's rate and what a 2002 trooper actually does — and
+ * the rest is derived from the period. */
 var BURST_N = 3, BURST_DT = 0.13, BURST_GAP = 1.5;
+var BURST_LEAD = 0.05;      /* s from entering a burst to the first shot */
+var BURST_REST = BURST_GAP - (BURST_N - 1) * BURST_DT - BURST_LEAD;
+var REPOS_P = 0.42;         /* chance of sidestepping instead of re-bursting */
+var REPOS_MIN = 0.9, REPOS_MAX = 1.6;
+var REPOS_MISS = 1.7;       /* aim error multiplier while shooting on the move */
 var SHOT_SPREAD = 0.070;    /* rad, ~4 deg per shot (contract) */
 /* Per-BURST aim bias, in METRES OF LATERAL MISS at the target — not radians.
  * An angular bias collapses at close range: the probe measured 76% accuracy
@@ -129,54 +158,162 @@ var SHOT_SPREAD = 0.070;    /* rad, ~4 deg per shot (contract) */
 var AIM_MISS = 3.0;         /* m of horizontal scatter at the target */
 var AIM_MISS_Y = 0.9;       /* m of vertical scatter */
 var AIM_LEAD = 0.50;        /* fraction of the true lead they actually apply */
-var BOLT_DMG = 9, BOLT_SPD = 58;
+/* 4, not 9 — because the fire rate DOUBLED. Fixing the rate in isolation would
+ * have undone the sith rebalance: at 9 damage and the new 2 bolts/s, the measured
+ * bolt share of a 30 s casual session went from 9-27 hp to 36-42.
+ * BE HONEST ABOUT WHAT THIS BUYS, THOUGH: it holds the damage FIRED per second
+ * roughly level (9 x 1.0 = 9.0 -> 4 x 2.05 = 8.2), not the damage LANDED. One
+ * trooper against a hero who stands still for 60 s, measured end to end on both
+ * builds: 57 bolts / 4 hits / 36 hp before, 123 bolts / 16 hits / 64 hp after —
+ * 0.60 dps becomes 1.07. Twice the noise and twice the light show for ~1.8x the
+ * incoming damage, which a lone trooper can afford to be (100 hp, 4 hp/s regen)
+ * and which the sith cuts more than pay for: an idle hero survives the boot wave
+ * 14.3 s instead of 9.3. A full burst of three is 12 hp. */
+var BOLT_DMG = 4, BOLT_SPD = 58;
 var DISARM_T = 2.5;
 var FLEE_T = 5.0, FLEE_HP = 0.30, SQUAD_WINDOW = 6.0;
 var RIFLE_MUZZLE = 0.60;    /* m from the grip to the barrel tip */
 
-/* sith */
-var SI_HP = 120, SI_R = 0.55, SI_H = 1.85;
+/* ---------------------------------- sith ----------------------------------
+ * THE DUEL, REBALANCED FOR A PHONE. Measured before: a scripted casual player
+ * (thumb-speed camera, 0.30 s reaction, +/-14 deg aim error) fighting the real
+ * boot wave for 30 s finished on 42, 9 and 6 hp out of 100. The damage ledger
+ * said exactly where it came from — saber 41/78/67, force 18/18/18, BOLTS ZERO —
+ * so the fight was decided entirely by sith blades landing 5-8 times at 11-15
+ * damage, plus two free 9-damage shoves from the sith who was NOT duelling.
+ *
+ * The asymmetry, not a global multiplier, is what got fixed:
+ *   damage per hit   11 -> 8 (elite 15 -> 11). A 3-swing combo that fully
+ *                    connects costs 24 hp instead of 33: a quarter of your
+ *                    health for being caught flat-footed, not a third.
+ *   hit cooldown     0.5 -> 0.8 s. This is not a rate limit in practice (a sith
+ *                    only lands 0.2-0.3 hits/s) — it caps the COMBO burst at two
+ *                    landed hits instead of three, which is what killed people.
+ *   front cone       0.25 -> 0.42 (75 -> 65 deg half-angle). Circling behind a
+ *                    sith mid-swing now actually works, so footwork is rewarded.
+ *   FPUSH damage     9 -> 5, cooldown 7-12 -> 9-15 s. The shove's job is the
+ *                    knockback; at 9 damage from up to 11.5 m, off-screen, from
+ *                    a sith you were not fighting, it was 30% of all damage
+ *                    taken for no counterplay.
+ *   hp               STAYS 120. It was cut to 100 here and put back: the frozen
+ *                    ITERATION 3+4 contract says "SITH ... hp 120", and the cut
+ *                    bought nothing worth breaking it for. Measured with a
+ *                    scripted player who closes to blade reach and swings
+ *                    (MEDIUM, 22 dmg, 0.22 s reaction, +/-6 deg aim error), three
+ *                    runs each: at 100 hp the duel lasted 3.6-4.2 s and cost the
+ *                    player 8 hp; at 120 hp it lasts 3.6-4.7 s and costs 0-11.
+ *                    One extra swing is the whole difference — the sith was never
+ *                    winning that fight on hit points, so trimming them only
+ *                    softened him. The real fix for "the duel kills you" was the
+ *                    per-hit damage, the hit cooldown and the RECOVER window
+ *                    below, all of which are ours to tune and all of which stay.
+ *   RECOVER          used to retreat at 3.5 m/s for 1.0-1.6 s, i.e. 3.5-5.6 m,
+ *                    which deleted the player's counter-attack window every time
+ *                    the sith finished a combo. It is a TAUNT: it now steps back
+ *                    ~1 m and shows off in place, so the opening is real. This
+ *                    raises player dps without touching the player's numbers.
+ *   ring / chargeCd  5.0 -> 4.2 m and 1.8-3.2 -> 1.4-2.4 s: the sith spent 35-45%
+ *                    of the duel orbiting at 5 m, outside saber reach, where the
+ *                    player can only whiff. Closer and more committed means more
+ *                    of the fight happens where BOTH blades can land.
+ */
+var SI_HP = 120, SI_R = 0.55, SI_H = 1.85;   /* contract: hp 120 (do not trim) */
 var SI_SPOT = 55, SI_LOSE = 95;
-var SI_RING = 5.0, SI_CLOSE = 2.2;   /* contract: charge closes to 2.2 m */
+var SI_RING = 4.2, SI_CLOSE = 2.2;   /* contract: charge closes to 2.2 m */
 var SI_WALK = 4.4, SI_RUN = 7.2;
-/* Melee damage is deliberately modest and rate-limited: a 3-swing combo that
- * all connects costs ~33 hp, so a duel is scary but survivable and you always
- * get a window to push, leap or parry out of it. (Harness at 16 dmg with no
- * cooldown killed a standing hero in about three seconds — not a duel.) */
-var SI_DMG = 11, SI_DMG_ELITE = 15;
-var SI_HIT_CD = 0.5;        /* s between two landed saber hits from one bot */
+var SI_DMG = 8, SI_DMG_ELITE = 11;
+var SI_HIT_CD = 0.8;        /* s between two landed saber hits from one bot */
 var SI_REACH = 2.4, SI_REACH_ELITE = 2.8;  /* contract: hit inside 2.4 m */
+var SI_FRONT = 0.42;        /* cos of the half-angle the hero must be inside */
 var ACT0 = 0.25, ACT1 = 0.72;   /* swing damage window (phase) */
+var FPUSH_DMG = 5;
 var FPUSH_MAX = 11.5;       /* m: the shove is re-checked against this on landing */
+var RECOVER_MIN = 0.85, RECOVER_MAX = 1.25;
+var RECOVER_BACK = 1.1;     /* m of ground given up while taunting */
 
 /* movement */
 var ACC_GND = 26, ACC_AIR = 7;
 var FRIC_GND = 9, FRIC_AIR = 0.35;
 var TURN_SLOW = 5, TURN_FAST = 9;
 
-/* ============================== palettes ============================ */
+/* ============================== palettes ============================
+ * PAINTED FOR VALUE, NOT FOR HUE. The scene light is fixed and known:
+ * sun (1.00, 0.92, 0.74) from (0.71, 0.573, 0.409), ambient (0.42, 0.36, 0.30),
+ * and the shader is `lit = (amb + sun*max(dot(n,L),0)) * base`. So a box face
+ * only ever gets one of a handful of multipliers, and a base colour maps onto a
+ * KNOWN on-screen range:
+ *
+ *   face        R mult   G mult   B mult   luma mult
+ *   sunward      1.13     1.01     0.83      1.02
+ *   top          0.99     0.89     0.72      0.90
+ *   shadow       0.42     0.36     0.30      0.37
+ *
+ * i.e. every base colour spans a 2.75:1 value range across the figure for free,
+ * and multiplying a base by k moves the whole figure by k. Lit sand measures
+ * luma 129-142/255, so THAT is the value everything is read against.
+ *
+ * The old sith was tunic 0.11 / pants 0.09 / boots 0.06: 0.37*0.11 = RGB 12 on
+ * the shadow side and 1.13*0.11 = RGB 32 on the sunward side. A 20-step range
+ * at the very bottom of the ramp is not "dark", it is a HOLE — measured mean
+ * luma 41 with p05/p50/p95 = 11/20/120, which is a black cut-out with a face
+ * floating on it. Fixed by giving each archetype a deliberate 5-value ramp:
+ *
+ *   SITH     hood 6-17 | legs 22-60 | robe 33-90 | crimson sash | face+hands
+ *            90-240. The robe is a cool slate so it separates from warm sand by
+ *            hue as well as value; the pale hands are the eye's anchor for where
+ *            the blade is, and the sash puts a saturated crimson band on the
+ *            waist so the torso never reads as one flat mass.
+ *   ELITE    the same ramp in oxblood with a BRONZE sash instead of crimson, so
+ *            the staff-carrying lord is a different silhouette AND a different
+ *            colour from his apprentices at 40 m.
+ *   TROOPER  white plastoid armour 83-255 over a near-black undersuit 28-77.
+ *            The old trooper was 0.83-0.88 head to toe: mean luma 140 against
+ *            sand at 142, i.e. contrast 0.007 — invisible. Bright plates over a
+ *            dark undersuit make him bimodal, so whichever half of him is not
+ *            matching the sand still carries the silhouette.
+ */
+/* WHITE ARMOUR NEEDS A BASE BRIGHTER THAN WHITE. The light is warm (sun
+ * 1.00/0.92/0.74, ambient 0.42/0.36/0.30), so the blue channel can never exceed
+ * 0.826 of its base while red reaches 1.13. Feed that light a neutral base and
+ * plastoid comes out the same warm cream as the dune it is standing on: rendered
+ * at 0.94 base the trooper read as BARE TAN SKIN in a screenshot — a shirtless
+ * man in black trousers. Nothing clamps the palette (it is the tint uniform, and
+ * only gl_FragColor saturates), so the fix is to pre-compensate: base blue 1.41x
+ * base red exactly cancels the sun's warmth, and the armour renders neutral grey
+ * 93 in shadow through 251 in the sun. THAT reads as white plastic on tan sand;
+ * a warm cream does not, at any brightness. Measured on the screenshots (sampled
+ * pixels, not palette arithmetic): mean chroma across the whole figure fell from
+ * 42-50 to 8-26, and the fraction of figure pixels carrying a >= 30 luma step
+ * against the sand went from 0.19-0.50 to 0.58-0.98 at 5/15/40 m.
+ * DO NOT PUSH THESE BASES HIGHER. The sun is fixed in world space, so a
+ * turntable at 12 m already clips: on the two camera bearings that show the
+ * sunward flank, 43-45% of the figure's pixels sit at 250-255 on all three
+ * channels (every face with dot(n,L) >= ~0.62 saturates), which costs the lit
+ * side some of its internal shading. It still reads — that bearing has the
+ * STRONGEST contrast of the eight, mean step 88-89 against sand 131-149 — but
+ * there is no headroom left to spend. */
 var PAL_TROOPER = {
-  skin:  [0.93, 0.94, 0.96],   /* helmet + gloves */
-  tunic: [0.88, 0.89, 0.93],
-  pants: [0.83, 0.84, 0.88],
-  boots: [0.13, 0.13, 0.15],
-  belt:  [0.16, 0.16, 0.19],
-  hair:  [0.10, 0.10, 0.13]    /* black helmet crown */
+  skin:  [0.93, 1.08, 1.30],   /* helmet shell + gloves — the brightest note */
+  tunic: [0.87, 1.02, 1.23],   /* chest / back / shoulder + arm plates */
+  pants: [0.26, 0.27, 0.34],   /* black undersuit: thighs + shins = structure */
+  boots: [0.10, 0.10, 0.14],
+  belt:  [0.09, 0.09, 0.13],   /* the utility belt boxes */
+  hair:  [0.07, 0.07, 0.11]    /* helmet brow / lens band */
 };
 var PAL_SITH = {
-  skin:  [0.55, 0.49, 0.50],
-  tunic: [0.11, 0.10, 0.13],
-  pants: [0.09, 0.09, 0.11],
-  boots: [0.06, 0.06, 0.08],
-  belt:  [0.42, 0.06, 0.07],
-  hair:  [0.05, 0.05, 0.07]
+  skin:  [0.86, 0.78, 0.73],   /* ashen face + bare hands: the lightest value */
+  tunic: [0.32, 0.31, 0.44],   /* robe body + sleeves — dark cool slate */
+  pants: [0.20, 0.20, 0.28],   /* robe skirt + legs, a step darker */
+  boots: [0.12, 0.11, 0.14],
+  belt:  [0.76, 0.10, 0.10],   /* crimson sash — the villain's accent */
+  hair:  [0.07, 0.06, 0.09]    /* hood/cowl: darkest, frames the pale face */
 };
 var PAL_ELITE = {
-  skin:  [0.63, 0.55, 0.55],
-  tunic: [0.21, 0.05, 0.07],
-  pants: [0.10, 0.08, 0.10],
-  boots: [0.07, 0.06, 0.08],
-  belt:  [0.62, 0.10, 0.10],
+  skin:  [0.90, 0.83, 0.79],
+  tunic: [0.44, 0.14, 0.16],   /* oxblood robe */
+  pants: [0.22, 0.13, 0.15],
+  boots: [0.13, 0.11, 0.12],
+  belt:  [0.86, 0.58, 0.14],   /* bronze sash: rank, and a warm mid-tone */
   hair:  [0.06, 0.05, 0.07]
 };
 var SABER_RED = [1.0, 0.16, 0.10];
@@ -402,7 +539,7 @@ function makeBot(variant){
     downW: 0, downDir: 1, liftW: 0, stagW: 0, flash: 0,
     /* --- trooper --- */
     hasRifle: true, dropX: 0, dropZ: 0, dropYaw: 0,
-    burstN: 0, burstT: 0, cycleT: 0, fleeCd: 0,
+    burstN: 0, burstT: 0, cycleT: 0, fleeCd: 0, reposT: 1.2,
     errLat: 0, errUp: 0,
     aimBlend: 0, recoil: 0, flashT: 0,
     aimYaw: 0, aimPitch: 0, aimYaw0: 0, aimPitch0: 0,
@@ -436,11 +573,12 @@ function resetBot(b, x, z){
   b.state = 'IDLE'; b.stT = 0; b.nextState = '';
   b.downW = 0; b.downDir = 1; b.liftW = 0; b.stagW = 0; b.flash = 0;
   b.hasRifle = true; b.burstN = 0; b.burstT = 0; b.cycleT = 0; b.fleeCd = 0;
+  b.reposT = rrange(REPOS_MIN, REPOS_MAX);
   b.errLat = 0; b.errUp = 0; b.aimBlend = 0; b.recoil = 0; b.flashT = 0;
   b.comboLeft = 0; b.swingHit = false; b.hitCd = 0; b.defIdx = 0;
-  b.chargeCd = rrange(1.6, 2.8);
+  b.chargeCd = rrange(1.3, 2.4);
   b.leapCd = rrange(4.0, 8.0);
-  b.pushCd = rrange(6.0, 11.0);
+  b.pushCd = rrange(7.0, 13.0);
   b.orbit = rnd() < 0.5 ? -1 : 1;
   b.flipCd = rrange(1.5, 3.0);
   b.cheapAcc = 0; b.avoidT = 0; b.stuckT = 0;
@@ -858,19 +996,61 @@ function trooperFire(b, wild){
   B.fire(MUZ3, DIR3, 'enemy', FIRE_OPT);
 }
 
-function newBurst(b){
+/* `carry` is the (negative) overshoot of the timer that expired, folded into the
+ * new one so the 1.5 s period survives any frame rate. Without it the rhythm is
+ * quantised UP by one frame per leg: measured 1.70 s per burst at 38 fps against
+ * the intended 1.50, i.e. the burst rate silently depended on the phone. */
+function newBurst(b, carry){
   b.burstN = BURST_N;
-  b.burstT = 0.05;
-  b.errLat = (rnd() - 0.5) * 2 * AIM_MISS;
+  b.burstT = BURST_LEAD + (carry > 0 ? 0 : (carry || 0));
+  /* shooting on the move is worse shooting — the lateral scatter widens while he
+   * strafes, so keeping the rhythm alive during REPOSITION does not make him
+   * measurably more lethal, only more present */
+  var miss = AIM_MISS * (b.state === 'REPOSITION' ? REPOS_MISS : 1);
+  b.errLat = (rnd() - 0.5) * 2 * miss;
   b.errUp = (rnd() - 0.5) * 2 * AIM_MISS_Y;
+}
+/* ONE burst clock, ticked by every state that is allowed to shoot. Returns true
+ * while a burst is in flight, so the caller knows not to change state mid-burst.
+ * `auto` restarts the next burst when the rest expires (FIRE and REPOSITION both
+ * want that; the caller decides what to do at the seam). */
+function burstTick(b, dt, auto){
+  if (b.burstN > 0){
+    b.burstT -= dt;
+    if (b.burstT <= 0){
+      trooperFire(b, false);
+      b.burstN--;
+      if (b.burstN === 0) b.cycleT = BURST_REST + b.burstT;
+      else b.burstT += BURST_DT;
+    }
+    return true;
+  }
+  b.cycleT -= dt;
+  if (b.cycleT <= 0 && auto){ newBurst(b, b.cycleT); return true; }
+  return false;
 }
 /* Entering FIRE always opens with a burst. (Rolling for a burst on arrival
  * made them dither: the probe measured one burst per 3.5 s, so the desert was
- * quiet. Opening with one gives ~1 burst per 2.5 s per trooper — a proper
- * imperial hail once three of them are on you.) */
+ * quiet.) */
 function enterFire(b){
   setState(b, 'FIRE');
   newBurst(b);
+}
+function enterRepos(b){
+  var carry = b.cycleT;        /* we are at the seam: keep the period honest */
+  setState(b, 'REPOSITION');
+  b.reposT = rrange(REPOS_MIN, REPOS_MAX);
+  b.orbit = rnd() < 0.5 ? -1 : 1;
+  b.nextState = rnd() < 0.18 ? 'TRIP' : '';
+  newBurst(b, carry);          /* strafe AND shoot: the rhythm never stops */
+}
+/* A trooper coming out of a stagger / knockdown / getup must re-enter FIRE
+ * through enterFire, not through a bare setState: the old path resumed whatever
+ * burstN and cycleT happened to be frozen on his record when he was hit, which
+ * could be a full BURST_REST of silence he had already half-spent. */
+function resume(b){
+  var st = combatState(b);
+  if (st === 'FIRE') enterFire(b); else setState(b, st);
 }
 
 function trooperAI(b, dt, t, hx, hy, hz){
@@ -923,32 +1103,18 @@ function trooperAI(b, dt, t, hx, hy, hz){
   if (s === 'FIRE'){
     stand(b);
     faceTo(b, hx, hz, TURN_FAST, dt);
-    if (b.burstN > 0){
-      b.burstT -= dt;
-      if (b.burstT <= 0){
-        trooperFire(b, false);
-        b.burstN--;
-        b.burstT = BURST_DT;
-        if (b.burstN === 0) b.cycleT = BURST_GAP;
-      }
-    } else {
-      b.cycleT -= dt;
-      if (b.cycleT <= 0){
-        if (d > TR_FAR){ setState(b, 'ADVANCE'); return; }
-        if (d < TR_MIN || rnd() < 0.5){
-          setState(b, 'REPOSITION');
-          b.cycleT = rrange(1.2, 2.0);
-          b.orbit = rnd() < 0.5 ? -1 : 1;
-          if (rnd() < 0.18) b.nextState = 'TRIP'; else b.nextState = '';
-          return;
-        }
-        newBurst(b);
-      }
-    }
+    /* burstTick without auto-restart: the seam between two bursts is exactly
+     * where a trooper is allowed to decide to move, so the decision happens
+     * once per burst and never chops a burst in half. */
+    if (burstTick(b, dt, false)) return;
+    if (b.cycleT > 0) return;
+    if (d > TR_FAR){ setState(b, 'ADVANCE'); return; }
+    if (d < TR_MIN || rnd() < REPOS_P){ enterRepos(b); return; }
+    newBurst(b, b.cycleT);
     return;
   }
   if (s === 'REPOSITION'){
-    /* sidestep around the player, holding the firing ring */
+    /* sidestep around the player, holding the firing ring — and keep shooting */
     var dx = b.pos[0] - hx, dz = b.pos[2] - hz;
     var l = Math.sqrt(dx * dx + dz * dz) || 1;
     dx /= l; dz /= l;
@@ -958,17 +1124,20 @@ function trooperAI(b, dt, t, hx, hy, hz){
     var tx = hx + (dx * (l - pull * 4) + px * 6);
     var tz = hz + (dz * (l - pull * 4) + pz * 6);
     seek(b, tx, tz, TR_WALK);
-    faceTo(b, hx, hz, TURN_SLOW, dt);
-    b.cycleT -= dt;
-    if (b.nextState === 'TRIP' && b.cycleT < 0.7){
+    faceTo(b, hx, hz, TURN_FAST, dt);   /* muzzle stays on him while he strafes */
+    burstTick(b, dt, true);
+    if (b.nextState === 'TRIP' && b.stT > b.reposT - 0.55){
       b.nextState = '';
       b.downDir = -1;                                    /* face-plant */
       setState(b, 'STUMBLE');
+      b.burstN = 0;                                      /* the burst dies with him */
       b.vel[0] = b.dvx * 0.8; b.vel[2] = b.dvz * 0.8;
       sndR('hurt', b.pos[0], b.pos[1] + 1.0, b.pos[2], 0.7, 1.5);
       return;
     }
-    if (b.cycleT <= 0) enterFire(b);
+    /* plain setState, NOT enterFire: cycleT is mid-rest and must stay that way,
+     * or ending a reposition would skip the rest and beat the contract's period */
+    if (b.stT > b.reposT && b.burstN === 0) setState(b, 'FIRE');
     return;
   }
   if (s === 'FLEE'){
@@ -1024,7 +1193,7 @@ function swingPhase(b){
 /* back off and show off — the taunt is the "I'm done attacking" tell */
 function enterRecover(b){
   setState(b, 'RECOVER');
-  b.cycleT = rrange(1.0, 1.6);
+  b.cycleT = rrange(RECOVER_MIN, RECOVER_MAX);
   if (b.rig && b.rig.playSwing){
     b.rig.playSwing(TAUNT_DEF);
     snd('swing', b.pos[0], b.pos[1] + 1.3, b.pos[2], 0.5);
@@ -1036,7 +1205,7 @@ function enterRecover(b){
  * swinging at a time. The others circle at sabre distance, taunt, and throw
  * the occasional Force Push, which is exactly how a JK2 fight reads. Measured:
  * three sith with no token did 54 dps to a standing hero (dead in under two
- * seconds); with the token it is ~20 dps and you get openings.
+ * seconds); with the token a lone sith lands 4.6 dps and you get openings.
  * The token is validated every frame instead of being explicitly released, so
  * a bot that dies, is knocked flat or is gripped mid-charge cannot leak it. */
 var token = null, tokenT = 0;
@@ -1085,7 +1254,7 @@ function sithMelee(b, hx, hy, hz){
   var reach = b.elite ? SI_REACH_ELITE : SI_REACH;
   if (l > reach) return;
   var fx = -Math.sin(b.yaw), fz = -Math.cos(b.yaw);
-  if (l > 1e-4 && (fx * dx + fz * dz) / l < 0.25) return;   /* must be in front */
+  if (l > 1e-4 && (fx * dx + fz * dz) / l < SI_FRONT) return;  /* must be in front */
   b.swingHit = true;
   b.hitCd = SI_HIT_CD;
   var nx = l > 1e-4 ? dx / l : fx, nz = l > 1e-4 ? dz / l : fz;
@@ -1139,13 +1308,13 @@ function sithAI(b, dt, t, hx, hy, hz){
     if (canLeap(b, d) && startLeap(b, hx, hz)) return;
     if (b.pushCd <= 0 && d > 3.5 && d < 9.5){
       setState(b, 'FPUSH');
-      b.pushCd = rrange(7.0, 12.0);
+      b.pushCd = rrange(9.0, 15.0);
       return;
     }
     if (b.chargeCd <= 0){
       if (claimToken(b)){
         setState(b, 'CHARGE');
-        b.chargeCd = rrange(1.8, 3.2);
+        b.chargeCd = rrange(1.4, 2.4);
       } else {
         b.chargeCd = rrange(0.6, 1.2);      /* wait your turn, apprentice */
       }
@@ -1217,7 +1386,7 @@ function sithAI(b, dt, t, hx, hy, hz){
         return;
       }
       if (heroAttackable()){
-        hurtHero(9, px, 0.6, pz, 'force');
+        hurtHero(FPUSH_DMG, px, 0.6, pz, 'force');
         var F = JK.ForceFx;
         if (F && F.push){
           FX3[0] = b.pos[0] - px * 0.4;
@@ -1233,8 +1402,15 @@ function sithAI(b, dt, t, hx, hy, hz){
     return;
   }
   if (s === 'RECOVER'){
-    var bx = b.pos[0] + (b.pos[0] - hx) * 0.5, bz = b.pos[2] + (b.pos[2] - hz) * 0.5;
-    seek(b, bx, bz, SI_WALK * 0.8);
+    /* A TAUNT, not a retreat: give up ~RECOVER_BACK metres and stand there
+     * flourishing. The old version ran 3.5-5.6 m backwards at 3.5 m/s, which
+     * erased the counter-attack window every single time the sith finished a
+     * combo — the player's whole reward for surviving one. */
+    var rdx = b.pos[0] - hx, rdz = b.pos[2] - hz;
+    var rl = Math.sqrt(rdx * rdx + rdz * rdz) || 1;
+    var bx = hx + rdx / rl * (rl + RECOVER_BACK);
+    var bz = hz + rdz / rl * (rl + RECOVER_BACK);
+    seek(b, bx, bz, SI_WALK * 0.45);
     faceTo(b, hx, hz, TURN_FAST, dt);
     if (b.stT > 0.5 && canLeap(b, d) && startLeap(b, hx, hz)) return;
     if (b.stT > b.cycleT) setState(b, 'STALK');
@@ -1263,7 +1439,7 @@ function reactAI(b, dt, t){
     b.downW -= b.downW * (1 - Math.exp(-6 * dt));
     if (b.stT > GETUP_T){
       b.downW = 0;
-      setState(b, combatState(b));
+      resume(b);
     }
     return true;
   }
@@ -1285,8 +1461,9 @@ function reactAI(b, dt, t){
     b.stagW += (1 - b.stagW) * (1 - Math.exp(-16 * dt));
     if (b.stT > STAGGER_T){
       b.stagW = 0;
-      setState(b, b.nextState || combatState(b));
+      var back = b.nextState || combatState(b);
       b.nextState = '';
+      if (back === 'FIRE') enterFire(b); else setState(b, back);
     }
     return true;
   }

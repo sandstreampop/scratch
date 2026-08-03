@@ -196,15 +196,46 @@ var amb    = new Float32Array([0.38, 0.34, 0.30]);
 var fogCol = new Float32Array([0.86, 0.72, 0.52]);
 var fogDen = 0.0035;
 var curBlend = false;
-/* Redundant-state cache. Every draw used to re-bind 4 buffers, re-issue 3
-   vertexAttribPointers and re-upload 4 uniforms even when nothing had changed —
-   and a particle burst issues 150+ consecutive draws of the SAME unit cube with
-   the SAME options. Measured in busy combat: 2053 GL calls/frame. iOS Safari
-   marshals every one of those across a process boundary, so this is the single
-   biggest GPU-side cost in the game. Nothing outside this module touches GL
-   state (verified), so caching is safe; mesh() invalidates the binding. */
-var curMesh = null;
+/* ---------------------------------------------------------------------------
+   WHY THIS RENDERER IS SHAPED LIKE THIS: on iOS Safari every WebGL entry point
+   is marshalled across a process boundary, so the number of GL CALLS dominates
+   frame time far more than triangle throughput. Three measured stages, counted
+   by wrapping every entry point of the live context and dividing by frames — one
+   hand-composed frame at a fixed 120-particle load, then the same build under
+   the 12 s busy-combat benchmark (bots + bolts + force fx, so it runs higher):
+
+                                                    120-part frame   busy combat
+     per-mesh buffers, one draw per particle             1204            1553
+     + static meshes packed into shared PAGES             639             586
+     + the particle pool collapsed into ONE batch         279             489
+
+   Draw calls over the same three stages: 201 -> 201 -> 79 at 120 particles.
+
+   The page trick is the big one. Every mesh in the game uses the identical
+   vertex layout, so instead of one vertex+normal+colour+index buffer per mesh
+   (7 binding calls whenever the mesh changes) we suballocate meshes out of a
+   few large interleaved buffers. Meshes sharing a page need NO binding calls at
+   all — just drawElements at the right index offset. That removed ~7 calls from
+   every one of the ~140 draws a busy frame issues.
+
+   Consequences to respect if you touch this file:
+   - Nothing outside this module touches GL state (verified by grep), so the
+     redundant-state caches below are safe.
+   - Uniform caches are per-program and survive across frames; only beginFrame's
+     blend/depth reset and mesh()/dynamic() (which leave bindings dangling)
+     invalidate anything.
+   - Model matrices are caller-owned mutable scratch, so ONLY the identity model
+     may be cached by reference.
+   --------------------------------------------------------------------------- */
+var curBind = null;      /* page (or dynamic handle) whose buffers are bound */
 var uEm = -1, uAl = -1, uNf = -1, uTr = -1, uTg = -1, uTb = -1;
+var uMIdent = false;     /* is uModel currently the identity? */
+var lightDirty = true;   /* sun/fog uniforms need re-upload */
+
+/* interleaved vertex layout shared by every mesh, page and dynamic batch:
+   [px,py,pz, nx,ny,nz, r,g,b] — 9 floats, 36 bytes */
+var VSTRIDE = 36, VFLOATS = 9;
+var NOOPTS = {};         /* draw()'s default opts — never written, never leaked */
 
 var VS =
 'attribute vec3 aP; attribute vec3 aN; attribute vec3 aC;\n'+
@@ -245,6 +276,12 @@ function sh(type, src){
 var GL = JK.GL = {
   gl: null, eye: new Float32Array(3), aspect: 1, w: 0, h: 0,
 
+  /* read-only diagnostics: page count should settle to a small constant after
+     boot. If it keeps climbing, something is calling mesh() every frame.
+     `clamped` counts batch draws that asked for more than the batch holds — it
+     must stay 0; anything else means a pool cap and its batch have drifted. */
+  stats: { meshes: 0, verts: 0, pages: 0, batches: 0, clamped: 0 },
+
   init: function(cv){
     canvas = cv;
     gl = cv.getContext('webgl', {antialias:false, alpha:false, depth:true,
@@ -273,11 +310,11 @@ var GL = JK.GL = {
     return true;
   },
 
-  fog: function(col, den){ fogCol.set(col); fogDen = den; },
+  fog: function(col, den){ fogCol.set(col); fogDen = den; lightDirty = true; },
   sun: function(dir, col, ambient){
     var l = Math.sqrt(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]) || 1;
     sunDir[0]=dir[0]/l; sunDir[1]=dir[1]/l; sunDir[2]=dir[2]/l;
-    sunCol.set(col); amb.set(ambient);
+    sunCol.set(col); amb.set(ambient); lightDirty = true;
   },
 
   beginFrame: function(r, g, b){
@@ -286,12 +323,20 @@ var GL = JK.GL = {
     GL.w = w; GL.h = h; GL.aspect = w / (h || 1);
     gl.viewport(0, 0, w, h);
     gl.clearColor(r, g, b, 1);
+    /* Additive draws leave BLEND on and depthMask(false), and a masked depth
+       buffer silently IGNORES gl.clear(DEPTH_BUFFER_BIT). Restoring the opaque
+       state here makes the clear correct no matter who drew last, so effect
+       modules no longer need a degenerate "reset" draw at the end of draw(). */
+    if (curBlend){ gl.disable(gl.BLEND); gl.depthMask(true); curBlend = false; }
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.uniform3fv(loc.uSunDir, sunDir);
-    gl.uniform3fv(loc.uSunCol, sunCol);
-    gl.uniform3fv(loc.uAmb, amb);
-    gl.uniform3fv(loc.uFogCol, fogCol);
-    gl.uniform1f(loc.uFogDen, fogDen);
+    if (lightDirty){          /* uniforms persist; only re-send on change */
+      gl.uniform3fv(loc.uSunDir, sunDir);
+      gl.uniform3fv(loc.uSunCol, sunCol);
+      gl.uniform3fv(loc.uAmb, amb);
+      gl.uniform3fv(loc.uFogCol, fogCol);
+      gl.uniform1f(loc.uFogDen, fogDen);
+      lightDirty = false;
+    }
   },
 
   setCamera: function(eye, target, fovDeg){
@@ -302,53 +347,229 @@ var GL = JK.GL = {
     gl.uniformMatrix4fv(loc.uView, false, view);
   },
 
-  /* geo: {pos,nrm,col:Float32Array, idx:Uint16Array} */
+  /* geo: {pos,nrm,col:Float32Array, idx:Uint16Array}
+     Suballocated out of a shared page — see the header note. The returned handle
+     is opaque; nothing outside this file may read its fields. */
   mesh: function(geo){
-    function buf(target, data){
-      var b = gl.createBuffer(); gl.bindBuffer(target, b);
-      gl.bufferData(target, data, gl.STATIC_DRAW); return b;
+    var nv = geo.pos.length / 3, ni = geo.idx.length, i, j;
+    if (nv > 65536) throw new Error('GL.mesh: ' + nv + ' verts > 65536');
+    var pg = pageFor(nv, ni);
+    var base = pg.nv;
+    var v = new Float32Array(nv * VFLOATS);    /* init-time only, not per frame */
+    var P = geo.pos, N = geo.nrm, C = geo.col;
+    for (i = 0; i < nv; i++){
+      var o = i * VFLOATS; j = i * 3;
+      v[o]   = P[j]; v[o+1] = P[j+1]; v[o+2] = P[j+2];
+      v[o+3] = N[j]; v[o+4] = N[j+1]; v[o+5] = N[j+2];
+      v[o+6] = C[j]; v[o+7] = C[j+1]; v[o+8] = C[j+2];
     }
-    var m = {
-      p: buf(gl.ARRAY_BUFFER, geo.pos),
-      n: buf(gl.ARRAY_BUFFER, geo.nrm),
-      c: buf(gl.ARRAY_BUFFER, geo.col),
-      i: buf(gl.ELEMENT_ARRAY_BUFFER, geo.idx),
-      count: geo.idx.length
-    };
-    curMesh = null;               /* creating buffers left them bound: invalidate */
+    var idx = new Uint16Array(ni);              /* rebased into the page */
+    for (i = 0; i < ni; i++) idx[i] = geo.idx[i] + base;
+    gl.bindBuffer(gl.ARRAY_BUFFER, pg.vb);
+    gl.bufferSubData(gl.ARRAY_BUFFER, base * VSTRIDE, v);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, pg.ib);
+    gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, pg.ni * 2, idx);
+    var m = { page: pg, first: pg.ni, count: ni };
+    pg.nv += nv; pg.ni += ni;
+    GL.stats.meshes++; GL.stats.verts += nv; GL.stats.pages = pages.length;
+    curBind = null;               /* uploading left bindings/pointers stale */
     return m;
   },
 
+  /* DYNAMIC batch — see the note above dynamic()'s helpers below. */
+  dynamic: function(maxVerts, opt){
+    opt = opt || {};
+    if (maxVerts > 65536) throw new Error('GL.dynamic: ' + maxVerts + ' verts > 65536');
+    var h = {
+      _dyn: true,
+      max: maxVerts,
+      v: new Float32Array(maxVerts * VFLOATS),  /* interleaved, stride 9 */
+      idx: opt.idx || new Uint16Array(opt.maxIdx || maxVerts * 3),
+      n: 0,                      /* vertices written this frame */
+      ni: 0,                     /* indices to draw this frame  */
+      staticIdx: !!opt.idx,
+      vb: gl.createBuffer(), ib: gl.createBuffer()
+    };
+    /* Draw ceiling, precomputed so the per-frame clamp in drawDynamic is two
+       compares: whole triangles only, so an over-full batch loses a primitive
+       rather than half of one. */
+    h.maxI = h.idx.length - (h.idx.length % 3);
+    gl.bindBuffer(gl.ARRAY_BUFFER, h.vb);
+    gl.bufferData(gl.ARRAY_BUFFER, h.v.byteLength, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, h.ib);
+    if (h.staticIdx) gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, h.idx, gl.STATIC_DRAW);
+    else gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, h.idx.byteLength, gl.DYNAMIC_DRAW);
+    h.vv = mkViews(h.v, VBUCKET * VFLOATS);
+    h.vi = mkViews(h.idx, IBUCKET);
+    GL.stats.batches++;
+    curBind = null;              /* buffer creation left bindings dangling */
+    return h;
+  },
+
+  reset: function(h){ h.n = 0; h.ni = 0; },
+
   draw: function(mesh, model, opts){
-    opts = opts || {};
-    gl.uniformMatrix4fv(loc.uModel, false, model || IDENT);
-    var v = opts.emissive || 0;
-    if (v !== uEm){ gl.uniform1f(loc.uEmissive, v); uEm = v; }
-    v = opts.alpha !== undefined ? opts.alpha : 1;
-    if (v !== uAl){ gl.uniform1f(loc.uAlpha, v); uAl = v; }
-    v = opts.nofog ? 1 : 0;
-    if (v !== uNf){ gl.uniform1f(loc.uNoFog, v); uNf = v; }
-    var t = opts.tint;
-    var tr = t ? t[0] : 1, tg = t ? t[1] : 1, tb = t ? t[2] : 1;
-    if (tr !== uTr || tg !== uTg || tb !== uTb){
-      gl.uniform3f(loc.uTint, tr, tg, tb); uTr = tr; uTg = tg; uTb = tb;
-    }
-    var add = !!opts.additive;
-    if (add !== curBlend){
-      curBlend = add;
-      if (add){ gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE); gl.depthMask(false); }
-      else { gl.disable(gl.BLEND); gl.depthMask(true); }
-    }
-    if (mesh !== curMesh){
-      curMesh = mesh;
-      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.p); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.n); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.c); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.i);
-    }
-    gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0);
+    opts = opts || NOOPTS;        /* shared: `opts || {}` allocated every frame */
+    if (mesh._dyn){ drawDynamic(mesh, model, opts); return; }
+    applyState(model, opts);
+    if (mesh.page !== curBind) bindUnit(mesh.page);
+    gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, mesh.first * 2);
   }
 };
+
+/* ---- shared static-geometry pages ------------------------------------------
+ * One page holds many meshes in one interleaved vertex buffer + one index
+ * buffer, so switching between meshes on the same page costs ZERO GL calls.
+ * Indices are rebased at upload time (WebGL1 has no baseVertex), which is why a
+ * page can never exceed the 16-bit index range. A geo too big for a fresh page
+ * gets a page sized exactly to it (the 129x129 terrain grid: 16641 verts /
+ * 98304 indices), and small meshes keep filling the general pages after it. */
+var PAGE_V = 16384, PAGE_I = 32768;
+var pages = [];
+
+function newPage(capV, capI){
+  var p = { vb: gl.createBuffer(), ib: gl.createBuffer(),
+            capV: capV, capI: capI, nv: 0, ni: 0 };
+  gl.bindBuffer(gl.ARRAY_BUFFER, p.vb);
+  gl.bufferData(gl.ARRAY_BUFFER, capV * VSTRIDE, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, p.ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, capI * 2, gl.STATIC_DRAW);
+  pages.push(p);
+  return p;
+}
+
+function pageFor(nv, ni){
+  for (var i = 0; i < pages.length; i++){
+    var p = pages[i];
+    if (p.nv + nv <= p.capV && p.ni + ni <= p.capI) return p;
+  }
+  if (nv > PAGE_V || ni > PAGE_I) return newPage(nv, ni);   /* exact-fit page */
+  return newPage(PAGE_V, PAGE_I);
+}
+
+/* Bind a page or a dynamic handle. Both use the same interleaved layout, so the
+ * three attrib pointers are identical — but WebGL1 has no VAOs, so a pointer
+ * always re-captures whatever is bound and must be re-issued on a switch. */
+function bindUnit(u){
+  gl.bindBuffer(gl.ARRAY_BUFFER, u.vb);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, VSTRIDE, 0);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, VSTRIDE, 12);
+  gl.vertexAttribPointer(2, 3, gl.FLOAT, false, VSTRIDE, 24);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, u.ib);
+  curBind = u;
+}
+
+/* ---- per-draw uniform + blend state, shared by both draw paths -------------
+ * Only the IDENTITY model matrix is cached: callers hand us mutable scratch
+ * matrices (M.ident(MTX); M.tr(MTX,...) then draw), so a by-reference compare
+ * on a real model matrix would be wrong. null/IDENT is safe and is what the
+ * batched path normally passes (its vertices are already in world space) — but
+ * a batch handed a model matrix honours it like any other mesh, so the two draw
+ * paths cannot disagree about what argument 2 means. */
+function applyState(model, opts){
+  if (model && model !== IDENT){
+    gl.uniformMatrix4fv(loc.uModel, false, model); uMIdent = false;
+  } else if (!uMIdent){
+    gl.uniformMatrix4fv(loc.uModel, false, IDENT); uMIdent = true;
+  }
+  var v = opts.emissive || 0;
+  if (v !== uEm){ gl.uniform1f(loc.uEmissive, v); uEm = v; }
+  v = opts.alpha !== undefined ? opts.alpha : 1;
+  if (v !== uAl){ gl.uniform1f(loc.uAlpha, v); uAl = v; }
+  v = opts.nofog ? 1 : 0;
+  if (v !== uNf){ gl.uniform1f(loc.uNoFog, v); uNf = v; }
+  var t = opts.tint;
+  var tr = t ? t[0] : 1, tg = t ? t[1] : 1, tb = t ? t[2] : 1;
+  if (tr !== uTr || tg !== uTg || tb !== uTb){
+    gl.uniform3f(loc.uTint, tr, tg, tb); uTr = tr; uTg = tg; uTb = tb;
+  }
+  var add = !!opts.additive;
+  if (add !== curBlend){
+    curBlend = add;
+    if (add){ gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE); gl.depthMask(false); }
+    else { gl.disable(gl.BLEND); gl.depthMask(true); }
+  }
+}
+
+/* ---- DYNAMIC batched geometry ----------------------------------------------
+ * WHY: JK.Fx used to issue ONE gl.drawElements per live particle — 150+
+ * back-to-back draws of the same unit cube in a spark burst. Every WebGL call
+ * on iOS Safari is marshalled across a process boundary, so the call COUNT, not
+ * the triangle count, was the frame-time spike. CPU-transforming a cube into a
+ * shared vertex buffer is ~30 float ops; a driver call is far more expensive.
+ *
+ * USAGE (WebGL1, no extensions, no VAOs; coexists with the static mesh path):
+ *   var h = JK.GL.dynamic(maxVerts, {idx: template});
+ *   // once: write the normals into h.v[o+3..o+5] for every slot
+ *   JK.GL.reset(h);
+ *   ... for each primitive, write WORLD-space verts into h.v at stride 9
+ *       (pos at o..o+2, colour at o+6..o+8), advancing h.n;
+ *       set h.ni = number of indices to draw ...
+ *   if (h.ni) JK.GL.draw(h, null, opts);      // ONE bufferSubData + ONE
+ *                                             // drawElements, total
+ * opt.idx     Uint16Array index template uploaded once as STATIC_DRAW. Use it
+ *             when the batch is N copies of one primitive packed from slot 0
+ *             (then ni = count * indicesPerPrimitive). Omit to rewrite h.idx
+ *             every frame (opt.maxIdx sizes it).
+ *
+ * The counts are the ONLY thing that decides what is drawn, so a frame with
+ * fewer primitives than the last can never show leftovers — set them every
+ * frame (or JK.GL.reset(h)) and never leave last frame's ni behind. Asking for
+ * more than the batch holds is clamped to whole triangles and counted in
+ * stats.clamped; it is a bug in the producer, not a licence to overfill.
+ *
+ * Vertices are interleaved exactly like a static page, so constant attributes
+ * (normals for emissive draws) are written once at build time and simply ride
+ * along in the upload — that costs bandwidth, never a call.
+ *
+ * Per-draw uniforms (emissive/alpha/tint/nofog/blend) are shared by the whole
+ * batch, so fold anything that varies per primitive into the VERTEX COLOUR.
+ * For additive+nofog+emissive draws that is exact: the shader reduces to
+ * dst += aC*uTint*uAlpha, so aC = colour*alpha with uTint=1, uAlpha=1 is
+ * bit-identical to one draw per primitive. Deliberately goes through draw() so
+ * a batch counts as exactly one draw call in the profiler — which is the truth.
+ *
+ * bufferSubData needs a typed-array view; making one per frame would allocate,
+ * so views are precut at build time in VBUCKET-vertex steps and reused. */
+var VBUCKET = 64, IBUCKET = 288;
+
+function mkViews(arr, bucket){
+  var v = [arr.subarray(0, 0)];         /* [0] unused: an empty batch never draws */
+  for (var k = 1; ; k++){
+    var e = k * bucket;
+    if (e >= arr.length){ v.push(arr); break; }
+    v.push(arr.subarray(0, e));
+  }
+  v.bucket = bucket;
+  return v;
+}
+function pick(v, elems){
+  var k = Math.ceil(elems / v.bucket);
+  if (k < 1) k = 1;
+  if (k >= v.length) k = v.length - 1;
+  return v[k];
+}
+
+function drawDynamic(h, model, opts){
+  var ni = h.ni, n = h.n;
+  /* CLAMP, never overrun. A producer that writes more primitives than its batch
+     was sized for has already had its surplus vertices silently swallowed by the
+     Float32Array (typed-array stores past the end are dropped, not memory
+     corruption) — but drawElements with a count past the index buffer is
+     INVALID_OPERATION, which drops the WHOLE batch and spams the error log every
+     frame. Clamping degrades to "you get the first maxI/3 triangles" instead,
+     and stats.clamped makes the drift visible in the profiler. */
+  if (ni > h.maxI){ ni = h.maxI; GL.stats.clamped++; }
+  if (n > h.max) n = h.max;
+  if (ni <= 0) return;                      /* empty batch: not a single GL call */
+  applyState(model, opts);                  /* batches pass null: world space */
+  if (h !== curBind) bindUnit(h);           /* leaves both of h's buffers bound */
+  else gl.bindBuffer(gl.ARRAY_BUFFER, h.vb);          /* rebind for the upload */
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, pick(h.vv, n * VFLOATS));
+  if (!h.staticIdx)                         /* ELEMENT buffer is already bound */
+    gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, pick(h.vi, ni));
+  gl.drawElements(gl.TRIANGLES, ni, gl.UNSIGNED_SHORT, 0);
+}
 
 /* ---- CPU geometry builders ---- */
 var Geo = JK.Geo = {
@@ -1630,6 +1851,14 @@ JK.Player = {
  *   - The blade tip is smoothly pulled under CEIL_Y: you cannot hold a saber
  *     overhead at arm's length, so the elbow tucks as the blade passes vertical.
  *     Overheads therefore stay off the "antenna above the head" failure.
+ *   - BODY CLEARANCE IS AUTOMATIC. You do not have to keep an arc away from the
+ *     character: whatever the arc (and whatever pose the blend into it passes
+ *     through), the weapon is slid clear of a no-go volume around the
+ *     head/chest/hips — see BODY_RX. Wind-ups therefore coil over the SHOULDER
+ *     rather than the sternum, which reads better anyway. Measured clearance and
+ *     its LIMITS are stated at BODY_RX; the slide is PLANNED per swing (PROF_N),
+ *     never reacted to, because a correction that arrives in one frame is a
+ *     visible teleport of the weapon.
  *
  * Instance API (consumed by sabers / ui / bots):
  *   var rig = JK.Rig.create(palette);
@@ -1672,7 +1901,20 @@ var M = JK.M;
 /* ---------------- skeleton constants ---------------- */
 var HIP_Y = 0.92;          /* pelvis height above feet */
 var PELV2TORSO = 0.10, NECK_Y = 0.52;
-var SH_X = 0.26, SH_Y = 0.44;      /* shoulder offset in torso frame */
+/* Shoulder socket. The torso is 0.40 wide (half 0.20), so a shoulder at 0.26
+ * put the 0.12-wide upper arm's inner face EXACTLY on the torso's side plane:
+ * every roll/yaw of the arm then swung it clear and opened a visible slot at
+ * the socket (box/box SAT over 109k shoulder orientations: worst separation
+ * 0.020 m, at roll -1.75 / yaw 1.57 — i.e. the airborne pose). The
+ * socket now sits INSIDE the torso's side plane and the arm mesh carries a
+ * near-cubic deltoid centred on the joint (see buildMeshes), whose smallest
+ * half-extent (SH_CAP) is what guarantees the weld: whatever the arm's
+ * orientation, the deltoid's surface is at least SH_CAP from the joint, so it
+ * always crosses the torso side plane at 0.20.  0.245 - 0.083 = 0.162 < 0.20,
+ * i.e. 0.038 m of overlap in EVERY pose, and the deltoid always covers the
+ * joint itself. */
+var SH_X = 0.245, SH_Y = 0.44;     /* shoulder offset in torso frame */
+var SH_CAP = 0.083;                /* deltoid min half-extent (see above) */
 var UARM = 0.30, LARM = 0.28;      /* arm segment lengths */
 var HIP_X = 0.105, HIP_DY = -0.06; /* leg sockets in pelvis frame */
 var ULEG = 0.42, LLEG = 0.38;
@@ -1700,6 +1942,119 @@ var BLEND_IN    = 0.045;  /* s, MINIMUM ease out of the pose we came from. The
                              instead of a snap plus a slow cock-back. */
 var BLEND_OUT   = 0.14;   /* s, ease back to procedural AFTER dur (phase already -1) */
 var DUAL_PHASE  = 0.12;   /* left blade trails the right by this fraction of dur */
+var LUNGE_CARRY = 0.22;   /* s to unload a chained-out-of lunge (see arcUpdate) */
+var POSE_DT   = 1 / 60;   /* last advance()'s dt: one frame is one dt for every
+                             rig in the game, so this is shared, not per-rig    */
+
+/* ---------------- body clearance (the weapon never cuts its owner) ---------
+ * The weapon is a 1.4 m line (2.9 m for a staff) rigidly attached to a hand that
+ * the arc engine swings around a pivot INSIDE the chest. Left alone it goes
+ * through its owner. So a no-go volume around the spine is defined, and the WHOLE
+ * WEAPON is translated in the body's XZ plane by exactly the amount needed to
+ * leave it. The translation is derived from the violation, so it is identically
+ * zero for the whole strike (the blade is a metre out by then) and the arc the
+ * player reads is untouched: only the coil moves, from over the sternum to over
+ * the shoulder — which is where a saber is actually cocked, so the anticipation
+ * reads stronger, not flatter.
+ *
+ * TWO THINGS MAKE THAT HARDER THAN IT SOUNDS, and both were live defects here:
+ *   1. The translation must be CONTINUOUS IN TIME. A correction that switches on
+ *      in one frame IS a teleport of the weapon — see clearPush's history note:
+ *      0.50 m of hand movement in a single 60 fps frame, a 358 m/s wind-up tip
+ *      speed against a 36 m/s strike, on three of the twelve attacks. So it is
+ *      PLANNED for the whole swing up front and rate-limited (see PROF_N).
+ *   2. Sliding OUTBOARD cannot clear a weapon that lies ACROSS the body, which
+ *      is exactly what a cross-body coil is. The escape direction is therefore
+ *      CHOSEN per swing out of four candidates (see playArc).
+ *
+ * MEASURED (independent probe: 12 attacks x 3 saber types x 121 phase samples per
+ * swing, plus 3 s of each of the five procedural anims; blade AND HILT segments
+ * against the head / torso / pelvis boxes rebuilt from the MODEL MATRICES
+ * ACTUALLY DRAWN; head box = the full skull + hair + brow + nose envelope; the
+ * player yawed off-axis so a body/world mix-up could not hide). Worst signed
+ * clearance over all attacks, metres, negative = interpenetrating:
+ *                head             torso            pelvis
+ *   single    0.087 -> 0.087   -0.110 -> +0.012   -0.045 -> +0.072
+ *   dual      0.054 -> 0.087   -0.120 -> -0.014   -0.045 -> +0.057
+ *   staff     0.012 -> 0.046   -0.120 -> -0.105   -0.084 -> -0.090
+ * All five procedural anims are clear by >= 0.14 m and were not touched.
+ *
+ * KNOWN REMAINING DEFECT — the STAFF's three cross-body attacks (SNAP CUT RIGHT,
+ * FALLING STAR, AVALANCHE) still put the hilt up to 0.105 m inside the torso box
+ * during the coil, at phase 0.09-0.13. Its two blades are COLLINEAR through the
+ * hand, so the weapon is a 2.9 m line through the grip; on those arcs that line
+ * crosses the spine at the coil with the hand itself only 0.14 m off it, and NO
+ * single translation inside BODY_MAX clears it. It is the authored blade
+ * ORIENTATION for a centre-gripped staff — a radial blade where a tangential one
+ * is wanted — and that lives in 50_sabers.js, not in the rig. Do not try to fix
+ * it by raising BODY_MAX: measured, 0.46 bought 0.01 m and cost the swing
+ * probe's pathOverSpan budget. Everything else, including all of single and all
+ * but one marginal frame of dual, is clear.
+ */
+/* The no-go volume is an ELLIPTICAL column, not a circular one. The body is
+ * 0.40 wide and 0.24 deep, so a circle big enough to contain it over-reaches by
+ * 0.18 m in FRONT — and a blade sweeping cleanly down the front of the chest was
+ * then shoved outboard for most of the strike, which is displacement the swing
+ * probe counts as tip PATH (pathOverSpan) for no clearance gain at all. Measured,
+ * switching to the ellipse: worst torso clearance single -0.021 -> +0.012, single
+ * pelvis -0.044 -> +0.072, dual pelvis -0.045 -> +0.057, and METEOR SMASH's
+ * pathOverSpan came back down off the 1.90 limit. */
+var BODY_RX   = 0.29;     /* half-width (X) of the no-go ellipse  */
+var BODY_RZ   = 0.225;    /* half-depth (Z). Contains every body box: the torso's
+                             corner (0.20,0.12) sits at 0.76 of the ellipse and the
+                             hair's nape (0.1225,0.1725) at 0.77.               */
+var IRX2 = 1 / (BODY_RX * BODY_RX), IRZ2 = 1 / (BODY_RZ * BODY_RZ);
+var BODY_Y0   = 0.80;     /* bottom: underside of the hips box                   */
+var BODY_Y1   = 1.88;     /* top: crown of the hair                              */
+var BODY_FADE = 0.16;     /* smooth ends, so the push never steps                */
+var BODY_MAX  = 0.38;     /* never displace the weapon further than this         */
+var BODY_DEEP = 0.20;     /* how far INTO the ellipse (normalised, 0 at the wall,
+                             1 at the spine) the push fades in over. 0.20 reaches
+                             full strength by the body-box envelope (0.77), so the
+                             boxes always get the whole push while the outer shell
+                             is a soft landing instead of a step.               */
+var WEAP_N    = 22;       /* samples along the weapon (~0.07 m apart)            */
+var HILT_BOT  = 0.15;     /* the weapon also exists BELOW the hand: the hilt box
+                             runs to -0.14 (pommel) in hand space, and it used to
+                             be excluded from the clearance test entirely — which
+                             is where every single/dual interpenetration measured
+                             in this file lived. See clearPush's callers.        */
+/* ---- the clearance slide is PLANNED, not reacted to -----------------------
+ * clearPush is continuous but its gradient is not gentle: it asks for ~0.25 m
+ * over the 5 cm of blade travel the depth fade spans, and a blade moving at
+ * 20 m/s crosses that in 2 ms. Applied raw it is a pop; rate-limited reactively
+ * it arrives too late and the hilt is already through the chest (measured both
+ * ways: raw -> 0.50 m of hand movement in one 60 fps frame; reactive-only at
+ * 3.4 m/s -> the torso box back to -0.120 m).
+ *
+ * So the whole slide is worked out ONCE per swing. A swing's pose is a known
+ * function of time — arcSample blended against the pose it started from — so
+ * playArc walks the entire swing, asks clearPush what it needs at PROF_N+1
+ * instants, and stores the answer as a profile. The profile is then dilated by
+ * one step and SLOPE-LIMITED in both directions, which can only ever RAISE a
+ * sample: the slide therefore starts moving BEFORE the blade needs it (the
+ * anticipation absorbs it, exactly as the pose blend does) and never changes
+ * faster than PUSH_RATE. Clearance is preserved by construction, and the
+ * runtime cost is one lerp.
+ * A rate-limited REACTIVE term is still kept as a floor, for the pose the plan
+ * cannot know: a rig posed by something other than the arc it was given. */
+var PROF_N    = 24;       /* profile samples across dur + BLEND_OUT */
+var PUSH_EASE = 40;       /* 1/s ease on the reactive floor (tau 25 ms) */
+var PUSH_DROP = 8.0;      /* m/s the slide may UNLOAD at. Higher than PUSH_RATE
+                             on purpose: the load happens during the wind-up,
+                             where the eye is looking for the cock-back, while the
+                             unload happens under the follow-through, where the
+                             whole arm is already sweeping back to guard. Clamping
+                             both at PUSH_RATE cost 0.03 m of torso clearance in
+                             the blend-out for no visible gain.               */
+var REACT_MAX = 0.06;     /* m the reactive floor may exceed the plan by */
+var PUSH_RATE = 7.0;      /* m/s ceiling on how fast the slide may LOAD.
+                             0.117 m per 60 fps frame — still under HALF of the
+                             0.20-0.26 m the arcs' own wind-up moves the hand in a
+                             frame, so the correction can never be what the eye
+                             follows. Measured: dropping it to 4.5 changed the
+                             worst one-frame hand movement by at most 0.03 m and
+                             cost 0.04 m of torso clearance, so 7.0 it is. */
 
 var DEF_PAL = {
   skin:  [0.85, 0.64, 0.47],
@@ -1757,20 +2112,45 @@ function buildMeshes(){
   if (MESH) return;
   var G = JK.Geo, GL = JK.GL;
   MESH = {
+    /* Head. The skull used to be a bare tan box with a lid on it, which reads as
+       a crate at any distance; a brow ridge and a nose cost 48 vertices in the
+       SAME merged mesh (no extra draw call) and give the face a direction. The
+       neck is thicker/taller than before so the 3 cm band between the torso top
+       (0.53) and the skull bottom is filled instead of showing daylight. */
     head: GL.mesh(G.merge([
-      bakedBox(0.10, 0.10, 0.10, 1,1,1, 0, 0.03, 0),          /* neck */
-      bakedBox(0.22, 0.26, 0.24, 1,1,1, 0, 0.17, 0.01)])),    /* skull */
+      bakedBox(0.115, 0.14, 0.115, 1,1,1, 0, 0.02, 0),        /* neck */
+      bakedBox(0.22, 0.26, 0.24, 1,1,1, 0, 0.17, 0.01),       /* skull */
+      bakedBox(0.19, 0.035, 0.04, 1,1,1, 0, 0.245, -0.112),   /* brow ridge */
+      bakedBox(0.055, 0.075, 0.06, 1,1,1, 0, 0.145, -0.128)])),/* nose */
+    /* Hair: cap + nape + temple slabs. The temples are what make it read as a
+       head of hair rather than a tan box wearing a plank. */
     hair: GL.mesh(G.merge([
-      bakedBox(0.24, 0.09, 0.26, 1,1,1, 0, 0.315, -0.005),    /* cap */
-      bakedBox(0.24, 0.15, 0.05, 1,1,1, 0, 0.235, 0.145)])),  /* back of head (+Z) */
+      bakedBox(0.245, 0.09, 0.265, 1,1,1, 0, 0.315, -0.005),  /* cap */
+      bakedBox(0.245, 0.20, 0.055, 1,1,1, 0, 0.205, 0.145),   /* nape (+Z) */
+      bakedBox(0.05, 0.145, 0.20, 1,1,1,  0.108, 0.245, 0.03),/* temple R */
+      bakedBox(0.05, 0.145, 0.20, 1,1,1, -0.108, 0.245, 0.03)])),/* temple L */
     torso: GL.mesh(bakedBox(0.40, 0.50, 0.24, 1,1,1, 0, 0.28, 0)),
     hips:  GL.mesh(bakedBox(0.32, 0.18, 0.21, 1,1,1, 0, -0.035, 0)),
     belt:  GL.mesh(bakedBox(0.36, 0.09, 0.25, 1,1,1, 0, 0.075, 0)),
-    uarm:  GL.mesh(bakedBox(0.12, 0.34, 0.13, 1,1,1, 0, -0.13, 0)),
-    larm:  GL.mesh(bakedBox(0.10, 0.30, 0.11, 1,1,1, 0, -0.12, 0)),
+    /* upper arm + DELTOID centred on the shoulder joint. The deltoid is the
+       fix for the detached-arm slot: near-cubic, so its surface is >= SH_CAP
+       from the joint under ANY orientation, which is more than the 0.045 the
+       joint sits outboard of the torso's side plane. It also reads as a
+       shoulder instead of the hard L-shaped step the bare arm box made. */
+    uarm:  GL.mesh(G.merge([
+      bakedBox(0.12, 0.34, 0.13, 1,1,1, 0, -0.13, 0),
+      bakedBox(2 * (SH_CAP + 0.001), 2 * SH_CAP, 0.176, 1,1,1, 0, 0, 0)])),
+    /* forearm + elbow ball: the bare boxes only overlapped 0.03 m, so a hard
+       elbow bend (the coil folds it past 2 rad) notched the outside of the joint */
+    larm:  GL.mesh(G.merge([
+      bakedBox(0.10, 0.30, 0.11, 1,1,1, 0, -0.12, 0),
+      bakedBox(0.115, 0.115, 0.12, 1,1,1, 0, 0, 0)])),
     hand:  GL.mesh(bakedBox(0.095, 0.11, 0.10, 1,1,1, 0, -0.01, 0)),
     uleg:  GL.mesh(bakedBox(0.15, 0.46, 0.16, 1,1,1, 0, -0.19, 0)),
-    lleg:  GL.mesh(bakedBox(0.125, 0.42, 0.135, 1,1,1, 0, -0.17, 0)),
+    /* shin + knee ball (same reason as the elbow; the run cycle bends 1.6 rad) */
+    lleg:  GL.mesh(G.merge([
+      bakedBox(0.125, 0.42, 0.135, 1,1,1, 0, -0.17, 0),
+      bakedBox(0.132, 0.132, 0.142, 1,1,1, 0, 0, 0)])),
     boot: GL.mesh(G.merge([
       bakedBox(0.13, 0.16, 0.15, 1,1,1, 0, 0.03, 0),          /* shaft */
       bakedBox(0.135, 0.07, 0.26, 1,1,1, 0, -0.045, -0.055)])),/* toe fwd -Z */
@@ -1810,6 +2190,41 @@ function lerp3(o, a, b, t){
   o[2] = a[2] + (b[2] - a[2]) * t;
   return o;
 }
+/* Blend a -> b about a CENTRE, keeping the distance from that centre equal to the
+ * lerp of the two distances instead of cutting the chord between them.
+ * WHY THIS EXISTS: the arc's pivot is inside the chest and both blend endpoints
+ * are ~1 m out from it, so a straight lerp of the blade's middle dips ~0.25 m
+ * toward the pivot at the halfway point — i.e. THROUGH the sternum. That is the
+ * single biggest source of measured self-clipping: on the cross-body attacks the
+ * hilt was at the centre of the torso box at phase 0.08-0.20, in the middle of
+ * the guard->coil blend, where BOTH endpoints are individually clean. Swinging
+ * the hand around the chest instead of through it fixes it at the source, for
+ * every attack at once, and needs no sliding at all. `o` may alias `a` or `b`. */
+/* Blend a -> b about a CENTRE, keeping the distance from that centre equal to the
+ * lerp of the two distances instead of cutting the chord between them.
+ * WHY THIS EXISTS: the arc's pivot is inside the chest and both blend endpoints
+ * are ~1 m out from it, so a straight lerp of the blade's middle dips ~0.25 m
+ * toward the pivot at the halfway point — i.e. THROUGH the sternum. That is a
+ * large share of the measured self-clipping: on the cross-body attacks the hilt
+ * was at the centre of the torso box at phase 0.08-0.20, in the middle of the
+ * guard->coil blend, where BOTH endpoints are individually clean. Swinging the
+ * hand around the chest instead of through it fixes it at the source, for every
+ * attack at once, and costs no sliding at all. `o` may alias `a` or `b`. */
+var blC = new Float32Array(3);     /* the centre, set by the caller */
+function arcLerp(o, a, b, t){
+  var ax = a[0]-blC[0], ay = a[1]-blC[1], az = a[2]-blC[2];
+  var bx = b[0]-blC[0], by = b[1]-blC[1], bz = b[2]-blC[2];
+  var ra = Math.sqrt(ax*ax + ay*ay + az*az);
+  var rb = Math.sqrt(bx*bx + by*by + bz*bz);
+  var cx = ax + (bx-ax)*t, cy = ay + (by-ay)*t, cz = az + (bz-az)*t;
+  var rc = Math.sqrt(cx*cx + cy*cy + cz*cz);
+  if (rc > 1e-4){
+    var k = (ra + (rb-ra)*t) / rc;
+    cx *= k; cy *= k; cz *= k;
+  }
+  o[0] = blC[0]+cx; o[1] = blC[1]+cy; o[2] = blC[2]+cz;
+  return o;
+}
 function norm3(o){
   var l = Math.sqrt(o[0]*o[0] + o[1]*o[1] + o[2]*o[2]);
   if (l < 1e-6){ o[0] = 0; o[1] = 1; o[2] = 0; return o; }
@@ -1827,6 +2242,7 @@ function ez(c, t, k){ return c + (t - c) * k; }
  * ========================================================================== */
 var AV = new Float32Array(3);      /* scratch: radial (pivot->blade middle) dir */
 var A2 = new Float32Array(2);      /* scratch: [a0, a1] out of dirsToArc        */
+var ESC_C = new Float32Array(8);   /* scratch: 4 candidate escapes, (x,z) pairs */
 
 function setBasis(a, x, y, z){
   var l = Math.sqrt(x * x + y * y + z * z);
@@ -1880,6 +2296,74 @@ var DEFAULT_ARC = {
   dirsToArc(tmp, 0.52, 0.60, -0.60, -0.60, -0.34, -0.72);
   DEFAULT_ARC.a0 = A2[0]; DEFAULT_ARC.a1 = A2[1];
 })();
+
+/* How far the weapon has to slide along the body-local XZ direction (ex,ez) so
+ * that no part of it is inside the no-go volume — the BODY_RX/BODY_RZ ellipse,
+ * between BODY_Y0 and BODY_Y1. All arguments are BODY-LOCAL: the hand at
+ * (hx,hy,hz), the blade direction (dx,dy,dz), and the weapon occupying `lo`..`hi`
+ * metres along it (`lo` is NEGATIVE: the pommel is behind the hand).
+ * Zero allocation, ~25 flops a sample.
+ *
+ * ONLY SAMPLES ACTUALLY INSIDE THE CAPSULE ASK FOR ANYTHING, and what they ask
+ * for is the LARGER root of P + t*e outside the no-go ellipse (P = the sample in
+ * the body's XZ plane) — the least travel that gets the sample out AND keeps it
+ * out. Inside the ellipse that root always exists and is always positive, so
+ * there is no branch to step over. The demand
+ * fades in with penetration DEPTH over BODY_DEEP, so a sample crossing the
+ * ellipse wall asks for nothing at the wall — which is what makes the whole
+ * function continuous in time, hence pop-free. A clean pose is left EXACTLY
+ * alone: push is identically zero, so idle/run/guard are untouched.
+ *
+ * WHAT THIS REPLACED, AND WHY (measured, all 12 attacks x 3 saber types,
+ * 161 samples a swing, plus a one-frame-displacement probe at 60 fps):
+ *   - The old version treated a sample that was out the FAR side as a CAP on the
+ *     whole weapon's travel. That cap STEPPED: one sample crossing the far
+ *     tangent flipped its contribution from "clamp everything to ~0" to
+ *     "displace clear across the body", so the entire weapon teleported up to BODY_MAX in
+ *     a single frame. Measured on the three cross-body attacks (SNAP CUT RIGHT,
+ *     FALLING STAR, AVALANCHE — one in every stance): 0.50 m of HAND movement in
+ *     one 60 fps frame at phase 0.056, a peak wind-up tip speed of 358 m/s
+ *     against a 36 m/s strike. Those attacks read as a flinch, then a cut. No
+ *     swing-probe metric sees a one-frame pop; only differentiating the tip does.
+ *   - The cap was also what left the staff's hilt at the exact centre of the
+ *     chest (-0.120 m, the deepest penetration the torso box admits) on those
+ *     same three attacks: clearing one end of a centre-gripped staff drove the
+ *     other end in, so the cap gave up and pushed nothing at all.
+ * Travel is capped by BODY_MAX; the escape DIRECTION (see playArc) is what keeps
+ * the demand small — a cross-body arc escapes mostly FORWARD, in front of the
+ * chest, because no amount of sideways sliding can clear a blade that lies
+ * across the sternum. */
+function clearPush(hx, hy, hz, dx, dy, dz, lo, hi, steps, ex, ez){
+  var push = 0, i, s, x, y, z, w, b, q, t;
+  for (i = 0; i <= steps; i++){
+    s = lo + (hi - lo) * (i / steps);
+    y = hy + dy * s;
+    w = 1;
+    if (y < BODY_Y0) w = (y - BODY_Y0 + BODY_FADE) / BODY_FADE;
+    else if (y > BODY_Y1) w = (BODY_Y1 + BODY_FADE - y) / BODY_FADE;
+    if (w <= 0) continue;                     /* above the hair / below the hips */
+    if (w > 1) w = 1;
+    w = w * w * (3 - 2 * w);                  /* smooth fade at the capsule ends */
+    x = hx + dx * s; z = hz + dz * s;
+    q = (x * x) * IRX2 + (z * z) * IRZ2;      /* < 1 == inside the ellipse */
+    if (q >= 1) continue;                     /* clear: asks for nothing */
+    if (1 - q < BODY_DEEP){                   /* fade in with depth */
+      var f = (1 - q) / BODY_DEEP;
+      w *= f * f * (3 - 2 * f);
+    }
+    /* least t >= 0 that puts P + t*e outside the ellipse: the larger root of
+       A t^2 + 2 B t + (q - 1) >= 0. Inside means q < 1, so the root always
+       exists and is always positive — there is no branch to step over. */
+    var A = ex * ex * IRX2 + ez * ez * IRZ2;
+    if (A < 1e-9) continue;
+    b = x * ex * IRX2 + z * ez * IRZ2;
+    t = ((Math.sqrt(b * b - A * (q - 1)) - b) / A) * w;
+    if (t > push) push = t;
+  }
+  return push;                    /* RAW: callers apply the BODY_MAX ceiling, and
+                                     buildProf scores the raw total so a candidate
+                                     that saturates loses to one that fits */
+}
 
 /* Sample the arc at phase p (0..1) for one side, all in body-local space.
  *   om <- blade MIDDLE (what the IK blends through), od <- blade direction,
@@ -1970,7 +2454,16 @@ function arcUpdate(r, dt){
     if (p > 1 - a.recover)
       lp *= 1 - 0.7 * smooth((p - (1 - a.recover)) / (a.recover || 1e-3));
   }
-  a.lungeCur = a.lungeAmt * lp * a.wOut;
+  /* Carry the PREVIOUS swing's lunge out instead of dropping it. Without this,
+     chaining out of a lunging attack reset the visual forward offset to 0 in a
+     single frame and the whole drawn body teleported: measured 1.29 m of hand
+     movement in one 60 fps frame on VIPER LUNGE (1.20 m of lunge) -> FLURRY
+     CROSS, the most-used LIGHT combo in the game. The carry starts at exactly
+     the offset we already had (so t = 0 is continuous) and eases out over
+     LUNGE_CARRY — its own constant, not the pose blend, because a LIGHT chain's
+     blend is only 76 ms and unloading a metre that fast is its own artefact. */
+  var cw = a.t < LUNGE_CARRY ? 1 - smooth(a.t / LUNGE_CARRY) : 0;
+  a.lungeCur = a.lungeAmt * lp * a.wOut + a.lungeCarry * cw;
 }
 
 /* Body-local blade middle + direction of the PROCEDURAL arm pose. Used only when
@@ -1993,6 +2486,92 @@ function fkLocal(r, side, outM, outD){
   outM[0] = mLocA[12] + outD[0] * ho;
   outM[1] = mLocA[13] + outD[1] * ho;
   outM[2] = mLocA[14] + outD[2] * ho;
+}
+
+/* ---- the planned clearance slide (see PROF_N) ------------------------------ */
+var pfH = new Float32Array(3), pfD = new Float32Array(3), pfM = new Float32Array(3);
+var pfFM = new Float32Array(3), pfFD = new Float32Array(3);
+var PROF_A = new Float32Array(PROF_N + 1), PROF_B = new Float32Array(PROF_N + 1);
+
+/* Walk the whole swing for one arm and fill `out` with the slide clearPush wants
+ * at each instant, then dilate + slope-limit. Returns the peak. `sgn` +1 right /
+ * -1 left (mirrored, phase-lagged by DUAL_PHASE exactly as arcUpdate does).
+ * Reproduces ikArm's blend arithmetic — blade MIDDLE space, wIn out of the pose
+ * we came from, wOut back into the procedural pose. Zero allocation. */
+function buildProf(r, a, sgn, snapM, snapD, ho, ex, ez, out){
+  var sf = (sgn > 0 && r.type === 'staff');
+  var top = sf ? STAFF_TOP : HILT_TOP;
+  var lo = sf ? -(top + BLADE_LEN) : -HILT_BOT, hi = top + BLADE_LEN;
+  var ns = sf ? 2 * WEAP_N : WEAP_N;
+  var tot = a.dur + BLEND_OUT, dtp = tot / PROF_N, i, t, p, wi, wo, l;
+  var score = 0, raw;
+  var mx0, my0, mz0, dx0, dy0, dz0;
+  fkLocal(r, sgn, pfFM, pfFD);            /* where the blend-out is heading */
+  blC[0] = sgn * a.pivot[0]; blC[1] = a.pivot[1]; blC[2] = a.pivot[2];
+  for (i = 0; i <= PROF_N; i++){
+    t = i * dtp;
+    p = (sgn < 0 ? t - DUAL_PHASE * a.dur : t) / a.dur;
+    if (p < 0) p = 0; else if (p > 1) p = 1;
+    wi = smooth(t / a.blendIn);
+    wo = t <= a.dur ? 1 : smooth(1 - (t - a.dur) / BLEND_OUT);
+    arcSample(a, p, pfH, pfD, pfM, r.type, sgn);
+    dx0 = pfD[0]; dy0 = pfD[1]; dz0 = pfD[2];
+    if (wi < 1){
+      arcLerp(pfM, snapM, pfM, wi);
+      dx0 = snapD[0] + (dx0 - snapD[0]) * wi;
+      dy0 = snapD[1] + (dy0 - snapD[1]) * wi;
+      dz0 = snapD[2] + (dz0 - snapD[2]) * wi;
+    }
+    if (wo < 1){
+      arcLerp(pfM, pfFM, pfM, wo);
+      dx0 = pfFD[0] + (dx0 - pfFD[0]) * wo;
+      dy0 = pfFD[1] + (dy0 - pfFD[1]) * wo;
+      dz0 = pfFD[2] + (dz0 - pfFD[2]) * wo;
+    }
+    l = Math.sqrt(dx0*dx0 + dy0*dy0 + dz0*dz0);
+    if (l < 1e-6){ dx0 = 0; dy0 = 1; dz0 = 0; } else { dx0 /= l; dy0 /= l; dz0 /= l; }
+    mx0 = pfM[0]; my0 = pfM[1]; mz0 = pfM[2];
+    raw = clearPush(mx0 - dx0*ho, my0 - dy0*ho, mz0 - dz0*ho,
+                    dx0, dy0, dz0, lo, hi, ns, ex, ez);
+    score += raw + 6 * max0(raw - BODY_MAX);   /* travel, saturation weighs 7x */
+    out[i] = raw > BODY_MAX ? BODY_MAX : raw;
+  }
+  /* dilate one step: a need that peaks BETWEEN samples is still covered */
+  PROF_B.set(out);
+  for (i = 0; i <= PROF_N; i++){
+    if (i > 0 && PROF_B[i-1] > out[i]) out[i] = PROF_B[i-1];
+    if (i < PROF_N && PROF_B[i+1] > out[i]) out[i] = PROF_B[i+1];
+  }
+  /* Slope-limit both ways at PUSH_RATE. The two passes only RAISE samples, so no
+     clearance is lost, and the backward pass is what makes the slide start moving
+     BEFORE the blade needs it — the anticipation absorbs the move exactly as it
+     absorbs the pose blend. */
+  var lim = PUSH_RATE * dtp;
+  for (i = PROF_N - 1; i >= 0; i--) if (out[i] < out[i+1] - lim) out[i] = out[i+1] - lim;
+  for (i = 1; i <= PROF_N; i++) if (out[i] < out[i-1] - lim) out[i] = out[i-1] - lim;
+  /* Both ENDS must be exactly zero, and the ramps out of them re-clamped. t = 0 is
+     last frame's pose, which needs no slide at all; t = dur + BLEND_OUT is the
+     procedural pose, ditto, and it is the frame the arc stops driving the arm — so
+     any slide still applied there vanishes in one frame. Starting or ending
+     anywhere but zero IS a pop. This is the one step that can cost clearance: a
+     slide that could not be pre-charged in time arrives a frame or two late.
+     Deliberate trade — a few cm of hilt inside a tunic for two frames is
+     invisible; a 0.39 m one-frame jump of the saber is the most visible artefact
+     this rig can produce, and was the defect this whole path exists to remove. */
+  out[0] = 0; out[PROF_N] = 0;
+  for (i = 1; i <= PROF_N; i++) if (out[i] > out[i-1] + lim) out[i] = out[i-1] + lim;
+  var dn = PUSH_DROP * dtp;
+  for (i = PROF_N - 1; i >= 0; i--) if (out[i] > out[i+1] + dn) out[i] = out[i+1] + dn;
+  return score;
+}
+
+function profAt(prof, t, tot){
+  if (!(tot > 0)) return 0;
+  var u = t / tot * PROF_N;
+  if (u <= 0) return prof[0];
+  if (u >= PROF_N) return prof[PROF_N];
+  var i = u | 0;
+  return prof[i] + (prof[i+1] - prof[i]) * (u - i);
 }
 
 function playArc(def){
@@ -2023,7 +2602,9 @@ function playArc(def){
   a.mirror = (this.type === 'dual') || !!def.mirror;
   a.name = def.name || '';
   a.t = 0; a.active = true; a.live = true;
-  a.wIn = 0; a.wOut = 1; a.lungeCur = 0;
+  a.wIn = 0; a.wOut = 1;
+  a.lungeCarry = this.lunge;        /* see arcUpdate: no 1-frame body teleport */
+  a.lungeCur = a.lungeCarry;
   /* Blend FROM whatever the blade is doing right now (idle guard, or the middle
      of the previous arc when chaining) so nothing ever teleports. The live pose
      is only known after a draw, so ignore it if this rig has been advanced
@@ -2035,6 +2616,52 @@ function playArc(def){
     fkLocal(this,  1, a.snapM,  a.snapD);
     fkLocal(this, -1, a.snapML, a.snapDL);
   }
+  /* --- escape direction for the body-clearance slide (see BODY_RX) -----------
+     A unit direction in the body's XZ plane, decided ONCE per swing so it can
+     NEVER flicker mid-arc — that is what makes the slide continuous in TIME.
+     Four candidates are scored by walking the WHOLE swing (buildProf) and the
+     one whose worst demand is smallest wins; ties go to the earlier candidate,
+     so outboard — the pose a saber actually cocks in — keeps every arc that
+     already worked:
+       0  OUTBOARD over the coil's shoulder
+       1  straight FORWARD, in front of the chest
+       2/3 the two PERPENDICULARS to the weapon at the coil. For a straight
+           weapon a perpendicular slide is exact AND minimal: every sample lies
+           on one line, so it makes the whole line tangent to the capsule at
+           once and cannot fix one end of a blade while opening the other.
+     Outboard is what this used to do unconditionally, and it CANNOT clear a coil
+     that lies across the body: on the staff's three cross-body coils it runs
+     along the weapon (the hand itself ends up 0.138 m from the spine, inside the
+     torso box) and asks for 0.404 m of travel, past the BODY_MAX ceiling — which
+     is why the rear blade sat 0.108 m inside the chest. A perpendicular clears
+     the same pose with 0.162 m. */
+  var cr = a.a0 - BACK_FRAC * (a.a1 - a.a0);
+  var rxx = a.u[0] * Math.cos(cr) + a.v[0] * Math.sin(cr);
+  arcSample(a, wu, a.hR, a.dR, a.mR, this.type, 1);   /* pose at the coil */
+  ESC_C[0] = rxx < -0.20 ? -1 : 1; ESC_C[1] = 0;      /* outboard */
+  ESC_C[2] = 0; ESC_C[3] = -1;                        /* forward  */
+  var bl = Math.sqrt(a.dR[0] * a.dR[0] + a.dR[2] * a.dR[2]);
+  if (bl > 0.30){
+    ESC_C[4] =  a.dR[2] / bl; ESC_C[5] = -a.dR[0] / bl;
+    ESC_C[6] = -ESC_C[4];     ESC_C[7] = -ESC_C[5];
+  } else {                                            /* vertical coil: no XZ axis */
+    ESC_C[4] = ESC_C[5] = ESC_C[6] = ESC_C[7] = 0;
+  }
+  a.profT = a.dur + BLEND_OUT;
+  var HOR = (this.type === 'staff' ? STAFF_TOP : HILT_TOP) + BLADE_LEN * 0.5;
+  var bestN = 1e9, ci, nd;
+  for (ci = 0; ci < 8; ci += 2){
+    if (ESC_C[ci] === 0 && ESC_C[ci + 1] === 0) continue;
+    nd = buildProf(this, a, 1, a.snapM, a.snapD, HOR, ESC_C[ci], ESC_C[ci + 1], PROF_A);
+    if (nd < bestN * 0.995){          /* clearly less total travel over the swing */
+      bestN = nd; a.escX = ESC_C[ci]; a.escZ = ESC_C[ci + 1];
+      a.prof.set(PROF_A);
+    }
+    if (bestN <= 1e-4) break;                         /* already clear: done */
+  }
+  if (a.mirror)
+    buildProf(this, a, -1, a.snapML, a.snapDL, HILT_TOP + BLADE_LEN * 0.5,
+              -a.escX, a.escZ, a.profL);
   arcUpdate(this, 0);
   this.swingT = 0;
   return true;
@@ -2115,6 +2742,13 @@ function swingPhase(){
 function startSwing(){ return this.playArc(DEFAULT_ARC); }
 
 /* ======================= TWO-BONE IK ======================================= */
+var IK_SOFT = 0.07;              /* m: below this reach the direction is damped
+                                    toward the pole — see solveIK. Kept SMALL:
+                                    it is a guard against a degenerate target,
+                                    and every millimetre of range it covers is
+                                    a millimetre of authored pose it perturbs.
+                                    0.12 cost 0.05 of METEOR SMASH's
+                                    pathOverSpan budget for no measured gain.  */
 var ikE = new Float32Array(3);   /* elbow */
 var ikH = new Float32Array(3);   /* reached (clamped) hand position */
 var ikN = new Float32Array(3);   /* bend-plane normal */
@@ -2130,6 +2764,19 @@ function solveIK(S, T, upper, lower, pole){
     if (L < 1e-4){ dx = 0; dy = -1; dz = 0; L = 1; }
   }
   var nx = dx / L, ny = dy / L, nz = dz / L;
+  /* Near the shoulder the reach DIRECTION is ill-conditioned: the hand is clamped
+     out to minL anyway, so a millimetre of target wobble would swing it through a
+     large angle. Fade the direction toward the (always stable) pole as the target
+     closes in. Measured: with the body-clearance slide able to drive a target to
+     within 0.05 m of the shoulder, this was worth 26 m/s of spurious tip speed on
+     METEOR SMASH's wind-up. Continuous, and a no-op beyond IK_SOFT. */
+  if (L < IK_SOFT){
+    var g = L / IK_SOFT; g = g * g * (3 - 2 * g);
+    var pw = (1 - g) / (Math.sqrt(pole[0]*pole[0] + pole[1]*pole[1] + pole[2]*pole[2]) || 1);
+    var bx = nx * g + pole[0] * pw, by = ny * g + pole[1] * pw, bz = nz * g + pole[2] * pw;
+    var bn = Math.sqrt(bx*bx + by*by + bz*bz);
+    if (bn > 1e-3){ nx = bx / bn; ny = by / bn; nz = bz / bn; }
+  }
   var maxL = (upper + lower) * 0.995;
   var minL = Math.abs(upper - lower) + 0.06;
   if (L > maxL) L = maxL; else if (L < minL) L = minL;
@@ -2185,6 +2832,7 @@ function setSaber(rgb, on){
 function advance(dt, t, anim, speed){
   var p = this.pose, a = this.arc;
   var sp = speed || 0;
+  if (dt > 1e-5) POSE_DT = dt;      /* renderRig eases the clearance slide */
 
   var stride = 2.2 + sp * 0.16;
   if (stride < 2.4) stride = 2.4; else if (stride > 3.6) stride = 3.6;
@@ -2214,20 +2862,27 @@ function advance(dt, t, anim, speed){
     twist = (fast ? 0.12 : 0.08) * s1;
     head = -lean * 0.6;
   } else if (anim === 'jump'){                /* tucked / trailing legs */
+    /* MEASURED: the old airborne wrist (-0.35) laid the blade back ACROSS the
+       body — the saber ran through the character's own head (0.040 m INTO the
+       head box, 0.099 with a dual) for the whole of every jump, which in a game
+       with a force jump is most of the time. The off arm still flings back for
+       the leap; the saber arm now carries the blade up-forward and OUTBOARD
+       (shoulder yawed out, wrist flexed), which clears by 0.54 m and reads as a
+       Jedi about to bring the blade down. */
     lSwL = 0.55; lSwR = 0.10;
     kneeL = -1.50; kneeR = -0.75;
-    aSwL = -0.55; aSwR = -0.35;               /* arms up-back */
-    sprL = 0.85; sprR = 0.70;
-    elbL = 0.45; elbR = 0.50;
-    wrist = -0.35;
+    aSwL = -0.55; aSwR = -0.20;
+    sprL = 0.85; sprR = 0.55;
+    elbL = 0.45; elbR = 0.60;
+    syR = -0.35; wrist = -1.35;
     lean = -0.06; bob = 0; twist = 0; head = 0.10;
   } else if (anim === 'fall'){                /* limbs spread */
     lSwL = 0.35; lSwR = -0.18;
     kneeL = -0.45; kneeR = -0.25;
-    aSwL = -0.15; aSwR = -0.05;
-    sprL = 1.05; sprR = 0.90;
-    elbL = 0.35; elbR = 0.40;
-    wrist = -0.50;
+    aSwL = -0.15; aSwR = 0.05;
+    sprL = 1.05; sprR = 0.70;
+    elbL = 0.35; elbR = 0.50;
+    syR = -0.32; wrist = -1.45;                /* same fix as jump (was -0.50) */
     lean = 0.07; bob = 0; twist = 0; head = 0.18;
   } else {                                    /* idle: breathe, saber on guard */
     lSwL = 0.05; lSwR = -0.05;
@@ -2252,6 +2907,12 @@ function advance(dt, t, anim, speed){
     } else if (anim === 'idle'){
       aSwL = 0.30; sprL = 0.14; elbL = 0.45; syL = -0.12;
       wrL = -1.65 + 0.05 * Math.sin(t * 1.3);
+    } else {
+      /* airborne: mirror the saber arm exactly, or the second blade lies back
+         across the head the same way the first one used to (measured -0.094 m
+         into the head box). The left arm's ROLL is already negated by the
+         renderer, so it is the YAW that has to flip. */
+      aSwL = aSwR; sprL = sprR; elbL = elbR; syL = -syR; wrL = wrist;
     }
   } else if (this.type === 'staff'){
     /* Maul carry: angled across the body, but kept near the saber guard so a
@@ -2270,6 +2931,7 @@ function advance(dt, t, anim, speed){
   /* ---- arc lifecycle ---- */
   a.snapAge++;
   if (a.live) arcUpdate(this, dt);
+  else { a.pu[0] = 0; a.pu[1] = 0; }   /* no arc, no slide: never carry one over */
   var w = a.live ? a.wIn * a.wOut : 0;
   if (a.live){
     twist = twist * (1 - w) + a.twist * w;    /* torso follows the arc */
@@ -2327,21 +2989,61 @@ function fkArm(mU, mF, mH, shx, roll, yaw, pitch, elb, wr, wroll){
 /* Blending happens in BLADE-MIDDLE space, not hand space: a saber cocking back
  * pivots roughly about the middle of the blade (hilt drops as the tip rises), so
  * the tip takes the short way round instead of being shoved across the body. */
-function ikArm(mU, mF, mH, shx, mLoc, dLoc, snapM, snapD, tilt, wIn, wOut, side, ref, ho){
+function ikArm(mU, mF, mH, shx, mLoc, dLoc, snapM, snapD, tilt, wIn, wOut, side, ref,
+               ho, ex, ez, pu2, pi, plan){
   M.xp(wT, mRoot, mLoc[0], mLoc[1], mLoc[2]);          /* arc blade middle -> world */
   M.xd(wB, mRoot, dLoc[0], dLoc[1], dLoc[2]);
   if (wIn < 1){                                        /* ...from the snapshot */
     M.xp(wX, mRoot, snapM[0], snapM[1], snapM[2]);
     M.xd(wY, mRoot, snapD[0], snapD[1], snapD[2]);
-    lerp3(wT, wX, wT, wIn); lerp3(wB, wY, wB, wIn);
+    arcLerp(wT, wX, wT, wIn); lerp3(wB, wY, wB, wIn);
   }
   if (wOut < 1){                                       /* ...back to procedural */
     wY[0] = mH[4];  wY[1] = mH[5];  wY[2] = mH[6];
     wX[0] = mH[12] + wY[0]*ho; wX[1] = mH[13] + wY[1]*ho; wX[2] = mH[14] + wY[2]*ho;
-    lerp3(wT, wX, wT, wOut); lerp3(wB, wY, wB, wOut);
+    arcLerp(wT, wX, wT, wOut); lerp3(wB, wY, wB, wOut);
   }
   norm3(wB);
   wT[0] -= wB[0]*ho; wT[1] -= wB[1]*ho; wT[2] -= wB[2]*ho;   /* middle -> hand */
+  /* --- body clearance (see BODY_RX): slide the weapon clear until none of it
+     is inside its owner. Enforced HERE, on the BLENDED pose that is about to be
+     drawn, not on the arc's target — measured, the frames that put the hilt in
+     the sternum were the guard->coil blend (wIn 0.35..0.85), where the pose is a
+     lerp of two individually clean poses through the middle of the chest. Only
+     the drawn pose is what the player sees, so only the drawn pose is checked. */
+  var ox = wT[0] - mRoot[12], oy = wT[1] - mRoot[13], oz = wT[2] - mRoot[14];
+  var top = ho - BLADE_LEN * 0.5, sf = top > HILT_TOP + 0.01;   /* sf: staff */
+  var pu = clearPush(
+    ox*mRoot[0] + oy*mRoot[1] + oz*mRoot[2], oy,       /* hand, body-local */
+    ox*mRoot[8] + oy*mRoot[9] + oz*mRoot[10],
+    wB[0]*mRoot[0] + wB[1]*mRoot[1] + wB[2]*mRoot[2], wB[1],   /* blade dir */
+    wB[0]*mRoot[8] + wB[1]*mRoot[9] + wB[2]*mRoot[10],
+    /* the weapon runs from the POMMEL, behind the hand, to the tip — a staff is
+       live (and long) both ways. Excluding the grip is what let the hilt through
+       the chest on 8 of 12 single-saber attacks; see HILT_BOT. */
+    sf ? -(top + BLADE_LEN) : -HILT_BOT, top + BLADE_LEN,
+    sf ? 2 * WEAP_N : WEAP_N, ex, ez);
+  /* ease the slide toward what clearPush asked for (see PUSH_EASE). The state is
+     per ARM and survives across swings, so chaining carries the current slide
+     instead of resetting it — the guard needs no slide at all, so a swing always
+     starts and ends at zero and nothing pops at either edge. */
+  if (pu > BODY_MAX) pu = BODY_MAX;
+  var cur = pu2[pi], lim = PUSH_RATE * POSE_DT;
+  pu -= (pu - cur) * Math.exp(-PUSH_EASE * POSE_DT);
+  if (pu - cur > lim) pu = cur + lim; else if (cur - pu > lim) pu = cur - lim;
+  if (plan > pu) pu = plan;           /* the PLANNED slide (see PROF_N) leads it */
+  else if (pu > plan + REACT_MAX) pu = plan + REACT_MAX;
+  pu2[pi] = pu;                       /* state tracks what was APPLIED, so the
+                                         reactive term can only ever ADD to the
+                                         plan, at a bounded rate, never lag it —
+                                         and never by more than REACT_MAX, so the
+                                         plan's zeroed ENDS cannot be undone */
+  if (pu > 0.0002){                   /* body X/Z in world = mRoot columns 0 / 2 */
+    var pux = pu * ex, puz = pu * ez;
+    wT[0] += pux*mRoot[0] + puz*mRoot[8];
+    wT[1] += pux*mRoot[1] + puz*mRoot[9];
+    wT[2] += pux*mRoot[2] + puz*mRoot[10];
+  }
   M.xp(wS, mTorso, shx, SH_Y, 0);                      /* shoulder joint */
   M.xd(wP, mTorso, side * 0.30, -0.86, 0.44);          /* elbow pole: down-back */
   norm3(wP);
@@ -2414,8 +3116,10 @@ function renderRig(r, pos, yaw){
   fkArm(mUL, mFL, mHL, -SH_X, -p.sprL, p.syL, p.aSwL, p.elbL, p.wrL, 0);
   if (arcOn && a.mirror){
     M.xd(wR, mRoot, -a.n[0], a.n[1], a.n[2]); norm3(wR);   /* mirrored plane */
+    M.xp(blC, mRoot, -a.pivot[0], a.pivot[1], a.pivot[2]); /* arcLerp centre */
     ikArm(mUL, mFL, mHL, -SH_X, a.mL, a.dL, a.snapML, a.snapDL,
-          -a.tilt, a.wIn, a.wOut, -1, wR, HILT_TOP + BLADE_LEN * 0.5);
+          -a.tilt, a.wIn, a.wOut, -1, wR, HILT_TOP + BLADE_LEN * 0.5, -a.escX, a.escZ,
+          a.pu, 1, profAt(a.profL, a.t, a.profT));
     M.xd(wR, mRoot, a.n[0], a.n[1], a.n[2]); norm3(wR);
   }
   GL.draw(MESH.uarm, mUL, r.oTunic);
@@ -2441,9 +3145,11 @@ function renderRig(r, pos, yaw){
 
   /* right (saber) arm */
   fkArm(mUR, mFR, mHR, SH_X, p.sprR, p.syR, p.aSwR, p.elbR, p.wrist, p.wrr);
+  if (arcOn) M.xp(blC, mRoot, a.pivot[0], a.pivot[1], a.pivot[2]);
   if (arcOn)
     ikArm(mUR, mFR, mHR, SH_X, a.mR, a.dR, a.snapM, a.snapD,
-          a.tilt, a.wIn, a.wOut, 1, wR, HO);
+          a.tilt, a.wIn, a.wOut, 1, wR, HO, a.escX, a.escZ, a.pu, 0,
+          profAt(a.prof, a.t, a.profT));
   GL.draw(MESH.uarm, mUR, r.oTunic);
   GL.draw(MESH.larm, mFR, r.oTunic);
   GL.draw(MESH.hand, mHR, r.oSkin);
@@ -2536,8 +3242,11 @@ function create(palette){
       live: false, active: false, t: 0, dur: SWING_DUR,
       pivot: new Float32Array([0.06, 1.34, -0.04]), radius: 1.02,
       u: new Float32Array(3), v: new Float32Array(3), n: new Float32Array(3),
-      a0: 0, a1: 1.6, tilt: 0, windup: 0.28, recover: 0.24,
-      lungeAmt: 0, lungeCur: 0, mirror: false, name: '', blendIn: BLEND_IN,
+      a0: 0, a1: 1.6, tilt: 0, windup: 0.28, recover: 0.24, escX: 1, escZ: 0,
+      lungeAmt: 0, lungeCur: 0, lungeCarry: 0, pu: new Float32Array(2),
+      prof: new Float32Array(PROF_N + 1), profL: new Float32Array(PROF_N + 1),
+      profT: SWING_DUR + BLEND_OUT,
+      mirror: false, name: '', blendIn: BLEND_IN,
       wIn: 0, wOut: 0, twist: 0, lean: 0, snapAge: 99,
       hR: new Float32Array(3), dR: new Float32Array([0, 1, 0]), mR: new Float32Array(3),
       hL: new Float32Array(3), dL: new Float32Array([0, 1, 0]), mL: new Float32Array(3),
@@ -3075,11 +3784,12 @@ var Sabers = JK.Sabers = {
  *   swingId — mirrors JK.Sabers.attackId (increments once per player swing).
  *   lastHit — {dmg, t, name} updated on every PLAYER-sourced hit (Ui reads).
  *
- * JK.Fx: preallocated 256-particle pool, one shared emissive cube drawn per
- * live particle with additive blending, model matrix from module scratch.
+ * JK.Fx: preallocated 256-particle pool, rendered as ONE batched draw call via
+ * JK.GL.dynamic (see BATCHING note above drawParticles).
  *   sparks(pos, n, color)   — impact sparks: gravity, quick fade
  *   burst(pos, n, color)    — explosion: big box shards that bounce on sand
  *   shimmer(pos, n, color)  — rising twinkle column (droid respawn)
+ *   live()                  — live particle count (profiler reads this)
  * color = [r,g,b] 0..1 or null for the kind's default. Zero alloc per frame.
  */
 (function(){
@@ -3109,10 +3819,11 @@ var parts = new Array(PMAX);
                  r:1, g:1, b:1, size:0.05, grav:9, spin:0, bounce:0, tw:0, ph:0 };
 })();
 var liveN = 0;
-var meshBox = null;                       /* ONE shared 1 m cube, scaled per particle */
+var pBatch = null;                        /* JK.GL.dynamic handle: all particles */
 
-var FT  = new Float32Array([1, 1, 1]);    /* per-particle tint scratch */
-var FXO = { emissive: 1, additive: true, nofog: true, alpha: 1, tint: FT };
+/* Whole batch shares these. Per-particle colour AND fade live in the vertex
+ * colour instead of uTint/uAlpha — see the BATCHING note on drawParticles. */
+var FXO = { emissive: 1, additive: true, nofog: true, alpha: 1, tint: null };
 var MTX = M.make();                       /* module-scope model matrix scratch */
 
 /* kind 0 = sparks, 1 = burst shards, 2 = shimmer */
@@ -3178,24 +3889,99 @@ function updateParticles(dt){
   }
 }
 
+/* BATCHING NOTE — why this is one draw call and why it looks identical.
+ *
+ * This loop used to issue one JK.GL.draw per live particle: a 40-spark impact
+ * cost 40 driver calls, an explosion 44+, and two overlapping bursts pushed the
+ * frame past 150 consecutive draws of the SAME unit cube. On iOS Safari every
+ * WebGL call crosses a process boundary, so that call count — not the 12
+ * triangles behind each one — was the measured draw-call spike.
+ *
+ * Now every particle is CPU-transformed into one shared vertex buffer and the
+ * whole pool goes out as a single drawElements. Three things make the pixels
+ * come out the same rather than merely similar:
+ *
+ * 1. emissive = 1 makes the shader's lit term drop out entirely
+ *    (vCol = mix(lit, base, 1) = base), so particle NORMALS are never read. They
+ *    are filled in once at build time and this loop never touches them again, and
+ *    the cube can be 8 shared corners / 12 triangles instead of 24 split verts —
+ *    same silhouette, same 6 faces (CULL_FACE is off, so front and back faces
+ *    both accumulate exactly as before).
+ * 2. nofog = true forces the fog factor to exactly 1, so the shader reduces to
+ *    dst += aC * uTint * uAlpha under blendFunc(SRC_ALPHA, ONE). Per-particle
+ *    tint and per-particle fade therefore multiply into the vertex colour with
+ *    no approximation: aC = rgb*alpha, uTint = 1, uAlpha = 1.
+ * 3. Additive blending with depthMask(false) is order-independent, and the depth
+ *    TEST is per fragment, so collapsing the draws cannot change occlusion.
+ *
+ * The model matrix work is replaced by three rotated half-axis vectors: with
+ * MTX = T * Ry(a) * Rx(0.7a) * S the eight corners are just
+ * pos +/- e0 +/- e1 +/- e2 where e0..e2 are the columns of Ry*Rx scaled by
+ * size/2 — 4 trig calls and ~30 multiplies per particle, cheaper than the four
+ * 4x4 matrix multiplies it replaces, let alone the driver call.
+ *
+ * MEASURED (driver entry points stubbed to no-ops so this is CPU only, best of
+ * 5 x 300 calls, zero heap growth in both):
+ *          40 particles   120 particles   256 (pool full)
+ *   before   0.0233 ms      0.0613 ms       0.1270 ms
+ *   after    0.0057 ms      0.0143 ms       0.0240 ms
+ * Do NOT quote a whole-game ms/frame delta for this: at these magnitudes it is
+ * far inside the run-to-run spread of gate.js (1.0-1.3 ms either way). What is
+ * reproducible is the line above, the draw count (201 -> 79 in a hand-composed
+ * 120-particle frame) and the pixels: a seeded 124-particle burst of all three
+ * kinds renders BIT-IDENTICAL to the per-particle path, 0 of 329160 pixels
+ * different, and still 0 with the pool saturated at 256. */
+var CUBE_TRI = [0,1,3, 0,3,2,   4,5,7, 4,7,6,   0,1,5, 0,5,4,
+                2,3,7, 2,7,6,   0,2,6, 0,6,4,   1,3,7, 1,7,5];
+
+function buildParticleBatch(){
+  var idx = new Uint16Array(PMAX * 36), i, j;
+  for (i = 0; i < PMAX; i++){
+    var vb = i * 8, ib = i * 36;
+    for (j = 0; j < 36; j++) idx[ib + j] = vb + CUBE_TRI[j];
+  }
+  pBatch = JK.GL.dynamic(PMAX * 8, { idx: idx });
+  var v = pBatch.v;                       /* normals: unused (emissive), set once */
+  for (i = 3; i < v.length; i += 9){ v[i] = 0; v[i+1] = 1; v[i+2] = 0; }
+}
+
 function drawParticles(){
-  if (!meshBox) return;
-  var GL = JK.GL;
+  if (liveN === 0){ JK.GL.reset(pBatch); return; }  /* never hold a stale count */
+  var V = pBatch.v, o = 0;                /* interleaved: pos at o, colour at o+6 */
   for (var i = 0; i < liveN; i++){
     var p = parts[i];
     var k = p.life / p.max;               /* 1 -> 0 over lifetime */
     var age = p.max - p.life;
-    M.ident(MTX);
-    M.tr(MTX, p.x, p.y, p.z);
-    if (p.spin !== 0){ M.ry(MTX, age * p.spin); M.rx(MTX, age * p.spin * 0.7); }
-    var s = p.size * (0.35 + 0.65 * k);   /* shrink as it dies */
-    M.sc(MTX, s, s, s);
-    FT[0] = p.r; FT[1] = p.g; FT[2] = p.b;
+    var s = p.size * (0.35 + 0.65 * k) * 0.5;   /* half-extent: shrinks as it dies */
     var a = k;
     if (p.tw) a *= 0.55 + 0.45 * Math.sin(age * 26 + p.ph);
-    FXO.alpha = a;
-    GL.draw(meshBox, MTX, FXO);
+    var e0x, e0y, e0z, e1x, e1y, e1z, e2x, e2y, e2z;
+    if (p.spin !== 0){                    /* columns of Ry(an)*Rx(bn), scaled */
+      var an = age * p.spin, bn = an * 0.7;
+      var ca = Math.cos(an), sa = Math.sin(an);
+      var cbn = Math.cos(bn), sbn = Math.sin(bn);
+      e0x =  ca * s;        e0y = 0;         e0z = -sa * s;
+      e1x =  sa * sbn * s;  e1y = cbn * s;   e1z =  ca * sbn * s;
+      e2x =  sa * cbn * s;  e2y = -sbn * s;  e2z =  ca * cbn * s;
+    } else {
+      e0x = s; e0y = 0; e0z = 0;
+      e1x = 0; e1y = s; e1z = 0;
+      e2x = 0; e2y = 0; e2z = s;
+    }
+    var px = p.x, py = p.y, pz = p.z;
+    var cr = p.r * a, cg = p.g * a, cbl = p.b * a;
+    for (var q = 0; q < 8; q++){          /* sign bits: 1=+x, 2=+y, 4=+z */
+      var sx = (q & 1) ? 1 : -1, sy = (q & 2) ? 1 : -1, sz = (q & 4) ? 1 : -1;
+      V[o]     = px + sx * e0x + sy * e1x + sz * e2x;
+      V[o + 1] = py + sx * e0y + sy * e1y + sz * e2y;
+      V[o + 2] = pz + sx * e0z + sy * e1z + sz * e2z;
+      V[o + 6] = cr; V[o + 7] = cg; V[o + 8] = cbl;   /* o+3..o+5: normal, fixed */
+      o += 9;
+    }
   }
+  pBatch.n  = liveN * 8;
+  pBatch.ni = liveN * 36;
+  JK.GL.draw(pBatch, null, FXO);          /* ONE draw call for the whole pool */
 }
 
 /* ============================ JK.Combat ==================================== */
@@ -3380,9 +4166,9 @@ function bb(sx, sy, sz, r, g, b, x, y, z){ /* baked-offset box */
 }
 
 function buildMeshes(){
-  if (meshBox) return;
+  if (meshDroid) return;
   var G = JK.Geo, GL = JK.GL;
-  meshBox = GL.mesh(G.box(1, 1, 1, 1, 1, 1));         /* shared particle cube */
+  buildParticleBatch();
   meshDroid = GL.mesh(G.merge([
     bb(0.34, 0.28, 0.34, 0.55, 0.57, 0.60, 0,  0.00,  0),     /* body */
     bb(0.22, 0.07, 0.22, 0.36, 0.38, 0.42, 0,  0.17,  0),     /* top cap */
@@ -3394,11 +4180,20 @@ function buildMeshes(){
     bb(0.11, 0.11, 0.035, 0.15, 0.15, 0.17, 0, 0.02, -0.175)  /* eye rim */
   ]));
   meshEye = GL.mesh(bb(0.055, 0.055, 0.03, 1, 0.18, 0.12, 0, 0.02, -0.195));
-  meshPost = GL.mesh(G.merge([
-    bb(0.07, 0.90, 0.07, 0.30, 0.27, 0.24, 0, 0.45, 0),       /* pole */
-    bb(0.34, 0.07, 0.34, 0.26, 0.23, 0.20, 0, 0.035, 0),      /* foot */
-    bb(0.16, 0.04, 0.16, 0.38, 0.36, 0.33, 0, 0.92, 0)        /* top plate */
-  ]));
+}
+
+/* The posts never move and the terrain under them never changes, so bake all
+ * three into ONE world-space static mesh: 3 draw calls -> 1, zero CPU cost.
+ * Must run after buildDroids() (it needs their positions). */
+function buildPostMesh(){
+  var G = JK.Geo, list = [], i;
+  for (i = 0; i < droids.length; i++){
+    var x = droids[i].pos[0], z = droids[i].pos[2], gy = groundY(x, z);
+    list.push(bb(0.07, 0.90, 0.07, 0.30, 0.27, 0.24, x, gy + 0.45,  z));  /* pole */
+    list.push(bb(0.34, 0.07, 0.34, 0.26, 0.23, 0.20, x, gy + 0.035, z));  /* foot */
+    list.push(bb(0.16, 0.04, 0.16, 0.38, 0.36, 0.33, x, gy + 0.92,  z));  /* plate */
+  }
+  meshPost = JK.GL.mesh(G.merge(list));
 }
 
 function droidHit(dmg, dir, kind, hitPos){
@@ -3470,10 +4265,9 @@ function updateDroids(dt, t){
 
 function drawDroids(){
   var GL = JK.GL;
+  GL.draw(meshPost, null, BODYO);         /* all three posts, one call */
   for (var i = 0; i < droids.length; i++){
     var d = droids[i];
-    M.ident(MTX); M.tr(MTX, d.pos[0], d.gy, d.pos[2]);
-    GL.draw(meshPost, MTX, BODYO);
     if (d.dead) continue;                 /* hidden while blown up */
     M.ident(MTX);
     M.tr(MTX, d.pos[0], d.cy, d.pos[2]);
@@ -3494,10 +4288,12 @@ var Fx = JK.Fx = {
   sparks:  function(pos, n, color){ emit(pos, n || 12, color, 0); },
   burst:   function(pos, n, color){ emit(pos, n || 24, color, 1); },
   shimmer: function(pos, n, color){ emit(pos, n || 16, color, 2); },
+  live:    function(){ return liveN; },   /* profiler / tests read this */
 
   init: function(){
     buildMeshes();
     buildDroids();                        /* registers 3 'enemy' entities */
+    buildPostMesh();                      /* needs droid positions */
     liveN = 0;
   },
 
@@ -3507,17 +4303,12 @@ var Fx = JK.Fx = {
     updateParticles(dt);
   },
 
+  /* No trailing "reset" draw: JK.GL.beginFrame now restores depthMask(true)
+   * before clearing, so leaving GL in additive mode here is harmless. */
   draw: function(){
-    if (!meshBox) return;
+    if (!pBatch) return;
     drawDroids();                         /* opaque first */
     drawParticles();                      /* additive on top */
-    if (liveN > 0){
-      /* particles leave GL in additive/depthMask(false) mode and Fx may be
-       * the frame's last drawer — issue one degenerate opaque draw (zero
-       * scale, rasterizes nothing) so beginFrame's depth clear works. */
-      M.ident(MTX); M.sc(MTX, 0, 0, 0);
-      JK.GL.draw(meshBox, MTX, BODYO);
-    }
   }
 };
 })();
@@ -5856,26 +6647,47 @@ var Powers = JK.Powers = {
  *   JK.ForceFx.pull(origin3, dir3)   converging tangential streaks, 0.45 s
  *   JK.ForceFx.lightning(from3, to3) ONE frame of a jagged arc — call EVERY
  *                                    frame while channelling (up to 4 at once)
- *   JK.ForceFx.grip(target, t)       swirling aura around a lifted target — call
- *                                    EVERY frame; target may be a vec3 (chest
- *                                    point) OR a JK.Combat entity ({pos,height})
+ *   JK.ForceFx.grip(target, t)       the choke: a TETHER from the player's saber
+ *                                    hand to the victim, two fat counter-rotating
+ *                                    bands (the inner one billboarded so it is
+ *                                    always a full hoop), two prisms of glow, and
+ *                                    thrashing motes — call EVERY frame; target
+ *                                    may be a vec3 (chest point) OR a JK.Combat
+ *                                    entity ({pos,height}). STOP calling it and
+ *                                    the aura times out within GRIP_HOLD and
+ *                                    fires a RELEASE shockwave by itself — that
+ *                                    is the only "let go" signal available, since
+ *                                    JK.Powers' contract ends at
+ *                                    onForce('gripRelease').
  *   JK.ForceFx.speed(on)             ghost after-images + CSS vignette (latched)
  *   init() / update(dt, t) / draw()  lifecycle (90_main SYSTEMS slot 'ForceFx')
  *   clear()                          drop every live effect (respawn / tests)
  *   active()                         live effect count (harnesses)
  *
  * RENDERING BUDGET / RULES
- *   - THREE static meshes built once at init: a unit segment (x,z centred,
- *     y in [0,1]), a unit cube, and a chunky humanoid ghost. JK.GL.mesh is
- *     STATIC_DRAW, so nothing is ever rebuilt: every instance is placed with a
- *     model matrix written into module-scope scratch.
+ *   - Every element this module draws is a BOX placed by a model matrix written
+ *     by hand into module-scope scratch (no M.mul) — cols are X, Y, Z, T. See
+ *     seg()/cube()/col(), and the ghost matrix in drawGhosts.
+ *   - ONE DRAW CALL for the entire module. Every box is additive + emissive +
+ *     nofog, which is exactly the case JK.GL.dynamic collapses without changing
+ *     a pixel, so they are CPU-transformed into one shared vertex buffer and go
+ *     out as a single drawElements — see the batching note above emitBox.
+ *     Per-effect driver calls, measured on frozen frames, before -> after:
+ *     grip 54 -> 0, two grips 109 -> 0, one push/pull wave 35 -> 0, four waves
+ *     134 -> 0, one lightning arc ~26 -> 0, four arcs 105 -> 0, speed ghosts
+ *     7 -> 0, and the whole module 1 call when anything at all is live. A
+ *     hand-composed worst case (2 grips + 4 arcs + 4 waves + speed + 24 bolts
+ *     + 4 parries) went 474 draws/frame -> 57, against a 200-call budget, and
+ *     busy combat with PUSH selected went 164 mean / 206 peak -> 136 / 146,
+ *     with the peak no longer depending on which power is in the player's hand.
  *   - Zero allocation per frame. Pools are preallocated with hard caps:
  *     4 waves x 16 shards, 4 arcs x 9 links (+1-2 forks), 2 grips, 14 ghosts.
- *     Ghosts are spent on DISTANCE as well as time — see GHOST_MIN_D.
- *   - Everything draws additive + emissive + nofog, so the sand can occlude it
- *     but the fog can never grey it out. A final degenerate opaque draw restores
- *     depthMask(true) — additive draws leave it off and the next frame's depth
- *     clear would silently do nothing.
+ *     Ghosts are spent on DISTANCE as well as time — see GHOST_MIN_D. BOXES is
+ *     sized to every pool being full at once; emitBox never overruns it.
+ *   - Additive + nofog means the sand can occlude the effects (the depth TEST
+ *     still runs) but the fog can never grey them out. No trailing "reset" draw:
+ *     JK.GL.beginFrame restores depthMask(true) before it clears, so leaving GL
+ *     in additive state here is harmless (JK.Fx relies on the same thing).
  *   - The arc jitter comes from a free-running xorshift32 (pure bitwise ops, no
  *     precision loss, no allocation), re-rolled every frame so it crackles.
  *
@@ -5918,11 +6730,43 @@ var ARC_HOLD   = 0.09;   /* s an arc survives without a refresh (fade tail) */
 var ARC_CORE_W = 0.045;  /* m: white-hot core cross-section */
 var ARC_GLOW_K = 3.6;    /* glow width multiplier over the core */
 
+/* ---- GRIP: the weakest power on screen, rebuilt ----------------------------
+ * Measured on a frozen still with a bot 6 m out: the old aura (3 thin rings of 8
+ * shards, r 0.55-0.9 m, plus 7 tiny motes) changed 0.48% of the screen — a white
+ * sparkle on the victim's chest — while push/pull/speed change 4-5%. It cost 58
+ * boxes to do it, so the answer could not be "more of the same".
+ * Re-measured independently against the identical frame with no grip in it:
+ * 0.73% of the screen from behind the player, 2.12% from the side — and the
+ * frames read as a man wrapped in a cage of light on a leash.
+ * Fewer, FATTER, BIGGER elements, plus the two things that were missing
+ * entirely: a TETHER from the player's hand to the victim (so the player can see
+ * that HE is doing this), and a RELEASE burst when the choke ends.
+ * Draw budget is spent, not raised: 2 fat rings instead of 3 thin ones pays for
+ * the tether, so the whole effect still fits in ~54 boxes — which, since the
+ * module batches, is ~54 boxes inside ONE driver call. */
 var GRIP_MAX   = 2;
 var GRIP_HOLD  = 0.16;   /* s a grip aura survives without a refresh */
-var GRIP_RINGS = 3;
-var GRIP_SEG   = 8;      /* shards per aura ring */
-var GRIP_MOTES = 7;
+var GRIP_RINGS = 2;      /* two fat bands read at 6 m; three thin ones did not */
+var GRIP_SEG   = 7;      /* shards per aura ring */
+var GRIP_MOTES = 8;
+var GRIP_W     = 0.085;  /* m: shard cross-section (was 0.046 — under 2 px out there) */
+var GRIP_R0    = 1.15;   /* x g.r: inner band radius */
+var GRIP_R1    = 1.62;   /* x g.r: outer band radius */
+var GRIP_AUR0  = 0.78;   /* x g.r: girth of the tall glow prism */
+var GRIP_AUR1  = 1.28;   /* x g.r: girth of the flat chest-height one */
+var GRIP_AUR_A = 0.055;  /* alpha per aura prism (additive, front+back faces) */
+var GRIP_POP   = 0.16;   /* s the bands take to snap open on the lock */
+
+var TETH_LINKS = 6;      /* hand -> victim cord, links */
+var TETH_W     = 0.060;  /* m core cross-section at the hand end */
+var TETH_GLOW  = 2.1;
+var TETH_AMP   = 0.045;  /* x length: lateral writhe of the cord */
+var TETH_SAG   = 0.030;  /* x length: gravity-ish droop in the middle */
+var TETH_BOW   = 0.105;  /* x length: slow revolving bow — see drawTether */
+
+var REL_DUR    = 0.34;   /* s: the release shockwave */
+var REL_R      = 2.7;    /* m: how far it opens */
+var REL_MIN    = 0.10;   /* s a grip must have held before a release is shown */
 
 var GHOSTS     = 14;     /* speed after-image ring buffer slots */
 var GHOST_DT   = 0.042;  /* s between samples */
@@ -5948,23 +6792,32 @@ var C_CYAN = [0.52, 0.94, 1.00];
 var C_VIO  = [0.68, 0.60, 1.00];
 
 /* ============================== state ============================== */
-var mSeg = null, mCube = null, mGhost = null;   /* built ONCE at init */
+/* Hard cap on boxes queued in one frame, sized to EVERY pool being full at once:
+ *   waves  4 x (16 shards x 2 passes) + 4 core flashes            = 132
+ *   grips  2 x (tether 6x2 + 2 flares + bands 2x7x2 + 2 prisms
+ *                + 8 motes + 2 choke)                             = 108
+ *   arcs   4 x (9 links x2 + 2 forks x3 + 4 flares)               = 112
+ *   ghosts 14 x 5 body boxes                                      =  70
+ * = 422, rounded up. emitBox drops anything past it rather than letting
+ * JK.GL clamp the batch (which would lose whole primitives silently). */
+var BOXES = 448;
+var batch = null;                               /* built ONCE at init */
 var built = false;
 var now = 0;
-var drewAny = false;
 
 /* ---- scratch (never reallocated) ---- */
 var MTX  = M.make();
-var TMX  = M.make();
 var TINT = new Float32Array(3);
-var OPT  = { emissive: 1, additive: true, nofog: true, alpha: 1, tint: TINT };
-var RESET = {};                                  /* opaque, restores depthMask */
+var BOPT = { emissive: 1, additive: true, nofog: true };  /* the one batch draw */
 var PX = new Float32Array(3);                    /* perpendicular basis X */
 var PZ = new Float32Array(3);                    /* perpendicular basis Z */
 var HAND = new Float32Array(3);                  /* saber-hand world point */
 var GP   = new Float32Array(3);                  /* resolved grip point */
 var NODES = new Float32Array(ARC_NODES * 3);     /* arc polyline scratch */
 var FNODES = new Float32Array((FORK_LINKS + 1) * 3);
+var TNODES = new Float32Array((TETH_LINKS + 1) * 3);  /* grip tether polyline */
+var RPOS = new Float32Array(3);                  /* release burst origin */
+var RDIR = new Float32Array(3);                  /* release burst normal */
 
 /* ---- deterministic-but-alive jitter: xorshift32, bitwise only ---- */
 var seed = 0x2f6e2b1 | 0;
@@ -6068,37 +6921,105 @@ function cube(m, x, y, z, s){
   m[12] = x; m[13] = y; m[14] = z; m[15] = 1;
 }
 
+/* A box spun about Y with independent girth and height — a turning PRISM. Two of
+ * these, counter-rotating at low alpha, are how the grip gets volume for two
+ * draw calls. Spun on two axes it looked like a tumbling crate (the flat top face
+ * gives the game away over open sand); kept upright and turning, it reads as a
+ * column of light around a body, which is the shape a body actually is. */
+function col(m, x, y, z, rw, rh, a){
+  var ca = Math.cos(a) * rw, sa = Math.sin(a) * rw;
+  m[0] = ca;  m[1] = 0;  m[2] = -sa; m[3] = 0;
+  m[4] = 0;   m[5] = rh; m[6] = 0;   m[7] = 0;
+  m[8] = sa;  m[9] = 0;  m[10] = ca; m[11] = 0;
+  m[12] = x; m[13] = y; m[14] = z; m[15] = 1;
+}
+
+/* ======================= THE BATCH (one draw call) ===================
+ * WHY: this module used to issue one JK.GL.draw per box — 54 back-to-back
+ * driver calls for a single grip, 134 for four push waves, 105 for four
+ * lightning arcs. On iOS Safari every WebGL entry point is marshalled across a
+ * process boundary, so that COUNT, not the 12 triangles behind each call, is the
+ * frame-time spike, and 200 calls/frame is the whole game's budget.
+ *
+ * Why the pixels come out identical rather than merely similar (the same three
+ * reasons the particle batch in 55_combat.js relies on):
+ *  1. emissive = 1 makes the shader's lit term drop out (vCol = base), so
+ *     NORMALS are never read — they are written once at build time and a box can
+ *     be 8 shared corners / 12 triangles instead of 24 split verts. CULL_FACE is
+ *     off, so front and back faces still both accumulate.
+ *  2. nofog = true pins the fog factor at 1, so the shader reduces to
+ *     dst += aC * uTint * uAlpha. Per-element tint and alpha therefore multiply
+ *     into the vertex colour exactly: aC = rgb*alpha, uTint = 1, uAlpha = 1.
+ *  3. Additive blending runs with depthMask(false) and the depth TEST is per
+ *     fragment, so collapsing the draws cannot change occlusion or ordering.
+ * Sand still occludes the effects, and the ONE draw is still issued through
+ * JK.GL.draw so the profiler counts it honestly. */
+var CUBE_TRI = [0,1,3, 0,3,2,   4,5,7, 4,7,6,   0,1,5, 0,5,4,
+                2,3,7, 2,7,6,   0,2,6, 0,6,4,   1,3,7, 1,7,5];
+
+/* Queue one box. `m` is a model matrix (cols X, Y, Z, T); the box occupies the
+ * local cell centred on (lx,ly,lz) with half-extents (hx,hy,hz), so a seg()
+ * matrix passes (0,0.5,0) and a cube()/col() one passes (0,0,0). Colour is
+ * folded to rgb*alpha here — nothing per-box reaches a uniform. */
+function emitBox(m, lx, ly, lz, hx, hy, hz, r, g, b){
+  var h = batch;
+  if (!h || h.n + 8 > h.max) return;             /* full: drop, never overrun */
+  var x0 = m[0], y0 = m[1], z0 = m[2];           /* column X */
+  var x1 = m[4], y1 = m[5], z1 = m[6];           /* column Y */
+  var x2 = m[8], y2 = m[9], z2 = m[10];          /* column Z */
+  var cx = m[12] + x0 * lx + x1 * ly + x2 * lz;
+  var cy = m[13] + y0 * lx + y1 * ly + y2 * lz;
+  var cz = m[14] + z0 * lx + z1 * ly + z2 * lz;
+  var e0x = x0 * hx, e0y = y0 * hx, e0z = z0 * hx;
+  var e1x = x1 * hy, e1y = y1 * hy, e1z = z1 * hy;
+  var e2x = x2 * hz, e2y = y2 * hz, e2z = z2 * hz;
+  var V = h.v, o = h.n * 9;
+  for (var q = 0; q < 8; q++){                   /* sign bits: 1=+x, 2=+y, 4=+z */
+    var sx = (q & 1) ? 1 : -1, sy = (q & 2) ? 1 : -1, sz = (q & 4) ? 1 : -1;
+    V[o]     = cx + sx * e0x + sy * e1x + sz * e2x;
+    V[o + 1] = cy + sx * e0y + sy * e1y + sz * e2y;
+    V[o + 2] = cz + sx * e0z + sy * e1z + sz * e2z;
+    V[o + 6] = r; V[o + 7] = g; V[o + 8] = b;    /* o+3..o+5: normal, fixed */
+    o += 9;
+  }
+  h.n += 8; h.ni += 36;
+}
+
+/* Queue MTX tinted by TINT at alpha `a`. yoff 0.5 for a seg() matrix (its local
+ * box spans y in [0,1]), 0 for a cube()/col() one. */
+function put(m, yoff, a){
+  if (!(a > 0.004)) return;                      /* NaN-safe, and skip invisible */
+  emitBox(m, 0, yoff, 0, 0.5, 0.5, 0.5, TINT[0] * a, TINT[1] * a, TINT[2] * a);
+}
+
 function drawCube(x, y, z, s, col, a){
   if (a <= 0.004 || s <= 0) return;
   cube(MTX, x, y, z, s);
-  tint(col); OPT.alpha = a;
-  JK.GL.draw(mCube, MTX, OPT);
-  drewAny = true;
+  tint(col);
+  put(MTX, 0, a);
 }
 
-/* ============================== meshes ============================== */
+/* the humanoid after-image: local centre + half-size of each body box */
+var GHOST_BOX = [
+  0,  0.43, 0, 0.220, 0.430, 0.140,            /* legs  */
+  0,  1.22, 0, 0.270, 0.350, 0.160,            /* torso */
+  0,  1.71, 0, 0.140, 0.140, 0.130,            /* head  */
+  0.34, 1.24, 0, 0.075, 0.310, 0.085,          /* arm R */
+ -0.34, 1.24, 0, 0.075, 0.310, 0.085           /* arm L */
+];
+
+/* ============================== batch build ========================= */
 function buildMeshes(){
-  if (built || !JK.GL || !JK.GL.gl || !JK.Geo) return;
-  var G = JK.Geo, GL = JK.GL;
-
-  /* unit segment: 1x1x1 box shifted so it spans y in [0,1] from its origin */
-  M.ident(TMX); M.tr(TMX, 0, 0.5, 0);
-  mSeg = GL.mesh(G.tf(G.box(1, 1, 1, 1, 1, 1), TMX));
-  mCube = GL.mesh(G.box(1, 1, 1, 1, 1, 1));
-
-  /* chunky humanoid silhouette for the Force Speed after-images */
-  mGhost = GL.mesh(G.merge([
-    bx(0.44, 0.86, 0.28, 0, 0.43, 0),          /* legs */
-    bx(0.54, 0.70, 0.32, 0, 1.22, 0),          /* torso */
-    bx(0.28, 0.28, 0.26, 0, 1.71, 0),          /* head */
-    bx(0.15, 0.62, 0.17,  0.34, 1.24, 0),      /* arm R */
-    bx(0.15, 0.62, 0.17, -0.34, 1.24, 0)       /* arm L */
-  ]));
+  if (built || !JK.GL || !JK.GL.dynamic) return;
+  var idx = new Uint16Array(BOXES * 36), i, j;
+  for (i = 0; i < BOXES; i++){
+    var vb = i * 8, ib = i * 36;
+    for (j = 0; j < 36; j++) idx[ib + j] = vb + CUBE_TRI[j];
+  }
+  batch = JK.GL.dynamic(BOXES * 8, { idx: idx });
+  var v = batch.v;                    /* normals: unused (emissive), set once */
+  for (i = 3; i < v.length; i += 9){ v[i] = 0; v[i + 1] = 1; v[i + 2] = 0; }
   built = true;
-}
-function bx(sx, sy, sz, x, y, z){
-  M.ident(TMX); M.tr(TMX, x, y, z);
-  return JK.Geo.tf(JK.Geo.box(sx, sy, sz, 1, 1, 1), TMX);
 }
 
 /* ======================= the saber hand (origin) ===================== */
@@ -6128,6 +7049,12 @@ function handPoint(out){
 
 /* ========================== push / pull waves ======================== */
 function spawnRing(kind, o, d){
+  /* The ORIGIN needs the same door check as the direction below. The direction
+   * was guarded and the origin was not, so pull([NaN,NaN,NaN], dir) put NaN
+   * straight into r.ox/oy/oz and every one of the wave's 32 shard matrices came
+   * out NaN for the whole 0.45 s — measured at 32 NaN uniform matrices a frame. */
+  if (o && !(o[0] > -1e9 && o[0] < 1e9 && o[1] > -1e9 && o[1] < 1e9 &&
+             o[2] > -1e9 && o[2] < 1e9)) return;
   var i, r = null, worst = 1e9;
   for (i = 0; i < RING_MAX; i++){
     var c = rings[i];
@@ -6137,7 +7064,7 @@ function spawnRing(kind, o, d){
   }
   if (!r) return;
   r.live = true; r.kind = kind; r.t = 0;
-  r.dur = kind ? PULL_DUR : PUSH_DUR;
+  r.dur = kind === 1 ? PULL_DUR : (kind === 2 ? REL_DUR : PUSH_DUR);
   r.ph = rnd() * TAU;
   r.ox = o ? o[0] : 0; r.oy = o ? o[1] : 1.2; r.oz = o ? o[2] : 0;
   var dx = d ? d[0] : 0, dy = d ? d[1] : 0, dz = d ? d[2] : -1;
@@ -6154,10 +7081,21 @@ function spawnRing(kind, o, d){
 
 function drawRing(r){
   var p = r.t / r.dur; if (p > 1) p = 1; if (p < 0) p = 0;
-  var pull = r.kind === 1;
+  var pull = r.kind === 1, rel = r.kind === 2;
   var e, rad, adv, alpha, stretch, w, ip = 1 - p;
 
-  if (!pull){
+  if (rel){
+    /* GRIP RELEASE: a hoop that snaps open around the victim as the choke lets
+     * go. Same machinery as the push wave, but centred ON the victim (adv 0) and
+     * opening from something already body-sized, so it reads as "let go of him"
+     * rather than "a wave arrived from somewhere". */
+    e = 1 - ip * ip * ip;
+    rad = 0.45 + REL_R * e;
+    adv = 0;
+    alpha = ip * ip;
+    stretch = 0.92;
+    w = 0.075 + 0.13 * ip;
+  } else if (!pull){
     e = 1 - ip * ip * ip;                        /* punch out fast, ease to a stop */
     rad = 0.55 + PUSH_R * e;                     /* born as a ring, not a dot */
     adv = 0.55 + PUSH_ADV * e;                   /* clear of the player's chest */
@@ -6193,16 +7131,23 @@ function drawRing(r){
     seg(MTX, cx - tx * h, cy - ty * h, cz - tz * h, tx, ty, tz, w, len);
 
     if (pull) tintLerp(C_CYAN, C_HOT, e);
+    else if (rel) tintLerp(C_HOT, C_VIO, p);     /* the grip's own colour */
     else tintLerp(C_HOT, C_BLUE, p);
-    OPT.alpha = alpha;
-    JK.GL.draw(mSeg, MTX, OPT);
+    put(MTX, 0.5, alpha);
 
     widen(MTX, 2.9);                             /* fat additive halo, same matrix */
-    tint(pull ? C_BLUE : C_PALE);
-    OPT.alpha = alpha * 0.34;
-    JK.GL.draw(mSeg, MTX, OPT);
+    tint(pull ? C_BLUE : (rel ? C_VIO : C_PALE));
+    put(MTX, 0.5, alpha * 0.34);
   }
-  drewAny = true;
+
+  if (rel){
+    /* the snap: one hot cube on the victim, gone in a third of the wave */
+    if (p < 0.34){
+      var q = 1 - p / 0.34;
+      drawCube(r.ox, r.oy, r.oz, 0.34 + 0.75 * q, C_HOT, q * q * 0.7);
+    }
+    return;
+  }
 
   /* core flash at the heart of the wave — kept small and pushed out in front so
    * it punctuates the cast instead of whiting out the player's own back */
@@ -6248,15 +7193,12 @@ function drawChain(nodes, n, w, glowK, core, glow, a){
     var k = j * 3;
     if (!seg2(MTX, nodes[k], nodes[k + 1], nodes[k + 2],
               nodes[k + 3], nodes[k + 4], nodes[k + 5], w)) continue;
-    tint(core); OPT.alpha = a;
-    JK.GL.draw(mSeg, MTX, OPT);
+    tint(core); put(MTX, 0.5, a);
     if (glowK > 0){
       widen(MTX, glowK);
-      tint(glow); OPT.alpha = a * 0.30;
-      JK.GL.draw(mSeg, MTX, OPT);
+      tint(glow); put(MTX, 0.5, a * 0.30);
     }
   }
-  drewAny = true;
 }
 
 function drawArc(arc){
@@ -6268,7 +7210,10 @@ function drawArc(arc){
   }
   var dx = arc.bx - ax, dy = arc.by - ay, dz = arc.bz - az;
   var len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  if (len < 0.05) return;
+  /* `!(len > 0.05)` not `len < 0.05`: a non-finite endpoint makes len NaN, and
+   * NaN fails EVERY `<` test, so the old form fell through and sprayed NaN model
+   * matrices through the whole chain. Same defensive form as spawnRing. */
+  if (!(len > 0.05)) return;
   var amp = 0.11 * len; if (amp < 0.09) amp = 0.09; else if (amp > 0.58) amp = 0.58;
 
   jag(NODES, ARC_LINKS, ax, ay, az, arc.bx, arc.by, arc.bz, amp, now * 21);
@@ -6325,62 +7270,170 @@ function gripPoint(p, out){
   return true;
 }
 
+/* THE TETHER — the bit that was missing. A writhing cord from the player's saber
+ * hand to the victim's chest, with a bright pulse crawling up it toward the
+ * victim so the direction of the force is unmistakable. 6 links x (core + glow)
+ * plus two flare cubes at the hand: 14 boxes, and it is the single most legible
+ * element of the whole effect because it crosses a lot of screen. */
+function drawTether(g, cx, cy, cz, a){
+  handPoint(HAND);
+  var ax = HAND[0], ay = HAND[1], az = HAND[2];
+  var dx = cx - ax, dy = cy - ay, dz = cz - az;
+  var len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (!(len > 0.45)) return;                     /* NaN-safe, and skip degenerate */
+  frame(dx / len, dy / len, dz / len);
+  var u1x = PX[0], u1y = PX[1], u1z = PX[2];
+  var u2x = PZ[0], u2y = PZ[1], u2z = PZ[2];
+  var amp = TETH_AMP * len, sag = TETH_SAG * len;
+  /* THE BOW. A cord that is only jittered stays inside its own axis, and when the
+   * victim is straight ahead that axis points down the lens: measured on a
+   * head-on grip the whole tether occupied a couple of pixels. So the cord also
+   * bows sideways by a body's width, in a direction that slowly revolves around
+   * the axis — from any camera angle some of that bow is across the screen. Free:
+   * it only moves the nodes that were being computed anyway. */
+  var bow = TETH_BOW * len + 0.12;
+  var bs = now * 1.6, bc = Math.cos(bs) * bow, bn = Math.sin(bs) * bow;
+  var i, k;
+  for (i = 0; i <= TETH_LINKS; i++){
+    var s = i / TETH_LINKS;
+    var env = Math.sin(s * PI);
+    var o1 = (bc + Math.sin(s * 5.2 - now * 6.5) * amp) * env;
+    var o2 = (bn + Math.cos(s * 4.1 + now * 5.1) * amp * 0.8) * env;
+    k = i * 3;
+    TNODES[k]     = ax + dx * s + u1x * o1 + u2x * o2;
+    TNODES[k + 1] = ay + dy * s + u1y * o1 + u2y * o2 - sag * env;
+    TNODES[k + 2] = az + dz * s + u1z * o1 + u2z * o2;
+  }
+  var ph = (now * 1.15) % 1;                     /* pulse crawling toward him */
+  for (i = 0; i < TETH_LINKS; i++){
+    k = i * 3;
+    var sc = (i + 0.5) / TETH_LINKS;
+    /* Fattest in MID-SPAN. Fattest at the hand made a white wedge (perspective
+     * already doubles that end); fattest at the victim washed his silhouette out
+     * the way the speed ghosts once erased the player. Mid-span is empty air. */
+    var w = TETH_W * (0.80 + 0.75 * Math.sin(sc * PI * 0.9));
+    if (!seg2(MTX, TNODES[k], TNODES[k + 1], TNODES[k + 2],
+              TNODES[k + 3], TNODES[k + 4], TNODES[k + 5], w)) continue;
+    var d = sc - ph; if (d < 0) d += 1;
+    var hot = d < 0.20 ? 1 - d / 0.20 : 0;
+    tintLerp(C_PALE, C_HOT, hot);
+    put(MTX, 0.5, a * (0.72 + 0.28 * hot));
+    widen(MTX, TETH_GLOW);
+    tintLerp(C_VIO, C_CYAN, hot);
+    put(MTX, 0.5, a * 0.14);
+  }
+  /* the hand doing the work */
+  var pu = 0.8 + 0.2 * Math.sin(now * 17);
+  drawCube(ax, ay, az, 0.17 * pu, C_HOT, a * 0.85);
+  drawCube(ax, ay, az, 0.44 * pu, C_VIO, a * 0.30);
+}
+
 function drawGrip(g){
   var a = g.life / (GRIP_HOLD * 0.6); if (a > 1) a = 1;
   if (a <= 0.02) return;
   var age = now - g.born;
-  var pop = age < 0.18 ? age / 0.18 : 1;         /* rings snap open on the lock */
+  var pop = age < GRIP_POP ? age / GRIP_POP : 1;  /* bands snap open on the lock */
+  pop = pop * pop * (3 - 2 * pop);
+  /* THRASHING: the victim is fighting it, so everything lurches together on one
+   * shared shudder (two incommensurate frequencies => never a clean loop). */
+  var cx = g.x + Math.sin(now * 13.7) * 0.05 + Math.sin(now * 7.1) * 0.03;
+  var cy = g.y + Math.sin(now * 11.3 + 1.7) * 0.055;
+  var cz = g.z + Math.cos(now * 12.1 + 0.6) * 0.05;
+  var pulse = 1 + 0.13 * Math.sin(now * 9.4);
   var i, k;
 
+  drawTether(g, cx, cy, cz, a);
+
+  /* two fat counter-rotating bands, wobbling on their axes like a caught animal */
   for (k = 0; k < GRIP_RINGS; k++){
-    var rad = (0.62 + 0.20 * k) * g.r * (0.6 + 0.4 * pop);
-    var tilt = 0.0 + k * 1.05;                   /* 0, 60, 120 deg about X */
-    var spin = now * (1.7 - 1.05 * k) + k * 2.1; /* counter-rotating gyroscope */
-    var yoff = (k - 1) * 0.16 + Math.sin(now * 2.3 + k) * 0.05;
+    var rad = (GRIP_R0 + (GRIP_R1 - GRIP_R0) * k) * g.r * pulse * (0.5 + 0.5 * pop);
+    var tilt = k * 1.15 + Math.sin(now * 1.9 + k * 2.1) * 0.30;
+    var spin = now * (2.2 - 1.5 * k) + k * 2.1;
+    var yoff = (k - 0.5) * 0.14 + Math.sin(now * 2.3 + k) * 0.05;
     var ct = Math.cos(tilt), stl = Math.sin(tilt);
     var cs = Math.cos(spin), ss = Math.sin(spin);
     /* ring plane basis: horizontal ring tilted about X, then yawed by spin */
     var e1x = cs,          e1y = 0,   e1z = -ss;
     var e2x = ct * ss,     e2y = stl, e2z = ct * cs;
+    /* ...except the INNER band, which is billboarded to the camera so it is
+     * always a full hoop. A tumbling gyroscope is alive, but it spends part of
+     * every cycle edge-on, and edge-on a ring of shards reads as the same little
+     * asterisk this rebuild exists to kill. One guaranteed circle + one tumbling
+     * ring = legible from every angle and still not static. */
+    if (k === 0 && JK.GL && JK.GL.eye){
+      var ex = cx - JK.GL.eye[0], ey = cy - JK.GL.eye[1], ez = cz - JK.GL.eye[2];
+      var el = Math.sqrt(ex * ex + ey * ey + ez * ez);
+      if (el > 0.5){
+        frame(ex / el, ey / el, ez / el);      /* PX,PZ span the screen plane */
+        e1x = PX[0] * cs + PZ[0] * ss; e1y = PX[1] * cs + PZ[1] * ss; e1z = PX[2] * cs + PZ[2] * ss;
+        e2x = -PX[0] * ss + PZ[0] * cs; e2y = -PX[1] * ss + PZ[1] * cs; e2z = -PX[2] * ss + PZ[2] * cs;
+      }
+    }
     var step = TAU / GRIP_SEG;
-    var w = 0.046 + 0.014 * k;
+    var w = GRIP_W + 0.022 * k;
     for (i = 0; i < GRIP_SEG; i++){
       var an = i * step + spin * 0.5;
       var ca = Math.cos(an), sa = Math.sin(an);
-      var cx = g.x + (e1x * ca + e2x * sa) * rad;
-      var cy = g.y + yoff + (e1y * ca + e2y * sa) * rad;
-      var cz = g.z + (e1z * ca + e2z * sa) * rad;
+      var bx = cx + (e1x * ca + e2x * sa) * rad;
+      var by = cy + yoff + (e1y * ca + e2y * sa) * rad;
+      var bz = cz + (e1z * ca + e2z * sa) * rad;
       var tx = -e1x * sa + e2x * ca;
       var ty = -e1y * sa + e2y * ca;
       var tz = -e1z * sa + e2z * ca;
-      var len = step * rad * 0.72;
+      var len = step * rad * 0.86;                /* nearly closed: a band, not dots */
       var h = len * 0.5;
-      seg(MTX, cx - tx * h, cy - ty * h, cz - tz * h, tx, ty, tz, w, len);
-      tintLerp(C_PALE, C_VIO, k / GRIP_RINGS);
-      OPT.alpha = a * (0.85 - 0.15 * k);
-      JK.GL.draw(mSeg, MTX, OPT);
+      seg(MTX, bx - tx * h, by - ty * h, bz - tz * h, tx, ty, tz, w, len);
+      tintLerp(C_PALE, C_VIO, GRIP_RINGS > 1 ? k / (GRIP_RINGS - 1) : 0);
+      put(MTX, 0.5, a * (0.78 - 0.12 * k));
       widen(MTX, 2.6);
       tint(C_BLUE);
-      OPT.alpha = a * 0.22;
-      JK.GL.draw(mSeg, MTX, OPT);
+      put(MTX, 0.5, a * 0.16);
     }
   }
-  drewAny = true;
 
-  /* motes rising out of the choke — pure formula, no state, no allocation */
+  /* VOLUME for two boxes: two counter-rotating prisms of glow around the
+   * body — a tall one down the whole figure and a wide flat one at the chest.
+   * This is what turns a sparkle into "he is held inside something". */
+  col(MTX, cx, cy, cz, GRIP_AUR0 * g.r * pulse, 2.25, now * 0.8);
+  tint(C_CYAN); put(MTX, 0, a * GRIP_AUR_A * 1.15);
+  col(MTX, cx, cy, cz, GRIP_AUR1 * g.r, 1.15, -now * 0.6 + 0.8);
+  tint(C_VIO); put(MTX, 0, a * GRIP_AUR_A);
+
+  /* motes torn off the body — pure formula, no state, no allocation */
   for (i = 0; i < GRIP_MOTES; i++){
-    var ph = (now * 0.62 + i * 0.1371) % 1;
-    var ang = i * 2.3999 + now * 1.15;
-    var mr = g.r * 0.85 * (1 - 0.55 * ph);
-    var mx = g.x + Math.cos(ang) * mr;
-    var my = g.y - 0.72 + ph * 1.85;
-    var mz = g.z + Math.sin(ang) * mr;
-    drawCube(mx, my, mz, 0.075 * (1 - 0.55 * ph), C_CYAN, a * Math.sin(ph * PI) * 0.9);
+    var mp = (now * 0.62 + i * 0.1371) % 1;
+    var ang = i * 2.3999 + now * 1.35;
+    var mr = g.r * 1.25 * (1 - 0.45 * mp);
+    var mx = cx + Math.cos(ang) * mr + Math.sin(now * 15 + i) * 0.04;
+    var my = cy - 0.80 + mp * 1.95;
+    var mz = cz + Math.sin(ang) * mr;
+    drawCube(mx, my, mz, 0.100 * (1 - 0.45 * mp), C_CYAN, a * Math.sin(mp * PI) * 0.9);
   }
 
   /* the choke itself */
-  drawCube(g.x, g.y, g.z, 0.22 + 0.05 * Math.sin(now * 15), C_HOT, a * 0.55);
-  drawCube(g.x, g.y, g.z, 0.62 + 0.10 * Math.sin(now * 15), C_VIO, a * 0.18);
+  drawCube(cx, cy, cz, 0.26 + 0.06 * Math.sin(now * 15), C_HOT, a * 0.42);
+  drawCube(cx, cy, cz, 0.66 + 0.10 * Math.sin(now * 15), C_VIO, a * 0.13);
+}
+
+/* THE RELEASE. JK.Powers has no ForceFx call for letting go (its contract ends
+ * at onForce('gripRelease')), so the visual is driven from the aura's own death:
+ * a grip that stops being refreshed times out inside GRIP_HOLD, and that is
+ * exactly the moment the player let go. Anything that ends a channel — release,
+ * empty force pool, the victim dying, switching power — lands here, so the choke
+ * can never just evaporate. */
+function releaseBurst(g){
+  if (now - g.born < REL_MIN) return;             /* a one-frame graze: no bang */
+  var P = JK.Player;
+  var px = P && P.pos ? P.pos[0] : g.x;
+  var py = P && P.pos ? P.pos[1] + 1.25 : g.y;
+  var pz = P && P.pos ? P.pos[2] : g.z + 1;
+  RPOS[0] = g.x; RPOS[1] = g.y; RPOS[2] = g.z;
+  RDIR[0] = g.x - px; RDIR[1] = g.y - py; RDIR[2] = g.z - pz;
+  spawnRing(2, RPOS, RDIR);                       /* hoop faces along the throw */
+  if (JK.Fx){
+    if (JK.Fx.burst) JK.Fx.burst(RPOS, 14, C_CYAN);
+    if (JK.Fx.sparks) JK.Fx.sparks(RPOS, 10, C_PALE);
+  }
 }
 
 /* =============================== speed ============================== */
@@ -6473,9 +7526,10 @@ function drawGhosts(){
     MTX[8] = sn * sc; MTX[9] = 0;  MTX[10] = c * sc;  MTX[11] = 0;
     MTX[12] = gPos[k]; MTX[13] = gPos[k + 1]; MTX[14] = gPos[k + 2]; MTX[15] = 1;
     tintLerp(C_CYAN, C_BLUE, 1 - s);
-    OPT.alpha = a;
-    JK.GL.draw(mGhost, MTX, OPT);
-    drewAny = true;
+    var r = TINT[0] * a, gg = TINT[1] * a, bb = TINT[2] * a;
+    for (var q = 0; q < 30; q += 6)             /* five body boxes, one frame */
+      emitBox(MTX, GHOST_BOX[q], GHOST_BOX[q+1], GHOST_BOX[q+2],
+              GHOST_BOX[q+3], GHOST_BOX[q+4], GHOST_BOX[q+5], r, gg, bb);
   }
 }
 
@@ -6527,6 +7581,13 @@ var ForceFx = JK.ForceFx = {
    * keeps each target on the same slot with no matching cost. ---- */
   lightning: function(from, to){
     if (!from || !to) return;
+    /* One caller-garbage check at the door, exactly as gripPoint does: a single
+     * non-finite endpoint used to make len NaN and spray ~28 NaN model matrices
+     * a frame, every frame the channel was held, with nothing to say where they
+     * came from. Measured: 8 NaN uniform matrices per frame per bad arc. */
+    if (!(from[0] > -1e9 && from[0] < 1e9 && from[1] > -1e9 && from[1] < 1e9 &&
+          from[2] > -1e9 && from[2] < 1e9 && to[0] > -1e9 && to[0] < 1e9 &&
+          to[1] > -1e9 && to[1] < 1e9 && to[2] > -1e9 && to[2] < 1e9)) return;
     var i = arcCursor;
     if (i >= ARC_MAX){                            /* overflow: recycle the faintest */
       i = 0;
@@ -6548,17 +7609,21 @@ var ForceFx = JK.ForceFx = {
   grip: function(target, t){
     if (!gripPoint(target, GP)) return;
     if (typeof t === 'number' && t > now) now = t;
-    var i, g = null, best = 1e9;
+    var i, g = null, best = 1e9, same = false;
     for (i = 0; i < GRIP_MAX; i++){
       var c = grips[i];
       if (c.life > 0){
         var dx = c.x - GP[0], dy = c.y - GP[1], dz = c.z - GP[2];
-        if (dx * dx + dy * dy + dz * dz < 12.25){ g = c; break; }   /* same victim */
+        if (dx * dx + dy * dy + dz * dz < 12.25){ g = c; same = true; break; }  /* same victim */
       }
       if (c.life < best){ best = c.life; g = c; }   /* else: recycle the faintest */
     }
     if (!g) g = grips[0];
-    if (g.life <= 0) g.born = now;
+    /* Anything that is NOT a refresh of the same victim restarts the pop — a
+     * fresh lock, and also a live slot STOLEN for a different victim, which the
+     * old `g.life <= 0` test missed: the bands stayed wide open, so the second
+     * simultaneous choke never snapped shut on anybody. */
+    if (!same) g.born = now;
     g.x = GP[0]; g.y = GP[1]; g.z = GP[2];
     g.r = (target && target.radius ? target.radius : 0.55) * 1.6;
     g.life = GRIP_HOLD;
@@ -6593,7 +7658,11 @@ var ForceFx = JK.ForceFx = {
     }
     for (i = 0; i < GRIP_MAX; i++){
       var g = grips[i];
-      if (g.life > 0){ g.life -= dt; if (g.life < 0) g.life = 0; }
+      if (g.life > 0){
+        g.life -= dt;
+        /* the frame the choke times out IS the frame the player let go */
+        if (g.life <= 0){ g.life = 0; releaseBurst(g); }
+      }
     }
     if (speedOn && now - gLast >= GHOST_DT) sampleGhost();
   },
@@ -6601,17 +7670,13 @@ var ForceFx = JK.ForceFx = {
   draw: function(){
     if (!built || !JK.GL || !JK.GL.gl) return;
     var i;
-    drewAny = false;
+    JK.GL.reset(batch);          /* counts decide what is drawn: never stale */
     drawGhosts();
     for (i = 0; i < RING_MAX; i++) if (rings[i].live) drawRing(rings[i]);
     for (i = 0; i < GRIP_MAX; i++) if (grips[i].life > 0) drawGrip(grips[i]);
     for (i = 0; i < ARC_MAX; i++) if (arcs[i].life > 0) drawArc(arcs[i]);
-    if (drewAny){
-      /* additive draws leave depthMask(false); one degenerate opaque draw puts
-       * it back so the NEXT frame's depth clear is not silently discarded. */
-      cube(MTX, 0, 0, 0, 0);
-      JK.GL.draw(mCube, MTX, RESET);
-    }
+    /* the whole module, however much of it is alight, in ONE driver call */
+    if (batch.ni) JK.GL.draw(batch, null, BOPT);
   }
 };
 })();
@@ -6640,7 +7705,8 @@ var ForceFx = JK.ForceFx = {
  *
  * Bolt record (preallocated, contract shape):
  *   { pos:Float32Array(3), vel:Float32Array(3), color:Float32Array(3),
- *     life, team, dmg, speed, active, deflected, owner }
+ *     life, team, dmg, speed, active, deflected, owner,
+ *     pop /* s of "just turned around" scale-up left — visual only *\/ }
  *
  * COLLISION: each bolt's frame movement is split into >= 2 substeps (a 58 m/s
  * bolt covers ~1 m per 60 Hz frame, up to 2.9 m on a 0.05 s clamped frame), and
@@ -6673,9 +7739,43 @@ var ForceFx = JK.ForceFx = {
  * race note on tryDeflect — getting that wrong made the same shot bounce or
  * land depending on the frame rate.
  *
- * Zero per-frame allocations: the pool, all scratch vectors, matrices and draw
- * option objects live at module scope. JK.GL.mesh is STATIC_DRAW — ONE unit
- * cube is built at init and every bolt is placed with a per-draw model matrix.
+ * SELLING THE PARRY. Mechanically the deflection was already excellent (9 of 9
+ * chest shots turned, HP never moved) and visually it was almost invisible:
+ * measured on a frozen still one frame after contact, the whole event changed
+ * 0.11% of the screen — a white smudge on the blade — and the returned bolt was
+ * the same small box as an incoming one, so nobody could tell they had just
+ * parried a blaster shot with a lightsaber. Four additions, all pooled and all
+ * drawn with the ONE shared cube:
+ *   - a PARRY FLASH pool (<=4) pinned to the contact point ON THE BLADE: a
+ *     screen-facing impact diamond, a white-hot core, a saber-coloured halo, two
+ *     chunky crossed spikes and a streak that grows down the return path. 7 boxes
+ *     each for 0.26 s, and only ever while a parry is on screen.
+ *   - deflected bolts are BEEFIER for their whole flight (1.55x cross-section,
+ *     1.22x core length, hotter core tint) plus a 0.13 s scale-up "pop" as they
+ *     leave, so the eye is dragged onto them at the moment they turn.
+ *   - one extra additive WAKE box behind a deflected bolt (+1 box per returned
+ *     bolt) so the return reads as a streak of motion rather than a dot.
+ *   - the same flash again where a RETURNED bolt lands, which is the end of the
+ *     story: flash on the blade -> streak -> fat green bolt -> flash on the
+ *     trooper who fired it.
+ * Measured (frozen still, one frame after contact, 844x390): screen pixels
+ * changed by the whole event went 0.08-0.14% -> 0.41-0.43% for a shot returned
+ * straight down the camera axis (the worst case: everything is foreshortened) and
+ * 0.45% -> 2.02% for one returned across the view. Independently re-measured with
+ * a frozen-world A/B against the identical frame with no bolt in it: 0.40% down
+ * the lens, 0.75% from behind, 0.95% across the view.
+ *
+ * DRAW COST: TWO CALLS, whatever is on screen. Every bolt and every flash is a
+ * box, so they are CPU-transformed into two shared vertex buffers — one opaque
+ * (the cores, which must write depth) and one additive (shells, wakes, flashes) —
+ * and go out as two drawElements per frame. It used to be 3 calls per bolt plus 7
+ * per flash plus a state-restore draw: a parried 3-round burst cost 34 and a
+ * 20-bolt salvo 81, against a 200-call whole-game budget. See the batching note
+ * above emitBox; the pixels are identical, not merely similar, and a frozen-frame
+ * A/B against the per-box path measures 0 of 329160 pixels different.
+ *
+ * Zero per-frame allocations: the pool, all scratch vectors, matrices, batches
+ * and draw option objects live at module scope.
  */
 (function(){
 'use strict';
@@ -6742,9 +7842,43 @@ var REPEL_SPRD  = 0.10;     /* rad, scatter of a repelled volley */
 var COL_ENEMY   = [1.00, 0.188, 0.125];   /* imperial red   #ff3020 */
 var COL_PLAYER  = [0.250, 1.000, 0.376];  /* deflected green #40ff60 */
 var COL_SAND    = [0.86, 0.74, 0.52];     /* ground-impact puff */
+var COL_HOT     = [1.00, 1.00, 1.00];     /* parry flash core */
 var CORE_MIX    = 0.55;     /* how far the core tint lerps toward white */
+var DEFL_MIX    = 0.72;     /* ...and further still for a returned bolt */
 var WORLD_PAD   = 60;       /* m past Terrain.SIZE before a bolt is discarded */
 var DEG         = Math.PI / 180;
+
+/* ---- the parry: how the deflection is SOLD (see the header note) ---- */
+var DEFL_VIS_W  = 1.55;     /* returned bolts are this much fatter, for life */
+var DEFL_VIS_L  = 1.22;     /* ...and this much longer */
+var POP_T       = 0.13;     /* s of extra scale-up as a bolt turns around */
+/* The pop is deliberately small. At 1.1x extra width the bolt's own halo became
+ * a 1.2 m green slab across the hero's chest on the contact frame and buried the
+ * flash that is supposed to be the star of the moment; the flash owns the punch,
+ * the bolt only needs to swell enough to look shoved. */
+var POP_W       = 0.55;     /* extra width at the start of the pop */
+var POP_L       = 0.30;     /* extra length at the start of the pop */
+var WAKE_LEN    = 2.8;      /* x core length: faint trail behind a returned bolt */
+var WAKE_W      = 0.65;     /* x GLOW1_W (never scaled by the pop — see draw) */
+var WAKE_A      = 0.16;
+
+var FMAX        = 4;        /* concurrent parry flashes (pooled) */
+var FLASH_T     = 0.26;     /* s a flash lives */
+var FL_CORE     = 0.40;     /* m, white-hot core at birth */
+var FL_HALO     = 0.50;     /* m, saber-coloured halo (expands) */
+var FL_SPIKE_L  = 1.30;     /* m, crossed spikes at full stretch */
+var FL_SPIKE_W  = 0.085;    /* m, spike cross-section at birth */
+var FL_STREAK_L = 2.60;     /* m the exit streak reaches */
+var FL_STREAK_W = 0.11;     /* m, streak cross-section at birth. Wider than
+                             * this and the core stops reading as a beam and
+                             * starts reading as a green slab. */
+var FL_DIA      = 0.46;     /* m, screen-facing impact diamond at full bloom.
+                             * Bigger than this and the hard-edged quad stops
+                             * reading as a flash and starts reading as a kite —
+                             * at 0.72 m it was 140 px across, wider than the
+                             * hero's whole torso, with its left half depth-culled
+                             * behind his shoulder into a lopsided wedge. */
+var FL_DIA_OFF  = 0.30;     /* m along the exit dir, so the quad clears the body */
 
 /* ============================== pool ================================ */
 var pool = new Array(MAXB);
@@ -6755,11 +7889,21 @@ var pool = new Array(MAXB);
       vel: new Float32Array(3),
       color: new Float32Array(3),
       life: 0, team: 'enemy', dmg: DEF_DMG, speed: DEF_SPEED,
-      active: false, deflected: false, owner: null
+      active: false, deflected: false, owner: null,
+      pop: 0                          /* s of "just turned around" scale-up left */
     };
   }
 })();
 var cursor = 0, nActive = 0;
+
+/* ---- parry flashes: pooled, additive, all on the shared cube ---- */
+var flashes = new Array(FMAX);
+(function(){
+  for (var i = 0; i < FMAX; i++)
+    flashes[i] = { life: 0, x: 0, y: 0, z: 0, dx: 0, dy: 0, dz: -1,
+                   cr: 1, cg: 1, cb: 1, roll: 0 };
+})();
+var nFlash = 0;
 
 /* ============================== scratch ============================= */
 var MTX   = M.make();               /* per-draw model matrix */
@@ -6770,11 +7914,33 @@ var NRM   = new Float32Array(3);    /* mirror normal */
 var SWB   = { base: new Float32Array(3), tip: new Float32Array(3) };  /* swept blade */
 var TC    = new Float32Array(3);    /* core tint */
 var TG    = new Float32Array(3);    /* glow tint */
-var CORE_O  = { emissive: 1, nofog: true, tint: TC };
-var GLOW1_O = { emissive: 1, nofog: true, additive: true, alpha: GLOW1_A, tint: TG };
-var GLOW2_O = { emissive: 1, nofog: true, additive: true, alpha: GLOW2_A, tint: TG };
-var FLAT_O  = {};                   /* opaque state-restore draw */
-var mesh = null;                    /* ONE shared unit cube */
+var CORE_BO = { emissive: 1, nofog: true };                   /* core batch */
+var ADD_BO  = { emissive: 1, nofog: true, additive: true };   /* shell batch */
+
+/* ---- the two batches ------------------------------------------------------
+ * WHY: every bolt used to cost three back-to-back drawElements of the same unit
+ * cube and every parry flash seven more. On iOS Safari each WebGL entry point is
+ * marshalled across a process boundary, so the CALL COUNT — not the 12 triangles
+ * behind each one — is the frame-time spike, and 200 calls a frame is the budget
+ * for the whole game. Both batches use the identical trick JK.Fx's particle pool
+ * uses (see the batching note in 55_combat.js):
+ *  1. emissive = 1 drops the shader's lit term (vCol = base), so NORMALS are
+ *     never read: they are written once at build time and a box can be 8 shared
+ *     corners / 12 triangles instead of 24 split verts. CULL_FACE is off, so
+ *     front and back faces still both accumulate.
+ *  2. nofog = true pins the fog factor at 1, so per-box colour and alpha fold
+ *     into the vertex colour exactly (aC = rgb*alpha, uTint = 1, uAlpha = 1).
+ *  3. The additive batch runs with depthMask(false) and the depth TEST is per
+ *     fragment, so collapsing those draws cannot change occlusion. The CORE
+ *     batch does write depth, and one drawElements rasterizes its primitives in
+ *     index order — the same order the separate draws used — so it too is exact.
+ * The cores stay in their own batch, drawn FIRST, because they are opaque and
+ * must occlude; mixing them into the additive one would lose the depth writes. */
+var CORE_BOXES = MAXB;                  /* one opaque core per live bolt */
+var ADD_BOXES  = MAXB * 3 + FMAX * 7;   /* glow1 + glow2 + wake, 7 per flash */
+var bCore = null, bAdd = null;
+var CUBE_TRI = [0,1,3, 0,3,2,   4,5,7, 4,7,6,   0,1,5, 0,5,4,
+                2,3,7, 2,7,6,   0,2,6, 0,6,4,   1,3,7, 1,7,5];
 
 var segS = 0, segT = 0;             /* params stashed by the distance tests */
 
@@ -6919,6 +8085,7 @@ function fire(origin, dir, team, opts){
   b.life = (o.life > 0) ? o.life : DEF_LIFE;
   b.owner = o.owner || null;
   b.deflected = false;
+  b.pop = 0;                             /* a recycled slot must not inherit one */
   b.active = true;
 
   var sp = o.spread || 0;
@@ -6935,6 +8102,104 @@ function fire(origin, dir, team, opts){
   sparks(origin[0], origin[1], origin[2], 2, b.color);
   snd('blaster', origin[0], origin[1], origin[2], 1);
   return b;
+}
+
+/* ============================== parry flash ========================= */
+/* A parry is the most heroic thing in the game and it lasted a couple of dozen
+ * pixels. spawnFlash pins a flash to the CONTACT POINT ON THE BLADE (not to the
+ * bolt, which is already leaving) and remembers the exit direction, so the flash
+ * and the streak both point where the shot is going. Pooled: a flash never
+ * allocates and never survives more than FLASH_T seconds. */
+function spawnFlash(x, y, z, dx, dy, dz, col){
+  var l = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (!(l > 1e-6)){ dx = 0; dy = 0; dz = -1; l = 1; }
+  var f = null, i, worst = 1e9;
+  for (i = 0; i < FMAX; i++){
+    var c = flashes[i];
+    if (c.life <= 0){ f = c; break; }
+    if (c.life < worst){ worst = c.life; f = c; }     /* else steal the faintest */
+  }
+  if (!f) return;
+  f.life = FLASH_T;
+  f.roll = 0.5 + (Blaster.stats.deflected % 5) * 0.31;   /* vary the diamond */
+  f.x = x; f.y = y; f.z = z;
+  f.dx = dx / l; f.dy = dy / l; f.dz = dz / l;
+  var c2 = col || COL_PLAYER;
+  f.cr = c2[0]; f.cg = c2[1]; f.cb = c2[2];
+}
+
+/* A screen-facing quad with an in-plane roll: the 2002 impact sprite, except the
+ * sprite is the same unit cube squashed flat along the view axis. Rolled 45 deg
+ * it is a diamond, which is the shape that says IMPACT at any size, and it costs
+ * one draw. Built straight into the matrix: right/up span the screen. */
+function billboard(m, s, roll, px, py, pz){
+  var eye = JK.GL.eye;
+  var fx = px - eye[0], fy = py - eye[1], fz = pz - eye[2];
+  var fl = Math.sqrt(fx * fx + fy * fy + fz * fz);
+  if (!(fl > 1e-4)){ fx = 0; fy = 0; fz = -1; fl = 1; }
+  fx /= fl; fy /= fl; fz /= fl;
+  var ux = 0, uy = 1, uz = 0;
+  if (fy > 0.999 || fy < -0.999){ ux = 1; uy = 0; uz = 0; }
+  var rx = uy * fz - uz * fy, ry = uz * fx - ux * fz, rz = ux * fy - uy * fx;
+  var rl = Math.sqrt(rx * rx + ry * ry + rz * rz) || 1;
+  rx /= rl; ry /= rl; rz /= rl;
+  var vx = fy * rz - fz * ry, vy = fz * rx - fx * rz, vz = fx * ry - fy * rx;
+  var c = Math.cos(roll) * s, sn = Math.sin(roll) * s;
+  m[0] = rx * c + vx * sn;  m[1] = ry * c + vy * sn;  m[2] = rz * c + vz * sn;  m[3] = 0;
+  m[4] = -rx * sn + vx * c; m[5] = -ry * sn + vy * c; m[6] = -rz * sn + vz * c; m[7] = 0;
+  m[8] = fx * 0.02; m[9] = fy * 0.02; m[10] = fz * 0.02; m[11] = 0;
+  m[12] = px; m[13] = py; m[14] = pz; m[15] = 1;
+}
+
+function drawFlash(f){
+  var p = 1 - f.life / FLASH_T;              /* 0 at contact -> 1 when spent */
+  if (p < 0) p = 0; else if (p > 1) p = 1;
+  var ip = 1 - p;
+
+  /* 0. the impact sprite: a screen-facing diamond that blooms and fades. This is
+   *    the element that makes the parry legible even when the return path runs
+   *    straight away from the camera and every other cue is foreshortened. */
+  var bloom = p < 0.35 ? p / 0.35 : 1;       /* snap open, then just fade */
+  billboard(MTX, FL_DIA * (0.40 + 0.90 * bloom), f.roll,
+            f.x + f.dx * FL_DIA_OFF, f.y + f.dy * FL_DIA_OFF, f.z + f.dz * FL_DIA_OFF);
+  TG[0] = f.cr + (1 - f.cr) * 0.65; TG[1] = f.cg + (1 - f.cg) * 0.65;
+  TG[2] = f.cb + (1 - f.cb) * 0.65;
+  add(ip * ip * 0.85);
+
+  /* 1. white-hot core: biggest on the contact frame, gone fast */
+  var s = FL_CORE * (0.45 + 0.55 * ip);
+  place(MTX, f.dx, f.dy, f.dz, s, s, s, f.x, f.y, f.z);
+  TG[0] = COL_HOT[0]; TG[1] = COL_HOT[1]; TG[2] = COL_HOT[2];
+  add(ip * ip * 0.95);
+
+  /* 2. saber-coloured halo: expands as it fades, so the eye is pulled outward */
+  s = FL_HALO * (0.6 + 0.9 * p);
+  place(MTX, f.dx, f.dy, f.dz, s, s, s, f.x, f.y, f.z);
+  TG[0] = f.cr; TG[1] = f.cg; TG[2] = f.cb;
+  add(ip * 0.45);
+
+  /* 3. two chunky spikes crossed ACROSS the exit direction — the 2002 impact
+   *    star, made of the same box as everything else */
+  var sl = FL_SPIKE_L * (0.35 + 0.65 * (p < 0.5 ? p * 2 : 1));
+  var sw = FL_SPIKE_W * ip;
+  if (sw > 0.004){
+    place(MTX, f.dx, f.dy, f.dz, sl, sw, sw, f.x, f.y, f.z);
+    add(ip * ip * 0.85);
+    place(MTX, f.dx, f.dy, f.dz, sw, sl, sw, f.x, f.y, f.z);
+    add(ip * ip * 0.85);
+  }
+
+  /* 4. the exit streak: a box that grows out of the contact point along the
+   *    return path, core + fat halo. THIS is the "it went that way" cue. */
+  var len = FL_STREAK_L * (0.25 + 0.75 * p);
+  var w = FL_STREAK_W * (1 - 0.55 * p);
+  var h = len * 0.5;
+  place(MTX, f.dx, f.dy, f.dz, w, w, len,
+        f.x + f.dx * h, f.y + f.dy * h, f.z + f.dz * h);
+  add(ip * 0.85);
+  place(MTX, f.dx, f.dy, f.dz, w * 3.2, w * 3.2, len * 0.92,
+        f.x + f.dx * h, f.y + f.dy * h, f.z + f.dz * h);
+  add(ip * 0.26);
 }
 
 /* ============================== deflection ========================== */
@@ -7020,6 +8285,7 @@ function doDeflect(b, ax, ay, az, bx, by, bz, bl, frac){
   b.dmg = DEFL_DMG;
   b.speed = DEFL_SPEED;
   b.life = DEF_LIFE;                  /* fresh clock for the return trip */
+  b.pop = POP_T;                      /* brief scale-up as it turns around */
   setCol(b, COL_PLAYER);
 
   if (!aimAtEnemy(px, py, pz)){
@@ -7047,10 +8313,17 @@ function doDeflect(b, ax, ay, az, bx, by, bz, bl, frac){
   b.vel[1] = SD[1] * b.speed;
   b.vel[2] = SD[2] * b.speed;
 
-  /* the flash belongs ON the blade, not on the bolt */
+  /* THE FLASH BELONGS ON THE BLADE, NOT ON THE BOLT. Its direction is the
+   * bolt's NEW velocity (set just above), so the spikes cross the return path
+   * and the streak points down it. Particles are batched into a single draw call
+   * by JK.Fx, so the extra sparks cost pixels, not calls. */
   Blaster.stats.deflected++;
-  sparks(qx, qy, qz, 12, saberCol());
-  sparks(qx, qy, qz, 5, COL_PLAYER);
+  spawnFlash(qx, qy, qz, b.vel[0], b.vel[1], b.vel[2], saberCol());
+  /* 22 sparks, not 40: JK.Fx's 256-particle pool is SHARED with droid explosions
+   * and a parried 3-round burst already spends 66 of it. Particles are batched
+   * into one draw call, so this costs pixels rather than calls either way. */
+  sparks(qx, qy, qz, 14, saberCol());
+  sparks(qx, qy, qz, 8, COL_PLAYER);
   snd('deflect', qx, qy, qz, 1);
 }
 
@@ -7202,6 +8475,11 @@ function hitEnts(b, ax, ay, az, bx, by, bz){
   b.pos[0] = px; b.pos[1] = py; b.pos[2] = pz;
   Blaster.stats.hits++;
   sparks(px, py, pz, b.deflected ? 14 : 10, b.color);
+  /* A RETURNED shot landing is the end of the parry's story, so it gets the same
+   * flash the blade got — same pool, same 7 boxes, only for bolts the player sent
+   * back. Aimed along the bolt's own heading so the streak sprays THROUGH the
+   * victim: "that came off my saber and it went into him". */
+  if (b.deflected) spawnFlash(px, py, pz, DIRV[0], DIRV[1], DIRV[2], COL_PLAYER);
   snd('boltHit', px, py, pz, 1);
   /* onHit last: a bot may die and unregister, which mutates ents underneath us */
   if (typeof best.onHit === 'function') best.onHit(b.dmg, DIRV, 'bolt', b.pos);
@@ -7281,10 +8559,12 @@ function repel(pos, dir){
     b.dmg = b.dmg > DEFL_DMG ? b.dmg : DEFL_DMG;
     b.speed = b.speed > REPEL_SPEED ? b.speed : REPEL_SPEED;
     b.life = DEF_LIFE;
+    b.pop = POP_T;                    /* same "it just turned" pop as a parry */
     setCol(b, COL_PLAYER);
     spreadDir(fx, fy, fz, REPEL_SPRD, SD);
     b.vel[0] = SD[0] * b.speed; b.vel[1] = SD[1] * b.speed; b.vel[2] = SD[2] * b.speed;
-    sparks(b.pos[0], b.pos[1], b.pos[2], 6, COL_PLAYER);
+    spawnFlash(b.pos[0], b.pos[1], b.pos[2], SD[0], SD[1], SD[2], COL_PLAYER);
+    sparks(b.pos[0], b.pos[1], b.pos[2], 8, COL_PLAYER);
     lx = b.pos[0]; ly = b.pos[1]; lz = b.pos[2];
     n++;
   }
@@ -7296,6 +8576,47 @@ function repel(pos, dir){
 }
 
 /* ============================== drawing ============================= */
+function buildBatches(){
+  if (bAdd || !JK.GL || !JK.GL.dynamic) return;
+  bCore = mkBatch(CORE_BOXES);
+  bAdd  = mkBatch(ADD_BOXES);
+}
+function mkBatch(nb){
+  var idx = new Uint16Array(nb * 36), i, j;
+  for (i = 0; i < nb; i++){
+    var vb = i * 8, ib = i * 36;
+    for (j = 0; j < 36; j++) idx[ib + j] = vb + CUBE_TRI[j];
+  }
+  var h = JK.GL.dynamic(nb * 8, { idx: idx });
+  var v = h.v;                        /* normals: unused (emissive), set once */
+  for (i = 3; i < v.length; i += 9){ v[i] = 0; v[i + 1] = 1; v[i + 2] = 0; }
+  return h;
+}
+
+/* Queue one box into batch `h` from a model matrix built by place()/billboard()
+ * (cols X, Y, Z, T; the local box is the unit cube centred on the origin), with
+ * the colour folded to rgb*alpha so nothing per-box reaches a uniform. */
+function emitBox(h, m, r, g, b, a){
+  if (!h || h.n + 8 > h.max || !(a > 0)) return;   /* full or invisible: drop */
+  var e0x = m[0] * 0.5, e0y = m[1] * 0.5, e0z = m[2] * 0.5;
+  var e1x = m[4] * 0.5, e1y = m[5] * 0.5, e1z = m[6] * 0.5;
+  var e2x = m[8] * 0.5, e2y = m[9] * 0.5, e2z = m[10] * 0.5;
+  var cx = m[12], cy = m[13], cz = m[14];
+  r *= a; g *= a; b *= a;
+  var V = h.v, o = h.n * 9;
+  for (var q = 0; q < 8; q++){        /* sign bits: 1=+x, 2=+y, 4=+z */
+    var sx = (q & 1) ? 1 : -1, sy = (q & 2) ? 1 : -1, sz = (q & 4) ? 1 : -1;
+    V[o]     = cx + sx * e0x + sy * e1x + sz * e2x;
+    V[o + 1] = cy + sx * e0y + sy * e1y + sz * e2y;
+    V[o + 2] = cz + sx * e0z + sy * e1z + sz * e2z;
+    V[o + 6] = r; V[o + 7] = g; V[o + 8] = b;      /* o+3..o+5: normal, fixed */
+    o += 9;
+  }
+  h.n += 8; h.ni += 36;
+}
+/* queue MTX into the additive batch tinted by TG at alpha `a` */
+function add(a){ emitBox(bAdd, MTX, TG[0], TG[1], TG[2], a); }
+
 /* Build an orientation+scale+translation matrix whose local +Z runs along the
  * bolt's velocity. The exactly-vertical case would make cross(up, f) vanish, so
  * the reference up flips to +X there. Column-major: cols = right, up, fwd. */
@@ -7324,9 +8645,27 @@ function boltView(b){
   return d2 > FAR_DRAW * FAR_DRAW ? -1 : d2;
 }
 
+/* A returned bolt is the pay-off of the whole system, so it is drawn as a
+ * heavier object than the shot that came in: wider, longer, hotter-cored, plus a
+ * short scale-up "pop" over the frames it turns around. Both multipliers land in
+ * VW / VL, which the two passes below share, so a bolt's core and its shells can
+ * never disagree about how big it is. */
+var VW = 1, VL = 1;
+function boltScale(b){
+  VW = b.deflected ? DEFL_VIS_W : 1;
+  VL = b.deflected ? DEFL_VIS_L : 1;
+  if (b.pop > 0){
+    var k = b.pop / POP_T;
+    VW *= 1 + POP_W * k;
+    VL *= 1 + POP_L * k;
+  }
+}
+
 function draw(){
-  if (!mesh || nActive === 0) return;
-  var GL = JK.GL, i, b, d2, half;
+  if (!bAdd) return;
+  var GL = JK.GL, i, b, d2, half, len;
+  GL.reset(bCore); GL.reset(bAdd);   /* counts decide what draws: never stale */
+  if (nActive === 0 && nFlash === 0) return;
 
   /* opaque cores first so they occlude correctly... */
   for (i = 0; i < MAXB; i++){
@@ -7334,13 +8673,15 @@ function draw(){
     if (!b.active) continue;
     d2 = boltView(b);
     if (d2 < 0) continue;
-    half = BOLT_LEN * 0.5;
-    TC[0] = b.color[0] + (1 - b.color[0]) * CORE_MIX;
-    TC[1] = b.color[1] + (1 - b.color[1]) * CORE_MIX;
-    TC[2] = b.color[2] + (1 - b.color[2]) * CORE_MIX;
-    place(MTX, SD[0], SD[1], SD[2], CORE_W, CORE_W, BOLT_LEN,
+    boltScale(b);
+    len = BOLT_LEN * VL; half = len * 0.5;
+    var mix = b.deflected ? DEFL_MIX : CORE_MIX;
+    TC[0] = b.color[0] + (1 - b.color[0]) * mix;
+    TC[1] = b.color[1] + (1 - b.color[1]) * mix;
+    TC[2] = b.color[2] + (1 - b.color[2]) * mix;
+    place(MTX, SD[0], SD[1], SD[2], CORE_W * VW, CORE_W * VW, len,
           b.pos[0] - SD[0] * half, b.pos[1] - SD[1] * half, b.pos[2] - SD[2] * half);
-    GL.draw(mesh, MTX, CORE_O);
+    emitBox(bCore, MTX, TC[0], TC[1], TC[2], 1);
   }
 
   /* ...then every additive shell in one blend-state block */
@@ -7349,22 +8690,43 @@ function draw(){
     if (!b.active) continue;
     d2 = boltView(b);
     if (d2 < 0) continue;
-    half = BOLT_LEN * 0.5;
+    boltScale(b);
+    len = BOLT_LEN * VL; half = len * 0.5;
     TG[0] = b.color[0]; TG[1] = b.color[1]; TG[2] = b.color[2];
-    place(MTX, SD[0], SD[1], SD[2], GLOW1_W, GLOW1_W, BOLT_LEN,
+    place(MTX, SD[0], SD[1], SD[2], GLOW1_W * VW, GLOW1_W * VW, len,
           b.pos[0] - SD[0] * half, b.pos[1] - SD[1] * half, b.pos[2] - SD[2] * half);
-    GL.draw(mesh, MTX, GLOW1_O);
+    add(GLOW1_A);
     if (d2 < FAR_HALO * FAR_HALO){
-      place(MTX, SD[0], SD[1], SD[2], GLOW2_W, GLOW2_W, BOLT_LEN * GLOW2_LEN,
+      place(MTX, SD[0], SD[1], SD[2], GLOW2_W * VW, GLOW2_W * VW, len * GLOW2_LEN,
             b.pos[0] - SD[0] * half, b.pos[1] - SD[1] * half, b.pos[2] - SD[2] * half);
-      GL.draw(mesh, MTX, GLOW2_O);
+      add(GLOW2_A);
+      if (b.deflected && b.pop <= 0){
+        /* WAKE: one faint box stretched back down the flight path, so the return
+         * shot reads as MOTION rather than as a dot. +1 box, deflected only.
+         * Held back until the pop is over: on the contact frames the wake points
+         * back at the CAMERA (the bolt has only just turned), and a 0.5 m wide
+         * box aimed down the lens is a slab over a quarter of the screen, not a
+         * trail. By the time it draws, the bolt is genuinely travelling. */
+        var wbase = BOLT_LEN * DEFL_VIS_L, wl = wbase * WAKE_LEN;
+        var ww = GLOW1_W * WAKE_W * DEFL_VIS_W;
+        var wh = wl * 0.5 - wbase * 0.5;
+        TG[0] = b.color[0]; TG[1] = b.color[1]; TG[2] = b.color[2];
+        place(MTX, SD[0], SD[1], SD[2], ww, ww, wl,
+              b.pos[0] - SD[0] * wh, b.pos[1] - SD[1] * wh, b.pos[2] - SD[2] * wh);
+        add(WAKE_A);
+      }
     }
   }
 
-  /* additive draws left depthMask(false); restore with one zero-scale opaque
-   * draw (rasterizes nothing) so later systems and the next depth clear work. */
-  M.ident(MTX); M.sc(MTX, 0, 0, 0);
-  GL.draw(mesh, MTX, FLAT_O);
+  /* the parry flashes ride along in the same additive batch */
+  for (i = 0; i < FMAX; i++) if (flashes[i].life > 0) drawFlash(flashes[i]);
+
+  /* TWO calls for the whole system: cores (opaque, they write depth) then every
+   * shell, wake and flash. No trailing state-restore draw — JK.GL.beginFrame
+   * puts depthMask(true) back before it clears, so leaving GL additive here is
+   * harmless (JK.Fx and JK.ForceFx rely on exactly the same thing). */
+  if (bCore.ni) GL.draw(bCore, null, CORE_BO);
+  if (bAdd.ni) GL.draw(bAdd, null, ADD_BO);
 }
 
 /* ============================== module ============================== */
@@ -7378,12 +8740,16 @@ var Blaster = JK.Blaster = {
   count: function(){ return nActive; },
 
   clear: function(){
-    for (var i = 0; i < MAXB; i++){ pool[i].active = false; pool[i].owner = null; }
-    nActive = 0;
+    var i;
+    for (i = 0; i < MAXB; i++){
+      pool[i].active = false; pool[i].owner = null; pool[i].pop = 0;
+    }
+    for (i = 0; i < FMAX; i++) flashes[i].life = 0;
+    nActive = 0; nFlash = 0;
   },
 
   init: function(){
-    if (!mesh && JK.GL && JK.GL.mesh) mesh = JK.GL.mesh(JK.Geo.box(1, 1, 1, 1, 1, 1));
+    buildBatches();
     Blaster.clear();
     cursor = 0;
     Blaster.stats.fired = Blaster.stats.deflected = 0;
@@ -7391,16 +8757,29 @@ var Blaster = JK.Blaster = {
   },
 
   update: function(dt, t){
-    var n = 0;
-    for (var i = 0; i < MAXB; i++){
+    var n = 0, i;
+    for (i = 0; i < MAXB; i++){
       var b = pool[i];
       if (!b.active) continue;
       b.life -= dt;
       if (b.life <= 0){ kill(b); continue; }   /* kill() also drops b.owner */
-      stepBolt(b, dt);
+      if (b.pop > 0){ b.pop -= dt; if (b.pop < 0) b.pop = 0; }
+      stepBolt(b, dt);                /* may set pop again (a fresh deflection) */
       if (b.active) n++;
     }
     nActive = n;                      /* authoritative resync each frame */
+    n = 0;
+    for (i = 0; i < FMAX; i++){       /* age the parry flashes */
+      var f = flashes[i];
+      if (f.life <= 0) continue;
+      f.life -= dt;
+      /* `<= 0`, not `< 0`: a flash landing exactly on zero is dead — drawFlash
+       * skips it — so counting it kept draw() awake for a frame with nothing
+       * in it. Same predicate here and at the draw site. */
+      if (f.life <= 0) f.life = 0;
+      else n++;
+    }
+    nFlash = n;
   },
 
   draw: draw
@@ -7432,27 +8811,29 @@ var Blaster = JK.Blaster = {
  *            damage; gripRelease throws them.
  *   DEAD     2.0 s corpse: crumples, then sinks into the sand, then recycles.
  *
- * STORMTROOPER (hp 40, r 0.5, h 1.8, white armour, saber off, rifle drawn here)
+ * STORMTROOPER (hp 40, r 0.5, h 1.8, white plastoid over a black undersuit,
+ *               saber off, rifle drawn here)
  *   IDLE ---player within 46 m---> SPOT ---> ADVANCE
  *   ADVANCE  run to 14 m --> FIRE.  Player > 85 m --> IDLE.
- *   FIRE     stand, raise rifle, bursts of 3 @ 0.13 s, 1.5 s between bursts,
- *            per-burst aim bias (~5 deg) + per-shot spread (~4 deg) so they
- *            MISS a lot. dist > 18 --> ADVANCE, dist < 6.5 or 45% roll -->
- *            REPOSITION.
- *   REPOSITION strafe around the player 1.2-2.0 s; 18% of the time they trip
- *            --> STUMBLE. Ends --> FIRE.
+ *   FIRE     stand, raise rifle, bursts of 3 @ 0.13 s on a 1.5 s PERIOD (see
+ *            BURST_GAP), per-burst lateral aim bias + per-shot spread (~4 deg)
+ *            so they MISS a lot. Between bursts: dist > 18 --> ADVANCE,
+ *            dist < 6.5 or a 42% roll --> REPOSITION.
+ *   REPOSITION strafe around the player 0.9-1.6 s, STILL FIRING (the burst clock
+ *            is shared, with 1.7x the aim error because he is moving); 18% of
+ *            the time they trip --> STUMBLE. Ends --> FIRE mid-rest.
  *   FLEE     hp < 30% or 2 squadmates died within 6 s: sprint away, fire
  *            wildly backwards every ~0.45 s. After 5 s they find their nerve
  *            --> ADVANCE.
  *   DISARMED Force Pull: rifle is yanked out of their hands (it lies on the
  *            sand), they panic-run in a zig-zag for 2.5 s, then re-arm.
  *
- * SITH (hp 120, r 0.55, h 1.85, black/crimson robes, red blade; one elite
+ * SITH (hp 120, r 0.55, h 1.85, slate robe + crimson sash, red blade; one elite
  *       carries a staff)
  *   IDLE ---player within 55 m---> SPOT (ignite) ---> STALK
- *   STALK    circle-strafe the ring at 5 m, saber in guard. Timers fire:
- *            charge (1.6-2.8 s, needs the duel token) --> CHARGE,
- *            leap (6-10 s, 6-18 m) --> LEAP, push (7-12 s, 4-9 m) --> FPUSH.
+ *   STALK    circle-strafe the ring at 4.2 m, saber in guard. Timers fire:
+ *            charge (1.4-2.4 s, needs the duel token) --> CHARGE,
+ *            leap (6.5-10 s, 6-18 m) --> LEAP, push (9-15 s, 3.5-9.5 m) --> FPUSH.
  *   CHARGE   close to 2.2 m --> COMBO (2.5 s timeout --> STALK).
  *   COMBO    2-3 chained rig.playSwing arcs; the hero takes JK.Hero.hurt
  *            during each swing's active window (phase 0.25..0.72) if he is
@@ -7460,23 +8841,29 @@ var Blaster = JK.Blaster = {
  *   LEAP     force-jump arc toward the player (own gravity). Landing near -->
  *            COMBO, else --> CHARGE.
  *   FPUSH    0.45 s telegraph (arm out), then a Force Push on the hero.
- *   RECOVER  back off + taunt flourish 1.0-1.6 s --> STALK.
+ *   RECOVER  give up ~1.1 m + taunt flourish 0.85-1.25 s --> STALK.
  *
  * ============================ THE TWO FUN DIALS =============================
  * THE DUEL TOKEN. Only ONE sith may be closing or swinging at any moment; the
  * rest circle at sabre distance, taunt and throw the occasional Force Push.
  * Three sith attacking at once did 54 dps to a standing hero (dead in under
- * two seconds and unreadable); with the token it is ~10 dps of saber damage
- * and the fight reads as a duel with an audience, which is the JK2 feel.
+ * two seconds and unreadable); with the token it is 4.6 dps of saber damage from
+ * a lone sith and 6.1 dps from the whole boot wave (measured against a hero who
+ * never moves: 95 hp in 20.5 s, and 87 hp in 14.3 s), so the fight reads as a
+ * duel with an audience, which is the JK2 feel.
+ * The token is also why FPUSH_DMG matters so much: the sith who does NOT hold
+ * the token has nothing to do but shove, and a shove the player cannot answer
+ * was 30% of all damage taken in a measured session. It is a shove now, not an
+ * attack — 5 damage, and the knockback is the point.
  *
  * THE MISS MODEL. A stormtrooper's per-burst aim error is a LATERAL DISTANCE
  * at the target (3 m), not an angle, and it is applied un-eased so it is
  * already full-strength on the first shot of the burst. Both details matter:
  * an angular error collapses at close range (76% accuracy measured at ~8 m),
  * and easing the error let the opening shot fly true while the aim converged.
- * With the lateral model a trooper is equally hopeless at every range — about
- * a third of his bolts land on a hero who is not even dodging, before the
- * saber deflects any of them.
+ * With the lateral model a trooper is equally hopeless at every range: measured
+ * over 60 s against a hero who never moves, 16 of 123 bolts landed (13%) and 12
+ * more were deflected back at him by the hero's idle blade.
  *
  * ============================ API ==========================================
  *   JK.Bots.list        array of bot objects (live + corpses). Stable identity.
@@ -7529,7 +8916,28 @@ var TR_HP = 40, TR_R = 0.50, TR_H = 1.80;
 var TR_SPOT = 46, TR_LOSE = 85;
 var TR_RANGE = 14, TR_MIN = 6.5, TR_FAR = 18;
 var TR_WALK = 3.6, TR_RUN = 6.2, TR_PANIC = 7.0;
+/* THE BURST RHYTHM (contract: bursts of 3, 0.13 s apart, 1.5 s between bursts).
+ * BURST_GAP is the burst PERIOD — first shot of one burst to the first shot of
+ * the next — so the rhythm you hear is a burst every 1.5 s, i.e. 2 bolts/s from
+ * an engaged trooper. BURST_REST is what is left over once the burst has spent
+ * its own 0.05 + 2*0.13 s, and is derived, never hand-tuned.
+ *
+ * MEASURED BEFORE THIS: 1.00 bolts/s and a 3.04 s gap between bursts, from a
+ * trooper that was in FIRE 66% of the time. Two things ate the missing half:
+ *   1. the gap was counted from the LAST shot of the burst, so the real period
+ *      was 0.05 + 0.26 + 1.50 = 1.81 s, not 1.50;
+ *   2. REPOSITION was completely silent, and the trooper rolled into it after
+ *      about half his bursts, adding a mean 1.6 s of dead air. That is the whole
+ *      deficit: 1.81 + 0.8 = 2.6 s per burst against the contract's 1.5.
+ * Now the burst clock runs in REPOSITION too — a strafing trooper keeps firing,
+ * which is both the contract's rate and what a 2002 trooper actually does — and
+ * the rest is derived from the period. */
 var BURST_N = 3, BURST_DT = 0.13, BURST_GAP = 1.5;
+var BURST_LEAD = 0.05;      /* s from entering a burst to the first shot */
+var BURST_REST = BURST_GAP - (BURST_N - 1) * BURST_DT - BURST_LEAD;
+var REPOS_P = 0.42;         /* chance of sidestepping instead of re-bursting */
+var REPOS_MIN = 0.9, REPOS_MAX = 1.6;
+var REPOS_MISS = 1.7;       /* aim error multiplier while shooting on the move */
 var SHOT_SPREAD = 0.070;    /* rad, ~4 deg per shot (contract) */
 /* Per-BURST aim bias, in METRES OF LATERAL MISS at the target — not radians.
  * An angular bias collapses at close range: the probe measured 76% accuracy
@@ -7539,54 +8947,162 @@ var SHOT_SPREAD = 0.070;    /* rad, ~4 deg per shot (contract) */
 var AIM_MISS = 3.0;         /* m of horizontal scatter at the target */
 var AIM_MISS_Y = 0.9;       /* m of vertical scatter */
 var AIM_LEAD = 0.50;        /* fraction of the true lead they actually apply */
-var BOLT_DMG = 9, BOLT_SPD = 58;
+/* 4, not 9 — because the fire rate DOUBLED. Fixing the rate in isolation would
+ * have undone the sith rebalance: at 9 damage and the new 2 bolts/s, the measured
+ * bolt share of a 30 s casual session went from 9-27 hp to 36-42.
+ * BE HONEST ABOUT WHAT THIS BUYS, THOUGH: it holds the damage FIRED per second
+ * roughly level (9 x 1.0 = 9.0 -> 4 x 2.05 = 8.2), not the damage LANDED. One
+ * trooper against a hero who stands still for 60 s, measured end to end on both
+ * builds: 57 bolts / 4 hits / 36 hp before, 123 bolts / 16 hits / 64 hp after —
+ * 0.60 dps becomes 1.07. Twice the noise and twice the light show for ~1.8x the
+ * incoming damage, which a lone trooper can afford to be (100 hp, 4 hp/s regen)
+ * and which the sith cuts more than pay for: an idle hero survives the boot wave
+ * 14.3 s instead of 9.3. A full burst of three is 12 hp. */
+var BOLT_DMG = 4, BOLT_SPD = 58;
 var DISARM_T = 2.5;
 var FLEE_T = 5.0, FLEE_HP = 0.30, SQUAD_WINDOW = 6.0;
 var RIFLE_MUZZLE = 0.60;    /* m from the grip to the barrel tip */
 
-/* sith */
-var SI_HP = 120, SI_R = 0.55, SI_H = 1.85;
+/* ---------------------------------- sith ----------------------------------
+ * THE DUEL, REBALANCED FOR A PHONE. Measured before: a scripted casual player
+ * (thumb-speed camera, 0.30 s reaction, +/-14 deg aim error) fighting the real
+ * boot wave for 30 s finished on 42, 9 and 6 hp out of 100. The damage ledger
+ * said exactly where it came from — saber 41/78/67, force 18/18/18, BOLTS ZERO —
+ * so the fight was decided entirely by sith blades landing 5-8 times at 11-15
+ * damage, plus two free 9-damage shoves from the sith who was NOT duelling.
+ *
+ * The asymmetry, not a global multiplier, is what got fixed:
+ *   damage per hit   11 -> 8 (elite 15 -> 11). A 3-swing combo that fully
+ *                    connects costs 24 hp instead of 33: a quarter of your
+ *                    health for being caught flat-footed, not a third.
+ *   hit cooldown     0.5 -> 0.8 s. This is not a rate limit in practice (a sith
+ *                    only lands 0.2-0.3 hits/s) — it caps the COMBO burst at two
+ *                    landed hits instead of three, which is what killed people.
+ *   front cone       0.25 -> 0.42 (75 -> 65 deg half-angle). Circling behind a
+ *                    sith mid-swing now actually works, so footwork is rewarded.
+ *   FPUSH damage     9 -> 5, cooldown 7-12 -> 9-15 s. The shove's job is the
+ *                    knockback; at 9 damage from up to 11.5 m, off-screen, from
+ *                    a sith you were not fighting, it was 30% of all damage
+ *                    taken for no counterplay.
+ *   hp               STAYS 120. It was cut to 100 here and put back: the frozen
+ *                    ITERATION 3+4 contract says "SITH ... hp 120", and the cut
+ *                    bought nothing worth breaking it for. Measured with a
+ *                    scripted player who closes to blade reach and swings
+ *                    (MEDIUM, 22 dmg, 0.22 s reaction, +/-6 deg aim error), three
+ *                    runs each: at 100 hp the duel lasted 3.6-4.2 s and cost the
+ *                    player 8 hp; at 120 hp it lasts 3.6-4.7 s and costs 0-11.
+ *                    One extra swing is the whole difference — the sith was never
+ *                    winning that fight on hit points, so trimming them only
+ *                    softened him. The real fix for "the duel kills you" was the
+ *                    per-hit damage, the hit cooldown and the RECOVER window
+ *                    below, all of which are ours to tune and all of which stay.
+ *   RECOVER          used to retreat at 3.5 m/s for 1.0-1.6 s, i.e. 3.5-5.6 m,
+ *                    which deleted the player's counter-attack window every time
+ *                    the sith finished a combo. It is a TAUNT: it now steps back
+ *                    ~1 m and shows off in place, so the opening is real. This
+ *                    raises player dps without touching the player's numbers.
+ *   ring / chargeCd  5.0 -> 4.2 m and 1.8-3.2 -> 1.4-2.4 s: the sith spent 35-45%
+ *                    of the duel orbiting at 5 m, outside saber reach, where the
+ *                    player can only whiff. Closer and more committed means more
+ *                    of the fight happens where BOTH blades can land.
+ */
+var SI_HP = 120, SI_R = 0.55, SI_H = 1.85;   /* contract: hp 120 (do not trim) */
 var SI_SPOT = 55, SI_LOSE = 95;
-var SI_RING = 5.0, SI_CLOSE = 2.2;   /* contract: charge closes to 2.2 m */
+var SI_RING = 4.2, SI_CLOSE = 2.2;   /* contract: charge closes to 2.2 m */
 var SI_WALK = 4.4, SI_RUN = 7.2;
-/* Melee damage is deliberately modest and rate-limited: a 3-swing combo that
- * all connects costs ~33 hp, so a duel is scary but survivable and you always
- * get a window to push, leap or parry out of it. (Harness at 16 dmg with no
- * cooldown killed a standing hero in about three seconds — not a duel.) */
-var SI_DMG = 11, SI_DMG_ELITE = 15;
-var SI_HIT_CD = 0.5;        /* s between two landed saber hits from one bot */
+var SI_DMG = 8, SI_DMG_ELITE = 11;
+var SI_HIT_CD = 0.8;        /* s between two landed saber hits from one bot */
 var SI_REACH = 2.4, SI_REACH_ELITE = 2.8;  /* contract: hit inside 2.4 m */
+var SI_FRONT = 0.42;        /* cos of the half-angle the hero must be inside */
 var ACT0 = 0.25, ACT1 = 0.72;   /* swing damage window (phase) */
+var FPUSH_DMG = 5;
 var FPUSH_MAX = 11.5;       /* m: the shove is re-checked against this on landing */
+var RECOVER_MIN = 0.85, RECOVER_MAX = 1.25;
+var RECOVER_BACK = 1.1;     /* m of ground given up while taunting */
 
 /* movement */
 var ACC_GND = 26, ACC_AIR = 7;
 var FRIC_GND = 9, FRIC_AIR = 0.35;
 var TURN_SLOW = 5, TURN_FAST = 9;
 
-/* ============================== palettes ============================ */
+/* ============================== palettes ============================
+ * PAINTED FOR VALUE, NOT FOR HUE. The scene light is fixed and known:
+ * sun (1.00, 0.92, 0.74) from (0.71, 0.573, 0.409), ambient (0.42, 0.36, 0.30),
+ * and the shader is `lit = (amb + sun*max(dot(n,L),0)) * base`. So a box face
+ * only ever gets one of a handful of multipliers, and a base colour maps onto a
+ * KNOWN on-screen range:
+ *
+ *   face        R mult   G mult   B mult   luma mult
+ *   sunward      1.13     1.01     0.83      1.02
+ *   top          0.99     0.89     0.72      0.90
+ *   shadow       0.42     0.36     0.30      0.37
+ *
+ * i.e. every base colour spans a 2.75:1 value range across the figure for free,
+ * and multiplying a base by k moves the whole figure by k. Lit sand measures
+ * luma 129-142/255, so THAT is the value everything is read against.
+ *
+ * The old sith was tunic 0.11 / pants 0.09 / boots 0.06: 0.37*0.11 = RGB 12 on
+ * the shadow side and 1.13*0.11 = RGB 32 on the sunward side. A 20-step range
+ * at the very bottom of the ramp is not "dark", it is a HOLE — measured mean
+ * luma 41 with p05/p50/p95 = 11/20/120, which is a black cut-out with a face
+ * floating on it. Fixed by giving each archetype a deliberate 5-value ramp:
+ *
+ *   SITH     hood 6-17 | legs 22-60 | robe 33-90 | crimson sash | face+hands
+ *            90-240. The robe is a cool slate so it separates from warm sand by
+ *            hue as well as value; the pale hands are the eye's anchor for where
+ *            the blade is, and the sash puts a saturated crimson band on the
+ *            waist so the torso never reads as one flat mass.
+ *   ELITE    the same ramp in oxblood with a BRONZE sash instead of crimson, so
+ *            the staff-carrying lord is a different silhouette AND a different
+ *            colour from his apprentices at 40 m.
+ *   TROOPER  white plastoid armour 83-255 over a near-black undersuit 28-77.
+ *            The old trooper was 0.83-0.88 head to toe: mean luma 140 against
+ *            sand at 142, i.e. contrast 0.007 — invisible. Bright plates over a
+ *            dark undersuit make him bimodal, so whichever half of him is not
+ *            matching the sand still carries the silhouette.
+ */
+/* WHITE ARMOUR NEEDS A BASE BRIGHTER THAN WHITE. The light is warm (sun
+ * 1.00/0.92/0.74, ambient 0.42/0.36/0.30), so the blue channel can never exceed
+ * 0.826 of its base while red reaches 1.13. Feed that light a neutral base and
+ * plastoid comes out the same warm cream as the dune it is standing on: rendered
+ * at 0.94 base the trooper read as BARE TAN SKIN in a screenshot — a shirtless
+ * man in black trousers. Nothing clamps the palette (it is the tint uniform, and
+ * only gl_FragColor saturates), so the fix is to pre-compensate: base blue 1.41x
+ * base red exactly cancels the sun's warmth, and the armour renders neutral grey
+ * 93 in shadow through 251 in the sun. THAT reads as white plastic on tan sand;
+ * a warm cream does not, at any brightness. Measured on the screenshots (sampled
+ * pixels, not palette arithmetic): mean chroma across the whole figure fell from
+ * 42-50 to 8-26, and the fraction of figure pixels carrying a >= 30 luma step
+ * against the sand went from 0.19-0.50 to 0.58-0.98 at 5/15/40 m.
+ * DO NOT PUSH THESE BASES HIGHER. The sun is fixed in world space, so a
+ * turntable at 12 m already clips: on the two camera bearings that show the
+ * sunward flank, 43-45% of the figure's pixels sit at 250-255 on all three
+ * channels (every face with dot(n,L) >= ~0.62 saturates), which costs the lit
+ * side some of its internal shading. It still reads — that bearing has the
+ * STRONGEST contrast of the eight, mean step 88-89 against sand 131-149 — but
+ * there is no headroom left to spend. */
 var PAL_TROOPER = {
-  skin:  [0.93, 0.94, 0.96],   /* helmet + gloves */
-  tunic: [0.88, 0.89, 0.93],
-  pants: [0.83, 0.84, 0.88],
-  boots: [0.13, 0.13, 0.15],
-  belt:  [0.16, 0.16, 0.19],
-  hair:  [0.10, 0.10, 0.13]    /* black helmet crown */
+  skin:  [0.93, 1.08, 1.30],   /* helmet shell + gloves — the brightest note */
+  tunic: [0.87, 1.02, 1.23],   /* chest / back / shoulder + arm plates */
+  pants: [0.26, 0.27, 0.34],   /* black undersuit: thighs + shins = structure */
+  boots: [0.10, 0.10, 0.14],
+  belt:  [0.09, 0.09, 0.13],   /* the utility belt boxes */
+  hair:  [0.07, 0.07, 0.11]    /* helmet brow / lens band */
 };
 var PAL_SITH = {
-  skin:  [0.55, 0.49, 0.50],
-  tunic: [0.11, 0.10, 0.13],
-  pants: [0.09, 0.09, 0.11],
-  boots: [0.06, 0.06, 0.08],
-  belt:  [0.42, 0.06, 0.07],
-  hair:  [0.05, 0.05, 0.07]
+  skin:  [0.86, 0.78, 0.73],   /* ashen face + bare hands: the lightest value */
+  tunic: [0.32, 0.31, 0.44],   /* robe body + sleeves — dark cool slate */
+  pants: [0.20, 0.20, 0.28],   /* robe skirt + legs, a step darker */
+  boots: [0.12, 0.11, 0.14],
+  belt:  [0.76, 0.10, 0.10],   /* crimson sash — the villain's accent */
+  hair:  [0.07, 0.06, 0.09]    /* hood/cowl: darkest, frames the pale face */
 };
 var PAL_ELITE = {
-  skin:  [0.63, 0.55, 0.55],
-  tunic: [0.21, 0.05, 0.07],
-  pants: [0.10, 0.08, 0.10],
-  boots: [0.07, 0.06, 0.08],
-  belt:  [0.62, 0.10, 0.10],
+  skin:  [0.90, 0.83, 0.79],
+  tunic: [0.44, 0.14, 0.16],   /* oxblood robe */
+  pants: [0.22, 0.13, 0.15],
+  boots: [0.13, 0.11, 0.12],
+  belt:  [0.86, 0.58, 0.14],   /* bronze sash: rank, and a warm mid-tone */
   hair:  [0.06, 0.05, 0.07]
 };
 var SABER_RED = [1.0, 0.16, 0.10];
@@ -7812,7 +9328,7 @@ function makeBot(variant){
     downW: 0, downDir: 1, liftW: 0, stagW: 0, flash: 0,
     /* --- trooper --- */
     hasRifle: true, dropX: 0, dropZ: 0, dropYaw: 0,
-    burstN: 0, burstT: 0, cycleT: 0, fleeCd: 0,
+    burstN: 0, burstT: 0, cycleT: 0, fleeCd: 0, reposT: 1.2,
     errLat: 0, errUp: 0,
     aimBlend: 0, recoil: 0, flashT: 0,
     aimYaw: 0, aimPitch: 0, aimYaw0: 0, aimPitch0: 0,
@@ -7846,11 +9362,12 @@ function resetBot(b, x, z){
   b.state = 'IDLE'; b.stT = 0; b.nextState = '';
   b.downW = 0; b.downDir = 1; b.liftW = 0; b.stagW = 0; b.flash = 0;
   b.hasRifle = true; b.burstN = 0; b.burstT = 0; b.cycleT = 0; b.fleeCd = 0;
+  b.reposT = rrange(REPOS_MIN, REPOS_MAX);
   b.errLat = 0; b.errUp = 0; b.aimBlend = 0; b.recoil = 0; b.flashT = 0;
   b.comboLeft = 0; b.swingHit = false; b.hitCd = 0; b.defIdx = 0;
-  b.chargeCd = rrange(1.6, 2.8);
+  b.chargeCd = rrange(1.3, 2.4);
   b.leapCd = rrange(4.0, 8.0);
-  b.pushCd = rrange(6.0, 11.0);
+  b.pushCd = rrange(7.0, 13.0);
   b.orbit = rnd() < 0.5 ? -1 : 1;
   b.flipCd = rrange(1.5, 3.0);
   b.cheapAcc = 0; b.avoidT = 0; b.stuckT = 0;
@@ -8268,19 +9785,61 @@ function trooperFire(b, wild){
   B.fire(MUZ3, DIR3, 'enemy', FIRE_OPT);
 }
 
-function newBurst(b){
+/* `carry` is the (negative) overshoot of the timer that expired, folded into the
+ * new one so the 1.5 s period survives any frame rate. Without it the rhythm is
+ * quantised UP by one frame per leg: measured 1.70 s per burst at 38 fps against
+ * the intended 1.50, i.e. the burst rate silently depended on the phone. */
+function newBurst(b, carry){
   b.burstN = BURST_N;
-  b.burstT = 0.05;
-  b.errLat = (rnd() - 0.5) * 2 * AIM_MISS;
+  b.burstT = BURST_LEAD + (carry > 0 ? 0 : (carry || 0));
+  /* shooting on the move is worse shooting — the lateral scatter widens while he
+   * strafes, so keeping the rhythm alive during REPOSITION does not make him
+   * measurably more lethal, only more present */
+  var miss = AIM_MISS * (b.state === 'REPOSITION' ? REPOS_MISS : 1);
+  b.errLat = (rnd() - 0.5) * 2 * miss;
   b.errUp = (rnd() - 0.5) * 2 * AIM_MISS_Y;
+}
+/* ONE burst clock, ticked by every state that is allowed to shoot. Returns true
+ * while a burst is in flight, so the caller knows not to change state mid-burst.
+ * `auto` restarts the next burst when the rest expires (FIRE and REPOSITION both
+ * want that; the caller decides what to do at the seam). */
+function burstTick(b, dt, auto){
+  if (b.burstN > 0){
+    b.burstT -= dt;
+    if (b.burstT <= 0){
+      trooperFire(b, false);
+      b.burstN--;
+      if (b.burstN === 0) b.cycleT = BURST_REST + b.burstT;
+      else b.burstT += BURST_DT;
+    }
+    return true;
+  }
+  b.cycleT -= dt;
+  if (b.cycleT <= 0 && auto){ newBurst(b, b.cycleT); return true; }
+  return false;
 }
 /* Entering FIRE always opens with a burst. (Rolling for a burst on arrival
  * made them dither: the probe measured one burst per 3.5 s, so the desert was
- * quiet. Opening with one gives ~1 burst per 2.5 s per trooper — a proper
- * imperial hail once three of them are on you.) */
+ * quiet.) */
 function enterFire(b){
   setState(b, 'FIRE');
   newBurst(b);
+}
+function enterRepos(b){
+  var carry = b.cycleT;        /* we are at the seam: keep the period honest */
+  setState(b, 'REPOSITION');
+  b.reposT = rrange(REPOS_MIN, REPOS_MAX);
+  b.orbit = rnd() < 0.5 ? -1 : 1;
+  b.nextState = rnd() < 0.18 ? 'TRIP' : '';
+  newBurst(b, carry);          /* strafe AND shoot: the rhythm never stops */
+}
+/* A trooper coming out of a stagger / knockdown / getup must re-enter FIRE
+ * through enterFire, not through a bare setState: the old path resumed whatever
+ * burstN and cycleT happened to be frozen on his record when he was hit, which
+ * could be a full BURST_REST of silence he had already half-spent. */
+function resume(b){
+  var st = combatState(b);
+  if (st === 'FIRE') enterFire(b); else setState(b, st);
 }
 
 function trooperAI(b, dt, t, hx, hy, hz){
@@ -8333,32 +9892,18 @@ function trooperAI(b, dt, t, hx, hy, hz){
   if (s === 'FIRE'){
     stand(b);
     faceTo(b, hx, hz, TURN_FAST, dt);
-    if (b.burstN > 0){
-      b.burstT -= dt;
-      if (b.burstT <= 0){
-        trooperFire(b, false);
-        b.burstN--;
-        b.burstT = BURST_DT;
-        if (b.burstN === 0) b.cycleT = BURST_GAP;
-      }
-    } else {
-      b.cycleT -= dt;
-      if (b.cycleT <= 0){
-        if (d > TR_FAR){ setState(b, 'ADVANCE'); return; }
-        if (d < TR_MIN || rnd() < 0.5){
-          setState(b, 'REPOSITION');
-          b.cycleT = rrange(1.2, 2.0);
-          b.orbit = rnd() < 0.5 ? -1 : 1;
-          if (rnd() < 0.18) b.nextState = 'TRIP'; else b.nextState = '';
-          return;
-        }
-        newBurst(b);
-      }
-    }
+    /* burstTick without auto-restart: the seam between two bursts is exactly
+     * where a trooper is allowed to decide to move, so the decision happens
+     * once per burst and never chops a burst in half. */
+    if (burstTick(b, dt, false)) return;
+    if (b.cycleT > 0) return;
+    if (d > TR_FAR){ setState(b, 'ADVANCE'); return; }
+    if (d < TR_MIN || rnd() < REPOS_P){ enterRepos(b); return; }
+    newBurst(b, b.cycleT);
     return;
   }
   if (s === 'REPOSITION'){
-    /* sidestep around the player, holding the firing ring */
+    /* sidestep around the player, holding the firing ring — and keep shooting */
     var dx = b.pos[0] - hx, dz = b.pos[2] - hz;
     var l = Math.sqrt(dx * dx + dz * dz) || 1;
     dx /= l; dz /= l;
@@ -8368,17 +9913,20 @@ function trooperAI(b, dt, t, hx, hy, hz){
     var tx = hx + (dx * (l - pull * 4) + px * 6);
     var tz = hz + (dz * (l - pull * 4) + pz * 6);
     seek(b, tx, tz, TR_WALK);
-    faceTo(b, hx, hz, TURN_SLOW, dt);
-    b.cycleT -= dt;
-    if (b.nextState === 'TRIP' && b.cycleT < 0.7){
+    faceTo(b, hx, hz, TURN_FAST, dt);   /* muzzle stays on him while he strafes */
+    burstTick(b, dt, true);
+    if (b.nextState === 'TRIP' && b.stT > b.reposT - 0.55){
       b.nextState = '';
       b.downDir = -1;                                    /* face-plant */
       setState(b, 'STUMBLE');
+      b.burstN = 0;                                      /* the burst dies with him */
       b.vel[0] = b.dvx * 0.8; b.vel[2] = b.dvz * 0.8;
       sndR('hurt', b.pos[0], b.pos[1] + 1.0, b.pos[2], 0.7, 1.5);
       return;
     }
-    if (b.cycleT <= 0) enterFire(b);
+    /* plain setState, NOT enterFire: cycleT is mid-rest and must stay that way,
+     * or ending a reposition would skip the rest and beat the contract's period */
+    if (b.stT > b.reposT && b.burstN === 0) setState(b, 'FIRE');
     return;
   }
   if (s === 'FLEE'){
@@ -8434,7 +9982,7 @@ function swingPhase(b){
 /* back off and show off — the taunt is the "I'm done attacking" tell */
 function enterRecover(b){
   setState(b, 'RECOVER');
-  b.cycleT = rrange(1.0, 1.6);
+  b.cycleT = rrange(RECOVER_MIN, RECOVER_MAX);
   if (b.rig && b.rig.playSwing){
     b.rig.playSwing(TAUNT_DEF);
     snd('swing', b.pos[0], b.pos[1] + 1.3, b.pos[2], 0.5);
@@ -8446,7 +9994,7 @@ function enterRecover(b){
  * swinging at a time. The others circle at sabre distance, taunt, and throw
  * the occasional Force Push, which is exactly how a JK2 fight reads. Measured:
  * three sith with no token did 54 dps to a standing hero (dead in under two
- * seconds); with the token it is ~20 dps and you get openings.
+ * seconds); with the token a lone sith lands 4.6 dps and you get openings.
  * The token is validated every frame instead of being explicitly released, so
  * a bot that dies, is knocked flat or is gripped mid-charge cannot leak it. */
 var token = null, tokenT = 0;
@@ -8495,7 +10043,7 @@ function sithMelee(b, hx, hy, hz){
   var reach = b.elite ? SI_REACH_ELITE : SI_REACH;
   if (l > reach) return;
   var fx = -Math.sin(b.yaw), fz = -Math.cos(b.yaw);
-  if (l > 1e-4 && (fx * dx + fz * dz) / l < 0.25) return;   /* must be in front */
+  if (l > 1e-4 && (fx * dx + fz * dz) / l < SI_FRONT) return;  /* must be in front */
   b.swingHit = true;
   b.hitCd = SI_HIT_CD;
   var nx = l > 1e-4 ? dx / l : fx, nz = l > 1e-4 ? dz / l : fz;
@@ -8549,13 +10097,13 @@ function sithAI(b, dt, t, hx, hy, hz){
     if (canLeap(b, d) && startLeap(b, hx, hz)) return;
     if (b.pushCd <= 0 && d > 3.5 && d < 9.5){
       setState(b, 'FPUSH');
-      b.pushCd = rrange(7.0, 12.0);
+      b.pushCd = rrange(9.0, 15.0);
       return;
     }
     if (b.chargeCd <= 0){
       if (claimToken(b)){
         setState(b, 'CHARGE');
-        b.chargeCd = rrange(1.8, 3.2);
+        b.chargeCd = rrange(1.4, 2.4);
       } else {
         b.chargeCd = rrange(0.6, 1.2);      /* wait your turn, apprentice */
       }
@@ -8627,7 +10175,7 @@ function sithAI(b, dt, t, hx, hy, hz){
         return;
       }
       if (heroAttackable()){
-        hurtHero(9, px, 0.6, pz, 'force');
+        hurtHero(FPUSH_DMG, px, 0.6, pz, 'force');
         var F = JK.ForceFx;
         if (F && F.push){
           FX3[0] = b.pos[0] - px * 0.4;
@@ -8643,8 +10191,15 @@ function sithAI(b, dt, t, hx, hy, hz){
     return;
   }
   if (s === 'RECOVER'){
-    var bx = b.pos[0] + (b.pos[0] - hx) * 0.5, bz = b.pos[2] + (b.pos[2] - hz) * 0.5;
-    seek(b, bx, bz, SI_WALK * 0.8);
+    /* A TAUNT, not a retreat: give up ~RECOVER_BACK metres and stand there
+     * flourishing. The old version ran 3.5-5.6 m backwards at 3.5 m/s, which
+     * erased the counter-attack window every single time the sith finished a
+     * combo — the player's whole reward for surviving one. */
+    var rdx = b.pos[0] - hx, rdz = b.pos[2] - hz;
+    var rl = Math.sqrt(rdx * rdx + rdz * rdz) || 1;
+    var bx = hx + rdx / rl * (rl + RECOVER_BACK);
+    var bz = hz + rdz / rl * (rl + RECOVER_BACK);
+    seek(b, bx, bz, SI_WALK * 0.45);
     faceTo(b, hx, hz, TURN_FAST, dt);
     if (b.stT > 0.5 && canLeap(b, d) && startLeap(b, hx, hz)) return;
     if (b.stT > b.cycleT) setState(b, 'STALK');
@@ -8673,7 +10228,7 @@ function reactAI(b, dt, t){
     b.downW -= b.downW * (1 - Math.exp(-6 * dt));
     if (b.stT > GETUP_T){
       b.downW = 0;
-      setState(b, combatState(b));
+      resume(b);
     }
     return true;
   }
@@ -8695,8 +10250,9 @@ function reactAI(b, dt, t){
     b.stagW += (1 - b.stagW) * (1 - Math.exp(-16 * dt));
     if (b.stT > STAGGER_T){
       b.stagW = 0;
-      setState(b, b.nextState || combatState(b));
+      var back = b.nextState || combatState(b);
       b.nextState = '';
+      if (back === 'FIRE') enterFire(b); else setState(b, back);
     }
     return true;
   }
