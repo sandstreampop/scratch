@@ -89,3 +89,55 @@ well; what holds it back is art legibility, not code" — and fixed a box shadow
 hole cut in the sand, a dead-flat sky (now a one-draw-call gradient dome), a **colour picker
 whose blue slider was physically unreachable on an iPhone in landscape**, and a GL
 redundant-state cache that cut 2053 raw WebGL calls per frame.
+
+---
+
+## Loop 3 — art legibility, and one draw call per particle
+
+**Scorecard: 8/8.** 1.22 ms JS, **draw calls 163 → 131** (worst frame was 348).
+
+Acting on the playtester's ranked list rather than guessing:
+
+- **The sith was a hole in the screen.** 85% of its pixels sat between RGB 11 and 29. The cause
+  was the light, not the palette: with this sun and ambient, a face gets base×0.37 (shadow) or
+  base×1.02 (lit), so a base of 0.11 *cannot* produce more than RGB 32. It now has a deliberate
+  five-value ramp — hood 12, legs 21–35, robe 39–75, crimson sash, pale skin 153.
+- **The stormtrooper was the same hue family as the dune** (Michelson contrast 0.025). The
+  fraction of the figure carrying a ≥30-luma step against sand went 0.47 → 0.94 at 5 m.
+  The agent's first attempt rendered as *a shirtless man in black trousers* — caught only by
+  looking at it. Blue can never exceed 0.826× base while red reaches 1.13×, so neutral white
+  armour needs pre-compensated blue.
+- **Fire rate 1.00 → 1.99 bolts/s** while engaged, in real bursts of 3. Two causes: `BURST_GAP`
+  was measured from the last shot rather than as a period, and REPOSITION was completely silent
+  for half of every cycle.
+- **Draw calls**: added a batched dynamic-geometry path to the core renderer. Particles were one
+  draw call *each* — a spark burst added 150+. Proven bit-identical: 0 of 329160 pixels differ.
+  Its reviewer found the batch had no overrun guard: one index past the end raised
+  `GL_INVALID_OPERATION` and the whole batch silently rendered nothing.
+- **Rig: three criticals.** The documented clearance fix was mis-measured by 0.20 m and had moved
+  the collision to a different body part; the weapon *teleported* at a discontinuous clamp
+  boundary; and the clearance test had never examined the hilt's pommel half.
+- Deflection and Grip now read (0.08% → 0.40–0.88% and 0.9% → 0.73–2.12% of screen pixels).
+
+## Loop 4 — closing the blind spot that hid loop 3's leftovers
+
+**No feature work. Tooling only**, because two defects had escaped twice.
+
+`swing_probe` only ever tested the **default single saber**. That is how *8 of 12 staff attacks*
+stayed broken through a whole iteration with a green gate. It now takes a saber-type argument and
+the gate runs all **36** combinations.
+
+And "wind-up faster than the strike" had now been caught twice by human-style review and *never*
+by a metric — so it became one: `strikeOverWindup >= 1.05`.
+
+That second metric needed care, and my first version was wrong in the same way the old
+performance check was wrong. Measured per *second* it was noise: headless frame times jitter from
+6 ms to 60 ms, and the same swing reported peak speeds of both 73.9 and 25.3 m/s on consecutive
+runs — it would have failed a correct animation. Measured per unit of swing **phase** the jitter
+divides out, because each attack has a fixed duration. The same swing now reads 1.25 and 1.36
+across runs.
+
+The extended gate immediately paid for itself: it confirms loop 2's fix genuinely held for single
+sabers, and independently reproduces the staff defect.
+
+    single 12/12    dual 12/12    staff 4/12
