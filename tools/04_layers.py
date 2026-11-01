@@ -102,6 +102,7 @@ for k,(name, dmin, dmax) in enumerate(BANDS):
     mirror_ok = known[my_, mx_] & ~known
     mirrored = plate[my_, mx_]
     wmir = np.clip(1.0 - (dist_k-40)/60.0, 0, 1)[...,None]          # trust the mirror for ~40px, fade to the average by 100px
+    if k == 0: wmir = wmir*0              # sky: smooth average only, mirrored clouds look duplicated
     col = np.where(known[...,None], plate, mirrored*wmir*mirror_ok[...,None] + base*(1-wmir*mirror_ok[...,None]))
     col = np.where(known[...,None], col, gaussian_filter(col, (1.2,1.2,0)))
     col = np.where((inband & ~known)[...,None], col, col)         # edge ring now carries fill colour, not the other side's

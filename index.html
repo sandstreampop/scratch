@@ -86,7 +86,7 @@ const ASPECT = scene.plate[0]/scene.plate[1];
 const TY = 0.42, TX = TY*ASPECT;                          // tan(half fov) of the painter's eye
 const ZP = 1.2;                                           // picture plane / frame distance
 const ZNEAR = 4.0, ZFAR = 400;                            // inverse-depth → metres (must match tools/04_layers.py)
-const ZFLYMAX = 40;
+const ZFLYMAX = 11;                                       // about where the near boats are
 const isTouch = matchMedia('(pointer:coarse)').matches;
 const Q = new URLSearchParams(location.search); const onlyLayer = Q.has('layer') ? +Q.get('layer') : -1;
 const zOf = d => 1/((1/ZFAR)*(1-d) + (1/ZNEAR)*d);
@@ -181,7 +181,7 @@ const swayU = scene.sway.map(s => new THREE.Vector4(s.c[0], s.c[1], s.amp, 0));
 const swayR = scene.sway.map(s => new THREE.Vector2(s.r[0], s.r[1]));
 const waterTex = tex('assets/water.png').then(t => { t.minFilter = THREE.LinearFilter; t.generateMipmaps = false; return t; });
 const commonU = { tWater:{value:null}, uTime:{value:0}, uSun:{value:new THREE.Vector2(scene.sun[0], scene.sun[1])}, uCamPos:{value:new THREE.Vector3()} };
-const segScale = 1.0;
+const segScale = isTouch ? 0.8 : 1.0;
 const layerPromises = scene.layers.map(async (L, k) => {
   const [tc, tm, tw] = await Promise.all([tex(`assets/L${k}.jpg`), tex(`assets/L${k}.png`), waterTex]); commonU.tWater.value = tw;
   tm.minFilter = THREE.NearestFilter; tm.magFilter = THREE.NearestFilter; tm.generateMipmaps = false;
@@ -319,7 +319,7 @@ addEventListener('keyup', e => input.keys.delete(e.code));
 function noteInput() { lastInput = clock.elapsedTime; if (glide) glide = null; }
 
 // where may the camera be?
-function constrain(p) {
+function constrain(p, dt = 1/60) {
   if (p.z > -ZP + 0.05) {                               // in the gallery
     p.x = THREE.MathUtils.clamp(p.x, -0.7, 0.7); p.y = THREE.MathUtils.clamp(p.y, -0.5, 0.55); p.z = Math.min(p.z, 2.7);
     if (p.z < -ZP + 0.45) { p.x = THREE.MathUtils.clamp(p.x, -TX*ZP*0.7, TX*ZP*0.7); p.y = THREE.MathUtils.clamp(p.y, -TY*ZP*0.7, TY*ZP*0.7); }
@@ -341,7 +341,7 @@ function constrain(p) {
   const fwd = new THREE.Vector3(-Math.sin(pose.yaw)*Math.cos(pose.pitch), Math.sin(pose.pitch), -Math.cos(pose.yaw)*Math.cos(pose.pitch));
   const right = new THREE.Vector3(Math.cos(pose.yaw), 0, -Math.sin(pose.yaw)), upv = new THREE.Vector3().crossVectors(right, fwd).negate();
   const tanV = Math.tan(THREE.MathUtils.degToRad(camera.fov/2)), tanH = tanV*camera.aspect;
-  for (let iter = 0; iter < 4; iter++) {
+  {
     let blocked = false;
     for (const [sx, sy] of [[0,0],[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,1],[1,-1],[-1,-1]]) {
       const dir = fwd.clone().addScaledVector(right, sx*tanH*0.9).addScaledVector(upv, sy*tanV*0.9).normalize();
@@ -353,8 +353,7 @@ function constrain(p) {
       }
       if (blocked) break;
     }
-    if (!blocked) break;
-    p.multiplyScalar(0.97); if (-p.z < ZP + 0.06) { p.multiplyScalar((ZP+0.06)/-p.z); break; }
+    if (blocked) { p.multiplyScalar(Math.max(0.9, 1 - 0.8*dt)); if (-p.z < ZP + 0.06) p.multiplyScalar((ZP+0.06)/-p.z); }
   }
   return p;
 }
@@ -362,10 +361,10 @@ function constrain(p) {
 // points of interest for the idle glide (ndc of the painter's view, fraction of surface distance, look-at ndc)
 const POIS = [
   { at:[0,0,0.04], look:[0.02,-0.2], hold:4 },
-  { at:[0.05,-0.42,0.55], look:[0.0,-0.32], hold:4 },
-  { at:[0.28,-0.25,0.42], look:[0.42,-0.55], hold:4 },
-  { at:[-0.32,0.25,0.35], look:[0.4,-0.15], hold:3 },
-  { at:[-0.08,-0.55,0.62], look:[-0.05,-0.42], hold:5 },
+  { at:[0.05,-0.42,0.42], look:[0.0,-0.32], hold:4 },
+  { at:[0.28,-0.25,0.33], look:[0.42,-0.55], hold:4 },
+  { at:[-0.32,0.25,0.28], look:[0.4,-0.15], hold:3 },
+  { at:[-0.08,-0.55,0.5], look:[-0.05,-0.42], hold:5 },
   { at:[0,0.05,0.05], look:[0,-0.05], hold:4 },
 ];
 function poiPos(nx, ny, frac) {
@@ -410,7 +409,7 @@ function tick() {
       pose.yaw += (a.yaw - pose.yaw)*s; pose.pitch += (a.pitch - pose.pitch)*s;
       if (dist < 0.25) { glide.hold += dt; if (glide.hold > P.hold) { glide.i++; glide.hold = 0; } }
     }
-    constrain(pose.pos);
+    constrain(pose.pos, dt);
   }
   camera.position.copy(pose.pos);
   camera.rotation.set(0,0,0); camera.rotateY(pose.yaw); camera.rotateX(pose.pitch);
